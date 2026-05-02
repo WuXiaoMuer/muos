@@ -138,12 +138,7 @@ qemu-system-i386 -kernel kernel.elf
 
 启动成功后，QEMU 窗口将显示：
 
-```
-============================
-      MuOS Booted!
-  Hello from Windows dev!
-============================
-```
+![MuOS 启动截图](assets/muos-boot.png)
 
 ---
 
