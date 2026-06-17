@@ -12,6 +12,7 @@
 #include "irq.h"
 #include "pit.h"
 #include "keyboard.h"
+#include "mouse.h"
 #include "mm.h"
 #include "task.h"
 #include "shell.h"
@@ -110,6 +111,11 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     keyboard_init();
     vga_print("[OK] Keyboard driver loaded (IRQ1)\n");
     serial_write("[OK] Keyboard driver loaded\n");
+
+    /* 7b. Mouse */
+    mouse_init();
+    vga_print("[OK] Mouse driver loaded (IRQ12)\n");
+    serial_write("[OK] Mouse driver loaded\n");
 
     /* 8. Multitasking */
     task_init();

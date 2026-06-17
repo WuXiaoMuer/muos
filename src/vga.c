@@ -135,3 +135,19 @@ void vga_print_dec(uint32_t n) {
 
 uint16_t vga_get_cursor_row(void) { return vga_row; }
 uint16_t vga_get_cursor_col(void) { return vga_col; }
+
+void vga_set_cursor(uint16_t row, uint16_t col) {
+    vga_row = row;
+    vga_col = col;
+    vga_update_cursor();
+}
+
+void vga_move_cursor_left(void) {
+    if (vga_col > 0) vga_col--;
+    vga_update_cursor();
+}
+
+void vga_move_cursor_right(void) {
+    vga_col++;
+    vga_update_cursor();
+}

@@ -158,16 +158,18 @@ void keyboard_init(void) {
     irq_register_handler(1, kbd_irq_handler);
 }
 
-/* Blocking read with IRQ + polling fallback */
+/* Blocking read — IRQ-driven with CLI-protected polling fallback */
 char keyboard_getchar(void) {
     while (kbd_head == kbd_tail) {
-        /* Poll keyboard directly: belt-and-suspenders if IRQs misfire */
-        if (inb(KEYBOARD_STATUS_PORT) & 0x01) {
-            kbd_process_scancode(inb(KEYBOARD_DATA_PORT));
-        }
-        /* If we still have nothing, wait for interrupt */
+        __asm__ volatile ("hlt");
+        /* Poll as fallback (CLI protects against IRQ handler race) */
         if (kbd_head == kbd_tail) {
-            __asm__ volatile ("hlt");
+            uint8_t s = inb(KEYBOARD_STATUS_PORT);
+            if (s & 0x01) {
+                __asm__ volatile ("cli");
+                kbd_process_scancode(inb(KEYBOARD_DATA_PORT));
+                __asm__ volatile ("sti");
+            }
         }
     }
     __asm__ volatile ("" ::: "memory");

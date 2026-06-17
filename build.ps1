@@ -99,8 +99,8 @@ $step++
 
 # GCC: all C files
 $CFiles = @(
-    "kernel", "vga", "serial", "gdt", "idt", "isr", "pic",
-    "pit", "keyboard", "mm", "task", "shell", "irq"
+    "kernel", "vga", "vgagfx", "serial", "gdt", "idt", "isr", "pic",
+    "pit", "keyboard", "mouse", "mm", "task", "shell", "irq"
 )
 
 $ObjFiles = @()

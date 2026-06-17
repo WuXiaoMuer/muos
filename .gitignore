@@ -1,22 +1,16 @@
 # Build output
 build/
 
-# Object files and binaries
-*.o
-*.elf
-
 # ISO image
 *.iso
-
-# Toolchain (download manually)
-toolchain/
 
 # Python cache
 __pycache__/
 *.pyc
 
-
-
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Large toolchain binaries (over 100MB)
+/toolchain/
