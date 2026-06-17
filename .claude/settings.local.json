@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.nasm.us)",
+      "WebFetch(domain:www.qemu.org)",
+      "WebSearch",
+      "Bash(curl -s https://api.github.com/repos/lordmilko/i686-elf-tools/releases/latest)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('Tag:', d.get\\('tag_name'\\)\\); print\\('Published:', d.get\\('published_at'\\)\\); [print\\('Asset:', a['name'], a['browser_download_url']\\) for a in d.get\\('assets',[]\\)]\")",
+      "Bash(curl -s https://api.github.com/repos/lordmilko/i686-elf-tools/releases)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

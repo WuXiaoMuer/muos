@@ -1,55 +1,20 @@
-# Prerequisites
-*.d
+# Build output
+build/
 
-# Object files
+# Object files and binaries
 *.o
-*.ko
-*.obj
 *.elf
 
-# Linker output
-*.ilk
-*.map
-*.exp
+# ISO image
+*.iso
 
-# Precompiled Headers
-*.gch
-*.pch
+# Toolchain (download manually)
+toolchain/
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
+# Python cache
+__pycache__/
+*.pyc
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
-
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
-
-# Claude Code
-.claude/
+# OS junk
+.DS_Store
+Thumbs.db
