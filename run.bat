@@ -10,4 +10,4 @@ echo.
 echo Starting QEMU...
 echo Click the QEMU window to type.
 echo ========================================
-"C:\Program Files\qemu\qemu-system-i386.exe" -kernel "%~dp0build\kernel.elf" -m 128M
+"C:\Program Files\qemu\qemu-system-i386.exe" -kernel "%~dp0build\kernel.elf" -m 256M

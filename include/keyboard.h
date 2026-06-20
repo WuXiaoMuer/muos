@@ -44,6 +44,7 @@
 
 void keyboard_init(void);
 char keyboard_getchar(void);        /* Blocking read */
+char keyboard_peek(void);           /* Non-destructive peek, 0 if empty */
 bool_t keyboard_haschar(void);        /* Check if buffer has data */
 void keyboard_flush(void);          /* Clear input buffer */
 

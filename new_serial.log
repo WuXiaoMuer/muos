@@ -1,0 +1,41 @@
+[OK] GDT initialized
+[OK] IDT initialized
+[OK] PIC remapped
+[OK] Physical memory manager initialized
+[OK] Paging enabled
+[OK] PIT initialized at 100 Hz
+[OK] Scheduler started
+--- MuOS Self-Test Suite ---
+[PASS] mm_alloc_page returns non-NULL
+[PASS] mm used count increments by 1
+[PASS] mm free count decrements by 1
+[PASS] mm used count restored after free
+[PASS] mm free count restored after free
+[PASS] mm_alloc_pages(4) returns non-NULL
+[PASS] mm used count increments by 4
+[PASS] mm free count decrements by 4
+[PASS] mm used count restored after multi free
+[PASS] mm free count restored after multi free
+[PASS] mm total = free + used
+[PASS] fs_open missing file returns -1
+[PASS] fs_create returns valid fd
+[PASS] fs_count increments after create
+[PASS] fs_create duplicate returns -1
+[PASS] fs_write returns written length
+[PASS] fs_size matches written length
+[PASS] fs_read returns length
+[PASS] fs_read data matches written data
+[PASS] fs_delete succeeds
+[PASS] fs_count restored after delete
+[PASS] deleted file no longer openable
+[PASS] vga_set_cursor
+[PASS] vga_putchar advances col
+[PASS] vga_putchar newline advances row and resets col
+[PASS] keyboard_flush empties buffer
+[PASS] pit ticks are monotonic
+[PASS] at least one task exists
+[PASS] task_get_current returns non-NULL
+[PASS] current task pid > 0
+[PASS] current task has a name
+--- Results: 31 passed, 0 failed ---
+

@@ -3,8 +3,8 @@
 
 static uint16_t* const VGA_BUFFER = (uint16_t*)0xB8000;
 static uint8_t    vga_color;
-static uint16_t   vga_row;
-static uint16_t   vga_col;
+static volatile uint16_t   vga_row;
+static volatile uint16_t   vga_col;
 
 uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg) {
     return (bg << 4) | fg;

@@ -12,6 +12,8 @@ extern current_task_esp
 ; Common ISR handler (exceptions)
 ; ---------------------------------------------------------------------------
 isr_common:
+    cli
+    cld
     pusha
     push ds
     push es
@@ -40,6 +42,8 @@ isr_common:
 ; Common IRQ handler (with scheduler check)
 ; ---------------------------------------------------------------------------
 irq_common:
+    cli
+    cld
     pusha
     push ds
     push es
@@ -55,27 +59,6 @@ irq_common:
     push esp
     call irq_handler
     add esp, 4
-
-    ; Check if we need to reschedule
-    cmp byte [need_reschedule], 0
-    je .no_switch
-
-    ; Save current task's stack pointer
-    ; ESP currently points to gs on the stack (the interrupt frame base)
-    ; Save this to current_task->esp
-    mov eax, [current_task_ptr]
-    mov [eax], esp              ; current_task->esp = esp
-
-    ; Call scheduler to pick next task
-    call task_schedule
-
-    ; Load next task's stack pointer
-    mov eax, [current_task_ptr]
-    mov esp, [eax]              ; esp = current_task->esp
-
-    ; Clear reschedule flag
-    mov byte [need_reschedule], 0
-
 .no_switch:
     pop gs
     pop fs
@@ -86,18 +69,19 @@ irq_common:
     iret
 
 ; ---------------------------------------------------------------------------
-; Scheduler variables
+; Scheduler variables (kept for symbol compatibility; not actually used)
 ; ---------------------------------------------------------------------------
-section .data
+section .bss
 global need_reschedule
-need_reschedule: db 0
+need_reschedule: resb 1
 
 global current_task_ptr
-current_task_ptr: dd 0
+current_task_ptr: resd 1
 
 ; ---------------------------------------------------------------------------
 ; Macros
 ; ---------------------------------------------------------------------------
+section .text
 %macro ISR_NOERR 1
 global isr%1
 isr%1:

@@ -7,7 +7,7 @@ extern volatile uint8_t need_reschedule;
 extern uint32_t current_task_ptr;
 
 #define TASK_NAME_MAX   32
-#define TASK_STACK_SIZE 4096
+#define TASK_STACK_SIZE 16384  /* 16KB — Win7 GUI has deep call chains */
 
 typedef enum {
     TASK_READY = 0,
@@ -27,11 +27,13 @@ typedef struct task {
 
 void task_init(void);
 task_t* task_create(void (*entry)(void), const char* name);
+task_t* task_register(const char* name);  /* register an already-running task */
 void task_exit(void);
 void task_yield(void);
 
 task_t* task_get_current(void);
 uint32_t task_get_count(void);
+extern uint32_t task_count;
 
 void task_list(void);
 

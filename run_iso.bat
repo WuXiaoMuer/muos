@@ -10,4 +10,4 @@ echo.
 echo Starting QEMU with CD-ROM...
 echo Click the QEMU window to type.
 echo ========================================
-"C:\Program Files\qemu\qemu-system-i386.exe" -cdrom "%~dp0muos.iso" -m 128M
+"C:\Program Files\qemu\qemu-system-i386.exe" -cdrom "%~dp0muos.iso" -m 256M

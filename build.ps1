@@ -92,7 +92,7 @@ $step++
 
 # NASM: isr_stubs.s
 Write-Host ">>> [$step] Compiling src\isr_stubs.s ..." -ForegroundColor Cyan
-& $NASM -f elf32 "$SrcDir\isr_stubs.s" -o "$BuildDir\isr_stubs.o"
+& $NASM -f elf32 -w+other -o "$BuildDir\isr_stubs.o" "$SrcDir\isr_stubs.s" 2>$null
 if ($LASTEXITCODE -ne 0) { throw "NASM isr_stubs.s failed" }
 Write-Host "      OK -> build\isr_stubs.o" -ForegroundColor Green
 $step++
@@ -100,7 +100,7 @@ $step++
 # GCC: all C files
 $CFiles = @(
     "kernel", "vga", "vgagfx", "serial", "gdt", "idt", "isr", "pic",
-    "pit", "keyboard", "mouse", "mm", "task", "shell", "irq"
+    "pit", "keyboard", "mouse", "mm", "fs", "editor", "win7", "task", "shell", "irq", "test"
 )
 
 $ObjFiles = @()
@@ -119,7 +119,9 @@ foreach ($name in $CFiles) {
 Write-Host ">>> [$step] Linking kernel.elf ..." -ForegroundColor Cyan
 $AllObj = @("$BuildDir\boot.o", "$BuildDir\isr_stubs.o") + $ObjFiles
 $LdArgs = @("-m", "elf_i386", "-T", "$PSScriptRoot\linker.ld") + $AllObj + @("-o", "$BuildDir\kernel.elf", "-nostdlib")
-& $LD @LdArgs
+# Suppress the harmless RWX warning by using `--no-warn-rwx-segments`.
+$LdArgsFull = @("--no-warn-rwx-segments") + $LdArgs
+& $LD @LdArgsFull
 if ($LASTEXITCODE -ne 0) { throw "Link failed" }
 Write-Host "      OK -> build\kernel.elf" -ForegroundColor Green
 
@@ -146,8 +148,8 @@ if ($Run) {
     Write-Host "      Ctrl+Alt+G = release mouse" -ForegroundColor Gray
     Write-Host ""
     if ($Iso -and (Test-Path "$PSScriptRoot\muos.iso")) {
-        & $QEMU -cdrom "$PSScriptRoot\muos.iso" -m 128M
+        & $QEMU -cdrom "$PSScriptRoot\muos.iso" -m 256M
     } else {
-        & $QEMU -kernel "$BuildDir\kernel.elf" -m 128M
+        & $QEMU -kernel "$BuildDir\kernel.elf" -m 256M
     }
 }
