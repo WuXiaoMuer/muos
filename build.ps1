@@ -32,7 +32,6 @@ function Find-Tool {
 
 $NASM = Find-Tool "nasm"
 $GCC  = Find-Tool "i686-elf-gcc"
-$LD   = Find-Tool "i686-elf-ld"
 $QEMU = Find-Tool "qemu-system-i386"
 
 # ======================== Clean ========================
@@ -51,7 +50,6 @@ if ($Clean) {
 $missing = @()
 if (-not $NASM) { $missing += "nasm" }
 if (-not $GCC)  { $missing += "i686-elf-gcc" }
-if (-not $LD)   { $missing += "i686-elf-ld" }
 
 if ($missing.Count -gt 0) {
     Write-Host ""
@@ -69,7 +67,6 @@ Write-Host ""
 Write-Host "======================== MuOS Build ========================" -ForegroundColor Cyan
 Write-Host "NASM : $NASM"
 Write-Host "GCC  : $GCC"
-Write-Host "LD   : $LD"
 if ($QEMU) { Write-Host "QEMU : $QEMU" }
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -77,7 +74,7 @@ Write-Host ""
 # ======================== Build ========================
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
-$CFlags = @("-m32", "-ffreestanding", "-O2", "-Wall", "-Wextra",
+$CFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
              "-fno-exceptions", "-fno-stack-protector", "-nostdinc",
              "-I$PSScriptRoot\include")
 
@@ -92,7 +89,7 @@ $step++
 
 # NASM: isr_stubs.s
 Write-Host ">>> [$step] Compiling src\isr_stubs.s ..." -ForegroundColor Cyan
-& $NASM -f elf32 -w+other -o "$BuildDir\isr_stubs.o" "$SrcDir\isr_stubs.s" 2>$null
+& $NASM -f elf32 -w+other -o "$BuildDir\isr_stubs.o" "$SrcDir\isr_stubs.s"
 if ($LASTEXITCODE -ne 0) { throw "NASM isr_stubs.s failed" }
 Write-Host "      OK -> build\isr_stubs.o" -ForegroundColor Green
 $step++
@@ -115,13 +112,12 @@ foreach ($name in $CFiles) {
     $step++
 }
 
-# Link
+# Link (via GCC driver so standard flags are handled consistently)
 Write-Host ">>> [$step] Linking kernel.elf ..." -ForegroundColor Cyan
 $AllObj = @("$BuildDir\boot.o", "$BuildDir\isr_stubs.o") + $ObjFiles
-$LdArgs = @("-m", "elf_i386", "-T", "$PSScriptRoot\linker.ld") + $AllObj + @("-o", "$BuildDir\kernel.elf", "-nostdlib")
-# Suppress the harmless RWX warning by using `--no-warn-rwx-segments`.
-$LdArgsFull = @("--no-warn-rwx-segments") + $LdArgs
-& $LD @LdArgsFull
+$LdArgs = @("-nostdlib", "-T", "$PSScriptRoot\linker.ld",
+            "-Wl,--no-warn-rwx-segments") + $AllObj + @("-o", "$BuildDir\kernel.elf")
+& $GCC @LdArgs
 if ($LASTEXITCODE -ne 0) { throw "Link failed" }
 Write-Host "      OK -> build\kernel.elf" -ForegroundColor Green
 
@@ -132,7 +128,11 @@ Write-Host ""
 # ======================== ISO / Run ========================
 if ($Iso) {
     Write-Host ">>> [ISO] Building bootable ISO via Python ..." -ForegroundColor Cyan
-    $python = "C:\Users\wuxiaomu\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+    $python = Find-Tool "python"
+    if (-not $python) {
+        Write-Host "[ERROR] python not found in PATH." -ForegroundColor Red
+        exit 1
+    }
     & $python "$PSScriptRoot\make_iso.py"
     if ($LASTEXITCODE -ne 0) { throw "ISO build failed" }
     Write-Host "      OK -> muos.iso" -ForegroundColor Green

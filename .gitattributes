@@ -1,2 +1,10 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Binary files - never diff/normalize these
+*.bin binary
+*.exe binary
+*.elf binary
+*.iso binary
+*.png binary
+*.zip binary

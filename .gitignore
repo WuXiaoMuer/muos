@@ -1,6 +1,12 @@
 # Build output
 build/
 
+# Root-level build artifacts / logs
+/kernel.elf
+/kernel.bin
+/new_serial.log
+*.log
+
 # ISO image
 *.iso
 
@@ -14,3 +20,5 @@ Thumbs.db
 
 # Large toolchain binaries (over 100MB)
 /toolchain/
+
+i686-elf-tools-windows.zip

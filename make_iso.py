@@ -1,12 +1,33 @@
 # make_iso.py - Build bootable MuOS ISO (custom bootloader)
 import os, struct, subprocess, errno, math
 
-PROJECT = r"C:\Users\wuxiaomu\Desktop\muos"
+PROJECT = os.path.dirname(os.path.abspath(__file__))
 SRC     = os.path.join(PROJECT, "src")
 TOOLS   = os.path.join(PROJECT, "tools", "nasm")
 NASM    = os.path.join(TOOLS, "nasm.exe")
+if not os.path.isfile(NASM):
+    # Fall back to NASM on PATH
+    path_nasm = None
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(d, "nasm.exe")
+        if os.path.isfile(candidate):
+            path_nasm = candidate
+            break
+    if path_nasm is None:
+        raise SystemExit("[ERROR] nasm.exe not found: run setup-tools.ps1 or install NASM")
+    NASM = path_nasm
 GCC_BIN = os.path.join(PROJECT, "toolchain", "bin")
 OBJCOPY = os.path.join(GCC_BIN, "i686-elf-objcopy.exe")
+if not os.path.isfile(OBJCOPY):
+    path_objcopy = None
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(d, "i686-elf-objcopy.exe")
+        if os.path.isfile(candidate):
+            path_objcopy = candidate
+            break
+    if path_objcopy is None:
+        raise SystemExit("[ERROR] i686-elf-objcopy.exe not found: extract i686-elf-tools to toolchain/")
+    OBJCOPY = path_objcopy
 BUILD   = os.path.join(PROJECT, "build")
 ISO_OUT = os.path.join(PROJECT, "muos.iso")
 
