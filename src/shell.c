@@ -118,7 +118,7 @@ static void cmd_logo(void){
     vga_print("\n");
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
 }
-static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS v0.4\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
+static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS v0.3\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
 static void cmd_reboot(void){vga_print("Reboot...\n");for(volatile int i=0;i<5000000;i++)__asm__ volatile("nop");uint8_t z[6]={0};__asm__ volatile("lidt %0"::"m"(z));__asm__ volatile("int $0");}
 static void cmd_halt(void){vga_print("Halted.\n");__asm__ volatile("cli;hlt");}
 static void cmd_crash(void){vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));vga_print("\nPANIC!\n\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));*(volatile uint32_t*)0=0xDEADBEEF;}

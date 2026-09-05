@@ -42,7 +42,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     /* Boot banner - VGA */
     vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
     vga_print("============================================\n");
-    vga_print("             MuOS Kernel v0.2\n");
+    vga_print("             MuOS Kernel v0.3\n");
     vga_print("         x86 32-bit Microkernel\n");
     vga_print("============================================\n\n");
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));

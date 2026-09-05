@@ -1,204 +1,117 @@
-# MuOS - 最小可启动内核（Windows 本地开发版）
+# MuOS — 从零编写的 x86 32 位内核(Windows 本地开发)
 
-在 Windows 上从零构建一个 x86 32位最小操作系统，不依赖 WSL / Linux。
+在 Windows 上原生开发(不依赖 WSL / Linux)的教学型操作系统内核。当前版本包含:
+
+- **完整启动链**:Multiboot1(QEMU `-kernel`)+ 自研 El Torito 光盘引导
+- **硬件抽象**:GDT / IDT(256 项全覆盖)/ PIC / PIT / PS/2 键盘 / 串口 / VGA 文本模式
+- **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、全 RAM 恒等映射分页、内核堆(kmalloc/kfree/kcalloc)
+- **RAM 文件系统** + 全屏文本编辑器
+- **"MuOS 7" 桌面**:Win7 风格文本模式 GUI(任务栏、开始菜单、可拖拽窗口)
+- **46 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
+
+演进目标见 **[ROADMAP.md](ROADMAP.md)**:以 Linux ABI 兼容(int 0x80 + ELF32,运行静态 i386 Linux 二进制)为主线;NT/Win32 兼容为长期远景。
 
 ## 项目结构
 
 ```
 muos/
-├── boot.s          ; 裸 ELF 启动入口 + 栈初始化（默认，QEMU -kernel 直接加载）
-├── boot_grub.s     ; Multiboot2 启动入口（备用，需 grub-mkrescue 制作 ISO）
-├── kernel.c        ; C 语言内核主程序，操作 VGA 文本缓冲区
-├── linker.ld       ; 链接脚本，内核加载到 1MB 地址
-├── grub.cfg        ; GRUB2 启动菜单配置
-├── build.ps1       ; PowerShell 一键构建/运行脚本
-└── README.md       ; 本文件
+├── src/             内核源码(20 个 .c + 3 个 .s)
+│   ├── boot.s       Multiboot1 入口(入口=镜像首字节,jmp 跨过内联 multiboot 头)
+│   ├── boot_cd.s    El Torito 光盘引导(实模式→保护模式→搬运内核→跳转)
+│   ├── isr_stubs.s  中断/异常汇编桩
+│   ├── kernel.c     内核主入口,初始化序列
+│   ├── mm.c         mmap 解析 / 位图分配器 / 分页
+│   ├── kheap.c      内核堆(first-fit 自由链表)
+│   ├── string.c     freestanding 字符串/内存函数(标准名)
+│   ├── fs.c editor.c win7.c shell.c task.c test.c ...
+├── include/         头文件(与 src 配对,muos_ 前缀 include guard)
+├── build.ps1        一键构建 / 运行 / ISO / 清理
+├── make_iso.py      Python + pycdlib 自制可启动 ISO
+├── setup-tools.ps1  自动下载 NASM / QEMU 到 tools\
+├── linker.ld        链接脚本(内核加载到 1MB)
+├── run.bat          双击:构建 + QEMU 快速启动
+├── run_iso.bat      双击:构建 + ISO 启动
+├── clean.bat        清理构建产物
+└── CODE_LOGIC.md    代码逻辑详解(启动/中断/内存/任务/Shell)
 ```
 
-## 启动流程
+工具目录(均被 gitignore,不影响仓库体积):`toolchain\` 交叉编译器、`tools\` NASM/QEMU。
 
-```
-QEMU -kernel (裸 ELF)  →  boot.s (设置栈)  →  kernel_main()  →  VGA 显示
-```
-
-> 默认方案不使用 GRUB，由 QEMU 直接加载 32-bit ELF。保留 `boot_grub.s` 供以后制作 GRUB ISO 使用。
-
-## 环境准备（Windows）
-
-需要安装 3 个工具：**NASM** + **i686-elf-gcc 交叉编译器** + **QEMU**
-
-### 1. 安装 NASM（汇编器）
-
-1. 访问 https://www.nasm.us/
-2. 下载最新 Windows 安装包（如 `nasm-2.16.03-installer-x64.exe`）
-3. 双击安装，**勾选"Add to PATH"**
-
-### 2. 安装 i686-elf-gcc（交叉编译器）
-
-这是最关键的一步。Windows 自带的 MinGW gcc 是为 Windows PE 格式设计的，不能直接编译裸机内核。
-
-**推荐：使用 lordmilko 预编译工具链**
-
-1. 访问 https://github.com/lordmilko/i686-elf-tools/releases
-2. 下载最新版 `i686-elf-tools-windows.zip`
-3. 解压到任意目录，例如 `C:\i686-elf-tools`
-4. 将 `C:\i686-elf-tools\bin` 加入系统 PATH
-
-> 该工具链包含：`i686-elf-gcc`、`i686-elf-ld`、`i686-elf-as` 等
-
-**替代方案：MSYS2（如果你已安装）**
-
-```bash
-pacman -S mingw-w64-i686-elf-gcc
-```
-
-### 3. 安装 QEMU（虚拟机）
-
-1. 访问 https://www.qemu.org/download/#windows
-2. 下载 `qemu-w64-setup-xxxx.exe`
-3. 双击安装，**勾选"Add to PATH"**
-
-### 验证安装
-
-打开 PowerShell，运行：
+## 快速开始
 
 ```powershell
-nasm -v
-i686-elf-gcc --version
-qemu-system-i386 --version
-```
+# 环境初始化(自动下载 NASM + QEMU 到 tools\)
+.\setup-tools.ps1
 
-三条命令都能显示版本号，说明环境就绪。
-
-## 编译与运行
-
-### 方式一：PowerShell 一键脚本（推荐）
-
-在项目目录打开 PowerShell：
-
-```powershell
-# 仅编译
+# 构建 build\kernel.elf
 .\build.ps1
 
-# 编译 + 直接运行（默认裸 ELF 方案，最快）
+# 构建 + QEMU 运行(最快路径)
 .\build.ps1 -Run
 
-# 清理构建产物
+# 构建 + 生成 muos.iso + 光盘启动(需要 python + pycdlib:pip install pycdlib)
+.\build.ps1 -Iso -Run
+
+# 清理
 .\build.ps1 -Clean
-
-# 使用 GRUB/multiboot2 方案编译（需 grub-mkrescue 制作 ISO）
-.\build.ps1 -Grub -Run
-
-# 编译 + 制作 ISO + 运行（需要 grub-mkrescue，见下方说明）
-.\build.ps1 -Grub -Iso -Run
 ```
 
-### 方式二：手动命令
+工具查找顺序:PATH → 仓库内 `toolchain\` / `tools\` → 常见安装位置(含 `X:\qemu`)。也可双击 `run.bat` / `run_iso.bat`。
+
+### 交叉编译器
+
+Windows 的 MinGW gcc 面向 PE 格式,不能编译裸机内核,需要 `i686-elf-gcc`:
+
+1. 从 https://github.com/lordmilko/i686-elf-tools/releases 下载 `i686-elf-tools-windows.zip`
+2. 解压到仓库根目录的 `toolchain\`(build.ps1 会自动找到),或解压到任意目录后加入 PATH
+
+### 手动构建(等价命令)
 
 ```powershell
-# 编译汇编
-nasm -f elf32 boot.s -o boot.o
-
-# 编译 C 内核
-i686-elf-gcc -m32 -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-stack-protector -c kernel.c -o kernel.o
-
-# 链接为 ELF
-i686-elf-ld -m elf_i386 -T linker.ld boot.o kernel.o -o kernel.elf -nostdlib
-
-# 直接用 QEMU 运行 ELF（开发调试最快）
-qemu-system-i386 -kernel kernel.elf
+nasm -f elf32 src\boot.s -o build\boot.o
+nasm -f elf32 src\isr_stubs.s -o build\isr_stubs.o
+i686-elf-gcc -m32 -ffreestanding -O2 -g -Wall -Wextra -fno-exceptions -fno-stack-protector -nostdinc -Iinclude -fno-tree-loop-distribute-patterns -c src\kernel.c -o build\kernel.o
+i686-elf-gcc -nostdlib -T linker.ld -Wl,--no-warn-rwx-segments build\boot.o build\isr_stubs.o build\*.o -o build\kernel.elf
+qemu-system-i386 -kernel build\kernel.elf -m 256M
 ```
 
-如果一切正常，你会看到 QEMU 窗口黑屏后显示：
+## 两条启动路径
 
-```
-============================
-      MuOS Booted!
-  Hello from Windows dev!
-============================
-```
+| 路径 | 入口 | 说明 |
+|------|------|------|
+| QEMU `-kernel` | Multiboot1 头 | QEMU 直接加载 ELF,boot.s 传 magic/mb_info 给 kernel_main |
+| 光盘 `-cdrom` | El Torito → boot_cd.s | 自研引导扇区:实模式 → A20 → 平坦 GDT → 保护模式 → 拷贝 flat kernel 到 0x100000 → 跳转 |
 
-## 制作可启动 ISO（可选）
+**布局约束**:内核入口 `start` 必须位于镜像第一个字节(boot.s 用 `jmp real_start` 跨过内联的 multiboot 头)。ISO 路径把 flat binary 拷到 0x100000 后直接跳过去,若 multiboot 头排在最前就会把魔数当指令执行。Multiboot1 规范只要求头在镜像前 8KB 内,`jmp` 跨头方案同时满足两条路径。
 
-制作 ISO 需要 `grub-mkrescue` 和 `xorriso`，这两个工具在 Windows 上没有原生版本，有以下方案：
+ISO 路径没有 multiboot 信息(EBX=0),内存管理回退到 mem_upper 默认值(32MB)——见 ROADMAP。
 
-### 方案 A：MSYS2（推荐）
+## 自检套件
 
-1. 安装 [MSYS2](https://www.msys2.org/)
-2. 在 MSYS2 UCRT64 终端中运行：
+内核启动时在进入 Shell 前自动运行 `tests_run()`(src\test.c,VGA + 串口双输出,失败会打印 `SELF-TEST FAILED`),覆盖:
 
-```bash
-pacman -S grub xorriso
-```
-
-3. 将 MSYS2 的 `ucrt64\bin` 加入系统 PATH
-4. 然后运行 `.\build.ps1 -Iso -Run`
-
-### 方案 B：WSL（如果你改变主意）
-
-```bash
-sudo apt install grub-pc-bin xorriso
-make iso
-```
-
-### 手动制作 ISO
-
-```powershell
-mkdir -p iso/boot/grub
-cp kernel.elf iso/boot/
-cp grub.cfg iso/boot/grub/
-grub-mkrescue -o muos.iso iso
-qemu-system-i386 -cdrom muos.iso
-```
-
-## 代码说明
-
-### boot.s（默认）
-
-- 裸 ELF 入口，QEMU `-kernel` 直接加载 32-bit ELF
-- 设置 16KB 栈空间，调用 `kernel_main`
-- 内核返回后执行 `cli; hlt` 永久停机
-
-### boot_grub.s（备用）
-
-- 定义 Multiboot2 header（魔数 `0xE85250D6`）
-- 供 GRUB 引导使用，需 `grub-mkrescue` 制作 ISO
-
-### kernel.c
-
-- 直接操作 VGA 文本缓冲区（物理地址 `0xB8000`）
-- 每个字符占 2 字节：`[属性字节][ASCII字符]`
-- 默认属性 `0x07` = 黑色背景 + 浅灰色文字
-- 包含简单的 `clear_screen`、`putchar`、`print` 函数
-
-### linker.ld
-
-- `ENTRY(start)` 指定入口点为汇编的 `start` 标签
-- `. = 0x100000` 将内核加载到 1MB 处
-
-## 进阶方向
-
-这是 **第一阶段：Hello OS**。后续可以逐步添加：
-
-- **GDT / IDT**：进入保护模式、设置中断描述符表
-- **键盘驱动**：读取 8042 键盘控制器扫描码
-- **定时器**：PIT 8253 可编程间隔定时器
-- **内存管理**：物理页分配器、虚拟内存（分页）
-- **简单 GUI**：绘制像素、矩形、窗口装饰
-- **多任务**：上下文切换、进程调度
+- 物理分配器:分配/释放计数、多页连续分配
+- 内核堆:16 字节对齐、哨兵写入、kcalloc 零化、100 块随机分配释放、双重释放防护、超界请求返回 NULL
+- 分页:4MB 以上帧的写读 + `mm_virt_to_phys` 恒等校验
+- mmap:位图覆盖加载器报告的全部 RAM
+- fs / vga / keyboard / pit / task
 
 ## 踩坑备忘
 
 | 问题 | 原因 | 解决 |
 |------|------|------|
-| QEMU 报错 `Error loading uncompressed kernel without PVH ELF Note` | 新版 QEMU Windows 无法直接用 `-kernel` 加载 multiboot2 ELF | 改用裸 ELF 方案（boot.s），或制作 GRUB ISO |
-| `grub-mkrescue` 找不到 | Windows 无原生版本 | 安装 MSYS2 或改用 `-kernel` 直接加载 ELF |
-| QEMU 黑屏无输出 | multiboot header 错误 / 未对齐 | 检查 `boot_grub.s` 中 header 的魔数、校验和、结束标签 |
-| 链接报错 `undefined reference to 'start'` | linker.ld 入口与汇编标签不匹配 | 确保 `ENTRY(start)` 和 `global start` 一致 |
-| `i686-elf-gcc` 找不到 | 未加入 PATH 或下载了错误版本 | 使用 lordmilko 预编译包，确认 `bin` 目录在 PATH 中 |
+| QEMU 报 `Error loading uncompressed kernel without PVH ELF Note` | 新版 QEMU 不能 `-kernel` 加载 multiboot2 ELF | 用 boot.s 的 Multiboot1 裸 ELF 方案 |
+| ISO 启动黑屏/三重故障 | multiboot 头被链接到镜像最前,0x100000 处是魔数不是代码 | boot.s 已改为入口 `jmp` 跨头;头仍在前 8KB 内 |
+| 链接神秘报 `undefined reference to memcpy/memset` | `-ffreestanding` 下 GCC 仍会为结构拷贝/清零隐式生成这两个调用 | 提供 string.c(标准名实现) |
+| string.c 自己的循环被编译成调用自己 | GCC 在 -O2 可能将字节循环识别为 memcpy/memset 模式 | 全局加 `-fno-tree-loop-distribute-patterns` |
+| 中断处理里裸 `sti` 破坏调用方临界区 | cli/sti 应成对保存/恢复 EFLAGS(pushfl/popfl),而不是盲目开中断 | keyboard.c 的 kbd_lock/kbd_unlock 模式 |
+| 物理分配器发 4MB 以上帧却 Page Fault | 分页只恒等映射了前 4MB(旧版) | mm_init 现在恒等映射全部 RAM |
+| multiboot mmap 字段读出来是垃圾 | mmap_length/mmap_addr 在偏移 44/48,截断的结构体少定义了 syms[4] | 用 include\multiboot.h 的完整定义 |
+| 下载 qemu-w64-setup-20250424.exe 404 | 上游只保留最近几个版本 | setup-tools.ps1 已指向当前版本;旧版本号需手动更新 |
 
 ## 参考资源
 
-- [OSDev Wiki - GCC Cross-Compiler](https://wiki.osdev.org/GCC_Cross-Compiler)
-- [Multiboot2 Specification](https://www.gnu.org/software/grub/manual/multiboot2/multiboot.html)
-- [VGA Text Mode (OSDev)](https://wiki.osdev.org/VGA_Hardware)
+- [OSDev Wiki](https://wiki.osdev.org/) — 交叉编译器、Multiboot、VGA、PIT、PS/2
+- [Multiboot 0.6.96 规范](https://www.gnu.org/software/grub/manual/multiboot/multiboot.html)
+- [Linux x86 boot protocol / i386 System V ABI](https://refspecs.linuxbase.org/elf/abi386-4.pdf) — Linux ABI 兼容工作的规范基础
+- 代码细节与设计意图:[CODE_LOGIC.md](CODE_LOGIC.md);演进计划:[ROADMAP.md](ROADMAP.md)
