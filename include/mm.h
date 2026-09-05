@@ -35,6 +35,7 @@ uint32_t mm_get_total_pages(void);
 uint32_t mm_get_free_pages(void);
 uint32_t mm_get_used_pages(void);
 uint32_t mm_get_mmap_regions(void);
+uint32_t mm_get_mem_upper_kb(void);
 
 void*  mm_alloc_pages(uint32_t count);
 void   mm_free_pages(void* addr, uint32_t count);

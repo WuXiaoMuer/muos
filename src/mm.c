@@ -14,6 +14,7 @@ static uint32_t* bitmap = NULL;
 static uint32_t  total_pages = 0;
 static uint32_t  free_pages = 0;
 static uint32_t  mmap_region_count = 0;
+static uint32_t  reported_mem_upper_kb = 0;  /* loader-reported RAM above 1MB */
 
 /* Page directory (must be page-aligned) */
 static uint32_t* page_directory __attribute__((aligned(PAGE_SIZE))) = NULL;
@@ -63,6 +64,7 @@ void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
     bitmap = (uint32_t*)kernel_end;
 
     const uint64_t ram_cap = (uint64_t)MM_MAX_RAM_MB * 1024 * 1024;
+    if (mb && (mb->flags & MULTIBOOT_FLAG_MEM)) reported_mem_upper_kb = mb->mem_upper;
 
     /* Pass 1: determine RAM top. Prefer the BIOS memory map (E820 via
      * multiboot); fall back to mem_upper when the loader provided none
@@ -199,6 +201,7 @@ uint32_t mm_get_total_pages(void) { return total_pages; }
 uint32_t mm_get_free_pages(void)  { return free_pages; }
 uint32_t mm_get_used_pages(void)  { return total_pages - free_pages; }
 uint32_t mm_get_mmap_regions(void) { return mmap_region_count; }
+uint32_t mm_get_mem_upper_kb(void) { return reported_mem_upper_kb; }
 
 void* mm_alloc_pages(uint32_t count) {
     if (count == 0 || count > total_pages || free_pages < count) return NULL;

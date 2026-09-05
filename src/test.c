@@ -3,6 +3,7 @@
 #include "vga.h"
 #include "serial.h"
 #include "mm.h"
+#include "kheap.h"
 #include "fs.h"
 #include "keyboard.h"
 #include "pit.h"
@@ -149,6 +150,97 @@ static void test_task_info(void) {
     CHECK(t->name[0] != '\0', "current task has a name");
 }
 
+/* ---------- Kernel heap tests ---------- */
+static void test_heap(void) {
+    if (!kheap_ready()) {
+        tfail("kernel heap initialized");
+        return;
+    }
+    tpass("kernel heap initialized");
+
+    void* a = kmalloc(1);
+    CHECK(a != NULL, "kmalloc(1) returns non-NULL");
+    CHECK(((uint32_t)a & 15) == 0, "kmalloc payload is 16-byte aligned");
+    kfree(a);
+
+    void* b = kmalloc(17);
+    CHECK(b != NULL && ((uint32_t)b & 15) == 0, "kmalloc(17) non-NULL and aligned");
+    if (b) {
+        for (int i = 0; i < 17; i++) ((uint8_t*)b)[i] = 0xA5;  /* sentinel */
+        kfree(b);
+    }
+
+    void* c = kcalloc(8, 8);
+    CHECK(c != NULL, "kcalloc(8,8) non-NULL");
+    if (c) {
+        bool_t zeroed = true;
+        for (int i = 0; i < 64; i++) if (((uint8_t*)c)[i]) zeroed = false;
+        CHECK(zeroed, "kcalloc memory is zeroed");
+        kfree(c);
+    }
+
+    /* Churn: 100 small allocations then all freed */
+    void* blocks[100];
+    bool_t all = true;
+    for (int i = 0; i < 100; i++) {
+        blocks[i] = kmalloc(24);
+        if (!blocks[i]) all = false;
+    }
+    for (int i = 0; i < 100; i++) kfree(blocks[i]);
+    CHECK(all, "100 small allocations succeed and free");
+
+    /* Double free and out-of-range free must be ignored safely */
+    void* d = kmalloc(32);
+    kfree(d);
+    kfree(d);
+    kfree((void*)0x1);
+    void* e = kmalloc(32);
+    CHECK(e != NULL, "heap usable after double-free attempt");
+    kfree(e);
+
+    CHECK(kmalloc(2u * 1024 * 1024) == NULL, "oversized kmalloc returns NULL");
+}
+
+/* ---------- Paging beyond 4MB ---------- */
+static void test_paging_high(void) {
+    if (mm_get_total_pages() < 1024) {
+        tpass("paging high address test skipped (RAM < 4MB)");
+        return;
+    }
+    /* First-fit hands out frames in ascending order, so allocating
+     * ~4MB worth must push the allocator past the old 4MB mapping
+     * limit. Writing the highest frame proves the identity map works
+     * there (any mapping gap would page-fault instantly). */
+    void* pages[1100];
+    uint32_t n = 0;
+    uint32_t hi = 0;
+    uint32_t free0 = mm_get_free_pages();
+    for (; n < 1100; n++) {
+        pages[n] = mm_alloc_page();
+        if (!pages[n]) break;
+        if ((uint32_t)pages[n] > hi) hi = (uint32_t)pages[n];
+    }
+    CHECK(hi >= 0x400000, "identity map reaches frames above 4MB");
+    if (hi >= 0x400000) {
+        volatile uint32_t* p = (volatile uint32_t*)hi;
+        *p = 0xA5A5A5A5;
+        CHECK(*p == 0xA5A5A5A5, "write/read frame above 4MB");
+        CHECK(mm_virt_to_phys(hi) == hi, "virt_to_phys identity above 4MB");
+    }
+    for (uint32_t i = 0; i < n; i++) mm_free_page(pages[i]);
+    CHECK(mm_get_free_pages() == free0, "free count restored after test");
+}
+
+/* ---------- Memory map coverage ---------- */
+static void test_mmap(void) {
+    CHECK(mm_get_free_pages() > 0, "free frames available");
+    /* The bitmap must cover at least what the loader reported
+     * (mem_upper + first MB), with one page of rounding slack. */
+    uint64_t covered = (uint64_t)mm_get_total_pages() * PAGE_SIZE + PAGE_SIZE;
+    uint64_t reported = ((uint64_t)mm_get_mem_upper_kb() + 1024) * 1024;
+    CHECK(covered >= reported, "bitmap covers reported RAM");
+}
+
 int tests_run(void) {
     passed = 0; failed = 0;
 
@@ -162,6 +254,9 @@ int tests_run(void) {
     __asm__ volatile ("cli");
 
     test_mm();
+    test_heap();
+    test_paging_high();
+    test_mmap();
     test_fs();
     test_vga();
     test_keyboard();
