@@ -59,13 +59,21 @@ irq_common:
     push esp
     call irq_handler
     add esp, 4
-.no_switch:
     pop gs
     pop fs
     pop es
     pop ds
     popa
     add esp, 8
+    iret
+
+; ---------------------------------------------------------------------------
+; Ignore stub: silently dismiss unexpected vectors (0x30-0xFF).
+; Receives a plain interrupt frame (no error code / pushed vector).
+; Vector 0x80 is reserved for the future int 0x80 syscall interface.
+; ---------------------------------------------------------------------------
+global isr_ignore
+isr_ignore:
     iret
 
 ; ---------------------------------------------------------------------------

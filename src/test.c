@@ -85,7 +85,7 @@ static void test_fs(void) {
     int len = 0; while (data[len]) len++;
     int w = fs_write(fd, data, len);
     CHECK(w == len, "fs_write returns written length");
-    CHECK((int)fs_size(n0) == len, "fs_size matches written length");
+    CHECK((int)fs_size(fs_open("__test_a")) == len, "fs_size matches written length");
 
     char buf[64] = {0};
     int r = fs_read(fd, buf, sizeof(buf) - 1);

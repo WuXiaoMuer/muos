@@ -17,7 +17,7 @@ void idt_init(void) {
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (uint32_t)&idt;
 
-    /* Set all 256 entries to a default handler first, then override exceptions */
+    /* Exceptions 0-31, then override with real handlers below */
     /* Exception ISRs (0-31) */
     idt_set_gate(0,  (uint32_t)isr0,  0x08, 0x8E);
     idt_set_gate(1,  (uint32_t)isr1,  0x08, 0x8E);
@@ -69,6 +69,12 @@ void idt_init(void) {
     idt_set_gate(0x2D, (uint32_t)irq13, 0x08, 0x8E);
     idt_set_gate(0x2E, (uint32_t)irq14, 0x08, 0x8E);
     idt_set_gate(0x2F, (uint32_t)irq15, 0x08, 0x8E);
+
+    /* Vectors 0x30-0xFF: present no-op gates so unexpected/spurious
+     * interrupts iret instead of raising #NF cascades. 0x80 is reserved
+     * for the future int 0x80 syscall interface. */
+    for (uint16_t v = 0x30; v < 256; v++)
+        idt_set_gate((uint8_t)v, (uint32_t)isr_ignore, 0x08, 0x8E);
 
     __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
 }

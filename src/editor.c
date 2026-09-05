@@ -115,13 +115,7 @@ static void save_file(void) {
     int fd = fs_open(filename);
     if(fd < 0) fd = fs_create(filename);
     if(fd < 0) return;
-    /* Calculate total size */
-    int total = 0;
-    for(int i = 0; i < line_count; i++) {
-        int len = 0; while(lines[i][len]) len++;
-        total += len + 1;  /* line + newline */
-    }
-    /* Build buffer */
+    /* Build buffer (silently truncated at 1023 bytes; fs cap is 1KB) */
     char buf[1024]; int bp = 0;
     for(int i = 0; i < line_count && bp < 1023; i++) {
         for(char* p = lines[i]; *p && bp < 1023; p++) buf[bp++] = *p;
@@ -193,7 +187,9 @@ void editor_run(const char* fn) {
         }
 
         if(c == 0x13) { /* Ctrl+S */ save_file(); draw_status(); continue; }
-        if(c == 0x12) { /* Ctrl+R */ load_file(filename); draw_content(); draw_status(); continue; }
+        if(c == 0x12) { /* Ctrl+R: reload from disk (needs a filename) */
+            if(filename[0]) load_file(filename);
+            draw_content(); draw_status(); continue; }
 
         switch((unsigned char)c) {
         case KEY_ESC: vga_clear(); return;

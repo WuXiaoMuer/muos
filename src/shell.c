@@ -94,7 +94,7 @@ static void readline(void){
     default:if(c>=' '&&c<127)isrt(c);break;
     }}
 }
-static int tokenize(char*b,char**a){int n=0;char*p=b;while(*p){while(*p==' ')p++;if(!*p)break;a[n++]=p;while(*p&&*p!=' ')p++;if(*p)*p++=0;}a[n]=NULL;return n;}
+static int tokenize(char*b,char**a,int max_args){int n=0;char*p=b;while(*p){while(*p==' ')p++;if(!*p)break;if(n>=max_args-1)break;a[n++]=p;while(*p&&*p!=' ')p++;if(*p)*p++=0;}a[n]=NULL;return n;}
 
 /* ═══════════════════ Commands ═══════════════════ */
 static void cmd_help(void){
@@ -102,7 +102,7 @@ static void cmd_help(void){
     vga_print("  help clear echo mem tasks time ps logo\n");
     vga_print("  version gui win7 test reboot halt crash\n");
 }
-static void cmd_test(void){ tests_run(); }
+static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
 static void cmd_clear(void){vga_clear();}
 static void cmd_echo(char**a,int n){for(int i=1;i<n;i++){vga_print(a[i]);if(i<n-1)vga_putchar(' ');}vga_putchar('\n');}
 static void cmd_mem(void){vga_print("Mem: ");vga_print_dec(mm_get_total_pages()*4);vga_print("KB tot ");vga_print_dec(mm_get_free_pages()*4);vga_print("KB free\n");}
@@ -240,7 +240,7 @@ static void cmd_gui(void){
     redraw_all();
 
     while(1){
-        {uint32_t s=pit_get_ticks()/100;char b[8];nts(b,s);fdt(65,0,b,vga_entry_color(VGA_LIGHT_GREEN,VGA_BLUE));fdt(65+slen(b),0,"s",vga_entry_color(VGA_LIGHT_GREEN,VGA_BLUE));}
+        {uint32_t s=pit_get_ticks()/100;char b[16];nts(b,s);fdt(65,0,b,vga_entry_color(VGA_LIGHT_GREEN,VGA_BLUE));fdt(65+slen(b),0,"s",vga_entry_color(VGA_LIGHT_GREEN,VGA_BLUE));}
         {mouse_state_t ms=mouse_get_state();int mx=ms.x/8,my=ms.y/16;char b[16];b[0]='X';b[1]=':';nts(b+2,(uint32_t)mx);int p=2+slen(b+2);b[p++]='Y';b[p++]=':';nts(b+p,(uint32_t)my);b[p+slen(b+p)]=0;fdt(44,24,b,vga_entry_color(VGA_BLACK,VGA_LIGHT_GREY));}
         char c=keyboard_getchar();
         switch((unsigned char)c){
@@ -260,7 +260,7 @@ static void cmd_gui(void){
 static void execute(void){
     if(!cmd_len)return;
     h_add(cmd_buf);
-    char*av[MAX_ARGS]; int ac=tokenize(cmd_buf,av); if(!ac)return;
+    char*av[MAX_ARGS]; int ac=tokenize(cmd_buf,av,MAX_ARGS); if(!ac)return;
     char*cmd=av[0];
     if(streq(cmd,"help"))cmd_help();
     else if(streq(cmd,"clear")||streq(cmd,"cls"))cmd_clear();
@@ -289,9 +289,9 @@ static void execute(void){
 void shell_run(void){
     fs_init();
     fs_create("readme.txt");
-    fs_write(fs_open("readme.txt"), "Welcome to MuOS 7!\nType 'help' for commands.\nType 'win7' for desktop.", 67);
+    fs_write(fs_open("readme.txt"), "Welcome to MuOS 7!\nType 'help' for commands.\nType 'win7' for desktop.", 69);
     fs_create("notes.txt");
-    fs_write(fs_open("notes.txt"), "MuOS 7 - x86 Microkernel\nBuilt with GCC 15 + NASM", 53);
+    fs_write(fs_open("notes.txt"), "MuOS 7 - x86 Microkernel\nBuilt with GCC 15 + NASM", 49);
 
     vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
     static const char* boot_art[] = {

@@ -6,6 +6,10 @@ static uint32_t pit_freq = 0;
 static uint32_t pit_ms_per_tick = 0;
 
 void pit_init(uint32_t frequency) {
+    /* Clamp so the divisor fits in 16 bits and ms_per_tick stays nonzero */
+    if (frequency < 19) frequency = 19;          /* 1193180/65535 ≈ 18.2 Hz */
+    if (frequency > PIT_FREQUENCY) frequency = PIT_FREQUENCY;
+
     pit_freq = frequency;
     pit_ms_per_tick = 1000 / frequency;
     pit_ticks = 0;
@@ -26,11 +30,4 @@ void pit_tick(void) {
 
 uint32_t pit_get_ticks(void) {
     return pit_ticks;
-}
-
-void pit_sleep(uint32_t ms) {
-    uint32_t target = pit_ticks + ms / pit_ms_per_tick;
-    while (pit_ticks < target) {
-        __asm__ volatile ("hlt");
-    }
 }

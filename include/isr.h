@@ -35,5 +35,6 @@ extern void isr24(void);  extern void isr25(void);
 extern void isr26(void);  extern void isr27(void);
 extern void isr28(void);  extern void isr29(void);
 extern void isr30(void);  extern void isr31(void);
+extern void isr_ignore(void);  /* no-op stub for unexpected vectors */
 
 #endif

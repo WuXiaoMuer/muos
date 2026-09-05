@@ -137,6 +137,8 @@ uint16_t vga_get_cursor_row(void) { return vga_row; }
 uint16_t vga_get_cursor_col(void) { return vga_col; }
 
 void vga_set_cursor(uint16_t row, uint16_t col) {
+    if (row >= VGA_HEIGHT) row = VGA_HEIGHT - 1;
+    if (col >= VGA_WIDTH)  col = VGA_WIDTH - 1;
     vga_row = row;
     vga_col = col;
     vga_update_cursor();
