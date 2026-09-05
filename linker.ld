@@ -4,7 +4,6 @@ SECTIONS
 {
     . = 0x100000;   /* 1 MB - 内核加载位置 */
 
-    .multiboot : { *(.multiboot) }
     .text      : { *(.text) }
     .rodata    : { *(.rodata) }
     .data      : { *(.data) }
