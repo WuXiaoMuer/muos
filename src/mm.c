@@ -19,9 +19,6 @@ static uint32_t  mmap_region_count = 0;
 static uint32_t* page_directory __attribute__((aligned(PAGE_SIZE))) = NULL;
 static uint32_t  page_dir_phys = 0;
 
-/* First page table (maps first 4MB - identity) */
-static uint32_t* page_table_0 __attribute__((aligned(PAGE_SIZE))) = NULL;
-
 static void bitmap_set(uint32_t frame) {
     uint32_t idx = frame / 32;
     uint32_t bit = frame % 32;
@@ -134,30 +131,37 @@ void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
         }
     }
 
-    /* Allocate page directory and first page table */
+    /* Allocate page directory */
     page_directory = (uint32_t*)mm_alloc_page();
     if (!page_directory) return;
     page_dir_phys = (uint32_t)page_directory;
+    for (uint32_t i = 0; i < 1024; i++) page_directory[i] = 0;
 
-    page_table_0 = (uint32_t*)mm_alloc_page();
-    if (!page_table_0) return;
-
-    /* Clear page directory and page table */
-    for (uint32_t i = 0; i < 1024; i++) {
-        page_directory[i] = 0;
-        page_table_0[i] = 0;
+    /* Identity-map ALL RAM below ram_top. Runs with paging still off,
+     * so touching physical addresses directly is safe. Page tables are
+     * allocated from the bitmap allocator itself: frames are handed out
+     * in ascending order starting right after the kernel, so every new
+     * page table lies inside an already-mapped range (the first tables
+     * cover the low 4MB where all subsequent tables are allocated) and
+     * the bootstrap needs no temporary mappings. This closes the old
+     * allocator/paging mismatch where frames above 4MB were handed out
+     * while still unmapped. */
+    for (uint32_t pfn = 0; pfn < total_pages; pfn++) {
+        uint32_t pde = pfn >> 10;
+        uint32_t* pt;
+        if (!(page_directory[pde] & PDE_PRESENT)) {
+            pt = (uint32_t*)mm_alloc_page();
+            if (!pt) return;  /* ran out of frames while bootstrapping */
+            for (uint32_t i = 0; i < 1024; i++) pt[i] = 0;
+            page_directory[pde] = (uint32_t)pt | PAGE_KERNEL;
+        } else {
+            pt = (uint32_t*)(page_directory[pde] & PAGE_MASK);
+        }
+        pt[pfn & 0x3FF] = (pfn * PAGE_SIZE) | PAGE_KERNEL;
     }
 
-    /* Identity map first 4MB */
-    for (uint32_t i = 0; i < 1024; i++) {
-        page_table_0[i] = (i * PAGE_SIZE) | PAGE_KERNEL;
-    }
-
-    /* Map first 4MB in page directory */
-    page_directory[0] = (uint32_t)page_table_0 | PAGE_KERNEL;
-
-    /* Also map the kernel at 3GB+ (higher half) for future use */
-    /* page_directory[768] = (uint32_t)page_table_0 | PAGE_KERNEL; */
+    /* Higher-half kernel mapping (3GB+) and user-space layout are
+     * deferred until the Ring3/ABI work (see ROADMAP.md). */
 }
 
 void mm_enable_paging(void) {
@@ -232,7 +236,7 @@ void mm_free_pages(void* addr, uint32_t count) {
     }
 }
 
-void mm_map_page(uint32_t phys, uint32_t virt, uint32_t flags) {
+bool_t mm_map_page(uint32_t phys, uint32_t virt, uint32_t flags) {
     uint32_t pd_index = virt >> 22;
     uint32_t pt_index = (virt >> 12) & 0x3FF;
 
@@ -240,17 +244,20 @@ void mm_map_page(uint32_t phys, uint32_t virt, uint32_t flags) {
     uint32_t* pt;
     if (!(page_directory[pd_index] & PDE_PRESENT)) {
         pt = (uint32_t*)mm_alloc_page();
-        if (!pt) return;
+        if (!pt) return false;
         for (uint32_t i = 0; i < 1024; i++) pt[i] = 0;
         page_directory[pd_index] = (uint32_t)pt | PAGE_KERNEL;
     } else {
         pt = (uint32_t*)(page_directory[pd_index] & PAGE_MASK);
     }
 
+    if (pt[pt_index] & PTE_PRESENT) return false;  /* already mapped */
+
     pt[pt_index] = (phys & PAGE_MASK) | (flags & 0xFFF) | PTE_PRESENT;
 
     /* Flush TLB entry */
     __asm__ volatile ("invlpg (%0)" : : "r"(virt) : "memory");
+    return true;
 }
 
 void mm_unmap_page(uint32_t virt) {

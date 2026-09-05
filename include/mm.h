@@ -40,7 +40,7 @@ void*  mm_alloc_pages(uint32_t count);
 void   mm_free_pages(void* addr, uint32_t count);
 
 /* Page mapping */
-void mm_map_page(uint32_t phys, uint32_t virt, uint32_t flags);
+bool_t mm_map_page(uint32_t phys, uint32_t virt, uint32_t flags);
 void mm_unmap_page(uint32_t virt);
 uint32_t mm_virt_to_phys(uint32_t virt);
 
