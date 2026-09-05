@@ -59,6 +59,19 @@ static const char kbd_upper[128] = {
     0,    0,    0,    0,    0,    0,    0,    0
 };
 
+/* Interrupt-safety helpers: save/restore EFLAGS instead of blind cli/sti,
+ * so code called from an IRQ (IF already 0) or from a caller's critical
+ * section never re-enables interrupts behind its back. */
+static uint32_t kbd_lock(void) {
+    uint32_t flags;
+    __asm__ volatile ("pushfl; popl %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static void kbd_unlock(uint32_t flags) {
+    __asm__ volatile ("pushl %0; popfl" :: "r"(flags) : "memory");
+}
+
 static void kbd_buf_put(char c) {
     uint16_t next = (kbd_head + 1) % KEYBOARD_BUFFER_SIZE;
     if (next != kbd_tail) {
@@ -70,12 +83,12 @@ static void kbd_buf_put(char c) {
 
 /* Process a single scancode byte. Called from both IRQ and polling path. */
 static void kbd_process_scancode(uint8_t scancode) {
-    /* Enter critical section so the ring-buffer indices cannot be torn
-     * by a concurrent polling read on another path. */
-    __asm__ volatile ("cli" ::: "memory");
+    /* Critical section so the ring-buffer indices cannot be torn
+     * by a concurrent read on the other path. Restores IF on exit. */
+    uint32_t flags = kbd_lock();
     if (scancode == 0xE0) {
         extended = true;
-        __asm__ volatile ("sti" ::: "memory");
+        kbd_unlock(flags);
         return;
     }
 
@@ -88,7 +101,7 @@ static void kbd_process_scancode(uint8_t scancode) {
             case 0x38: if (extended) ralt  = false; else lalt  = false; break;
         }
         extended = false;
-        __asm__ volatile ("sti" ::: "memory");
+        kbd_unlock(flags);
         return;
     }
 
@@ -134,7 +147,7 @@ static void kbd_process_scancode(uint8_t scancode) {
         }
     }
     extended = false;
-    __asm__ volatile ("sti" ::: "memory");
+    kbd_unlock(flags);
 }
 
 /* IRQ1 handler — pre-empts polling only briefly.
@@ -144,14 +157,13 @@ static void kbd_irq_handler(registers_t* regs) {
     (void)regs;
     /* Drain ALL pending bytes in the 8042 buffer. A mouse IRQ
      * can otherwise queue up a 3-byte packet that the next
-     * poll-loop iteration misreads as keyboard scancodes. */
+     * poll-loop iteration misreads as keyboard scancodes.
+     * IF is already 0 inside the IRQ gate; no cli/sti here. */
     while (inb(KEYBOARD_STATUS_PORT) & 0x01) {
         uint8_t s = inb(KEYBOARD_STATUS_PORT);
         uint8_t data = inb(KEYBOARD_DATA_PORT);
         if (!(s & 0x20)) {
-            __asm__ volatile ("cli" ::: "memory");
             kbd_process_scancode(data);
-            __asm__ volatile ("sti" ::: "memory");
         }
         /* Mouse byte — discard */
     }
@@ -181,9 +193,11 @@ void keyboard_init(void) {
 
 /* Pure polling read — no CLI/STI needed (single task, PIT doesn't preempt) */
 char keyboard_getchar(void) {
+    uint32_t flags = kbd_lock();  /* remember caller's IF state */
     while (kbd_head == kbd_tail) {
-        /* Enable interrupts, halt until any IRQ, then re-disable.
-         * The 16-bit head/tail read after wake is atomic on x86. */
+        /* Enable interrupts, halt until any IRQ (wake with IF=1),
+         * then re-disable before touching shared state. The 16-bit
+         * head/tail read after wake is atomic on x86. */
         __asm__ volatile ("sti; hlt; cli" ::: "memory");
         /* Polling fallback: drain any pending byte ourselves so
          * the loop has a chance to make progress even if IRQs are
@@ -198,27 +212,27 @@ char keyboard_getchar(void) {
     }
     char c = kbd_buffer[kbd_tail];
     kbd_tail = (kbd_tail + 1) % KEYBOARD_BUFFER_SIZE;
-    __asm__ volatile ("sti" ::: "memory");
+    kbd_unlock(flags);  /* restore caller's IF state */
     return c;
 }
 
 bool_t keyboard_haschar(void) {
-    __asm__ volatile ("cli" ::: "memory");
+    uint32_t flags = kbd_lock();
     int r = (kbd_head != kbd_tail);
-    __asm__ volatile ("sti" ::: "memory");
+    kbd_unlock(flags);
     return r;
 }
 
 char keyboard_peek(void) {
-    __asm__ volatile ("cli" ::: "memory");
+    uint32_t flags = kbd_lock();
     char c = (kbd_head == kbd_tail) ? 0 : kbd_buffer[kbd_tail];
-    __asm__ volatile ("sti" ::: "memory");
+    kbd_unlock(flags);
     return c;
 }
 
 void keyboard_flush(void) {
-    __asm__ volatile ("cli" ::: "memory");
+    uint32_t flags = kbd_lock();
     kbd_head = 0;
     kbd_tail  = 0;
-    __asm__ volatile ("sti" ::: "memory");
+    kbd_unlock(flags);
 }
