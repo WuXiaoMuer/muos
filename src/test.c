@@ -7,6 +7,7 @@
 #include "keyboard.h"
 #include "pit.h"
 #include "task.h"
+#include "string.h"
 
 /* ANSI-ish helpers */
 #define OK  "[PASS] "
@@ -34,8 +35,6 @@ static void tfail(const char* name) {
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
     serial_write(FAIL); serial_write(name); serial_write("\n");
 }
-
-static const char* uitoa(uint32_t n);
 
 #define CHECK(cond, name) do { if (cond) tpass(name); else tfail(name); } while (0)
 
@@ -150,15 +149,6 @@ static void test_task_info(void) {
     CHECK(t->name[0] != '\0', "current task has a name");
 }
 
-static const char* uitoa(uint32_t n) {
-    static char buf[12];
-    int d[10], c = 0;
-    while (n) { d[c++] = n % 10; n /= 10; }
-    if (!c) { buf[0] = '0'; buf[1] = 0; }
-    else { int p = 0; while (c) buf[p++] = '0' + d[--c]; buf[p] = 0; }
-    return buf;
-}
-
 int tests_run(void) {
     passed = 0; failed = 0;
 
@@ -189,9 +179,9 @@ int tests_run(void) {
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
 
     serial_write("--- Results: ");
-    serial_write(uitoa(passed));
+    { char nb[12]; u32_to_dec(nb, (uint32_t)passed); serial_write(nb); }
     serial_write(" passed, ");
-    serial_write(uitoa(failed));
+    { char nb[12]; u32_to_dec(nb, (uint32_t)failed); serial_write(nb); }
     serial_write(" failed ---\n\n");
 
     return failed;

@@ -3,6 +3,7 @@
 #include "vga.h"
 #include "keyboard.h"
 #include "fs.h"
+#include "string.h"
 
 #define EDIT_COLS 79
 #define EDIT_ROWS 22
@@ -73,7 +74,7 @@ static void scroll_to_cursor(void) {
 
 static void ins_at_cursor(char c) {
     char* ln = lines[cursor_y];
-    int len = 0; while(ln[len]) len++;
+    int len = (int)strlen(ln);
     if(len >= EDIT_COLS) return;
     for(int i = len; i > cursor_x; i--) ln[i] = ln[i-1];
     ln[cursor_x] = c; ln[len+1] = '\0';
@@ -82,7 +83,7 @@ static void ins_at_cursor(char c) {
 
 static void del_at_cursor(void) {
     char* ln = lines[cursor_y];
-    int len = 0; while(ln[len]) len++;
+    int len = (int)strlen(ln);
     if(cursor_x >= len) return;
     for(int i = cursor_x; i < len; i++) ln[i] = ln[i+1];
     modified = 1;
@@ -94,8 +95,8 @@ static void bksp_at_cursor(void) {
         /* Join with previous line */
         char* prev = lines[cursor_y-1];
         char* cur  = lines[cursor_y];
-        int plen = 0; while(prev[plen]) plen++;
-        int clen = 0; while(cur[clen]) clen++;
+        int plen = (int)strlen(prev);
+        int clen = (int)strlen(cur);
         if(plen + clen <= EDIT_COLS) {
             for(int i = 0; i <= clen; i++) prev[plen+i] = cur[i];
             /* Shift lines up */

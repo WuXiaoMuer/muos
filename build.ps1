@@ -77,6 +77,10 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
 $CFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
              "-fno-exceptions", "-fno-stack-protector", "-nostdinc",
+             # Keep GCC from turning our byte loops in string.c into
+             # calls to memcpy/memset (self-recursion hazard in a
+             # freestanding kernel).
+             "-fno-tree-loop-distribute-patterns",
              "-I$PSScriptRoot\include")
 
 $step = 1
@@ -98,7 +102,8 @@ $step++
 # GCC: all C files
 $CFiles = @(
     "kernel", "vga", "vgagfx", "serial", "gdt", "idt", "isr", "pic",
-    "pit", "keyboard", "mouse", "mm", "fs", "editor", "win7", "task", "shell", "irq", "test"
+    "pit", "keyboard", "mouse", "mm", "kheap", "string", "fs", "editor",
+    "win7", "task", "shell", "irq", "test"
 )
 
 $ObjFiles = @()

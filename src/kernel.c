@@ -15,6 +15,7 @@
 #include "mouse.h"
 #include "mm.h"
 #include "multiboot.h"
+#include "kheap.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
@@ -85,6 +86,16 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     mm_enable_paging();
     vga_print("[OK] Paging enabled (identity map)\n");
     serial_write("[OK] Paging enabled\n");
+
+    /* 5b. Kernel heap (needs paging: heap pages live anywhere in RAM) */
+    kheap_init();
+    if (kheap_ready()) {
+        vga_print("[OK] Kernel heap (1MB)\n");
+        serial_write("[OK] Kernel heap initialized\n");
+    } else {
+        vga_print("[WARN] Kernel heap unavailable\n");
+        serial_write("[WARN] Kernel heap unavailable\n");
+    }
 
     /* 6. PIT timer */
     pit_init(100); /* 100 Hz */

@@ -10,6 +10,7 @@
 #include "win7.h"
 #include "test.h"
 #include "task.h"
+#include "string.h"
 
 /* ── Types ────────────────────────────── */
 #define CMD_MAX   128
@@ -27,11 +28,8 @@ static char history[HIST_MAX][HIST_LEN];
 static int  hist_count, hist_index;
 
 /* ── String Helpers ──────────────────── */
-static int streq(const char*a,const char*b){while(*a&&*b){if(*a!=*b)return 0;a++;b++;}return *a==*b;}
-static int starts(const char*s,const char*p){while(*p){if(*s!=*p)return 0;s++;p++;}return 1;}
-static void scpy(char*d,const char*s){while(*s)*d++=*s++;*d=0;}
-static int slen(const char*s){int n=0;while(*s++)n++;return n;}
-static void nts(char*b,uint32_t n){int p=0;if(!n)b[p++]='0';else{int d[10],c=0;while(n){d[c++]=n%10;n/=10;}while(c)b[p++]='0'+d[--c];}b[p]=0;}
+/* strcmp/strcpy/strlen/u32_to_dec come from string.c */
+static int streq(const char*a,const char*b){return strcmp(a,b)==0;}
 
 /* ── Line Editor (forward-declared before tab) ── */
 static void prompt(void){vga_setcolor(vga_entry_color(VGA_LIGHT_GREEN,VGA_BLACK));vga_print("muos> ");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
@@ -56,7 +54,7 @@ static void tab(void){
     for(int i=cmd_pos-1;i>=0;i--){if(cmd_buf[i]==' '){ws=i+1;break;}}
     int wl=cmd_pos-ws; if(!wl)return;
     int m=0; const char*mt=NULL;
-    for(int i=0;cmds[i];i++) if(starts(cmds[i],cmd_buf+ws)){m++;mt=cmds[i];}
+    for(int i=0;cmds[i];i++) if(strncmp(cmd_buf+ws,cmds[i],strlen(cmds[i]))==0){m++;mt=cmds[i];}
     if(m==1&&mt){cmd_len=ws;cmd_pos=ws;for(const char*p=mt;*p;p++)isrt(*p);isrt(' ');}
 }
 static void bksp(void){
@@ -67,8 +65,8 @@ static void bksp(void){
 static void h_add(const char*l){
     if(!*l)return;
     if(hist_count>0&&streq(history[hist_count-1],l))return;
-    if(hist_count<HIST_MAX)scpy(history[hist_count++],l);
-    else{for(int i=0;i<HIST_MAX-1;i++)scpy(history[i],history[i+1]);scpy(history[HIST_MAX-1],l);}
+    if(hist_count<HIST_MAX)strcpy(history[hist_count++],l);
+    else{for(int i=0;i<HIST_MAX-1;i++)strcpy(history[i],history[i+1]);strcpy(history[HIST_MAX-1],l);}
 }
 static void h_recall(int d){
     if(!hist_count)return;
@@ -76,7 +74,7 @@ static void h_recall(int d){
     if(i<0)i=0;
     if(i>=hist_count)i=hist_count;
     hist_index=i;
-    if(i<hist_count){scpy(cmd_buf,history[i]);cmd_len=slen(cmd_buf);cmd_pos=cmd_len;redraw_line();}
+    if(i<hist_count){strcpy(cmd_buf,history[i]);cmd_len=(int)strlen(cmd_buf);cmd_pos=cmd_len;redraw_line();}
 }
 static void readline(void){
     cmd_len=0;cmd_pos=0;cmd_buf[0]=0;hist_index=hist_count;prompt();
@@ -200,9 +198,9 @@ static void draw_content(Win*w){
             fdt(w->x+2,w->y+7,"version gui reboot",vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
             break;
     case 2: {uint32_t tot=mm_get_total_pages()*4,fr=mm_get_free_pages()*4,us=tot-fr;char b[16];
-            fdt(w->x+2,w->y+1,"Total:",vga_entry_color(VGA_GREEN,VGA_BLACK));nts(b,tot);fdt(w->x+10,w->y+1,b,vga_entry_color(VGA_GREEN,VGA_BLACK));fdt(w->x+16,w->y+1,"KB",vga_entry_color(VGA_GREEN,VGA_BLACK));
-            fdt(w->x+2,w->y+2,"Used:",vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));nts(b,us);fdt(w->x+10,w->y+2,b,vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));
-            fdt(w->x+2,w->y+3,"Free:",vga_entry_color(VGA_GREEN,VGA_BLACK));nts(b,fr);fdt(w->x+10,w->y+3,b,vga_entry_color(VGA_GREEN,VGA_BLACK));
+            fdt(w->x+2,w->y+1,"Total:",vga_entry_color(VGA_GREEN,VGA_BLACK));u32_to_dec(b,tot);fdt(w->x+10,w->y+1,b,vga_entry_color(VGA_GREEN,VGA_BLACK));fdt(w->x+16,w->y+1,"KB",vga_entry_color(VGA_GREEN,VGA_BLACK));
+            fdt(w->x+2,w->y+2,"Used:",vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));u32_to_dec(b,us);fdt(w->x+10,w->y+2,b,vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));
+            fdt(w->x+2,w->y+3,"Free:",vga_entry_color(VGA_GREEN,VGA_BLACK));u32_to_dec(b,fr);fdt(w->x+10,w->y+3,b,vga_entry_color(VGA_GREEN,VGA_BLACK));
             int bar=28,f=tot?(int)((uint32_t)us*bar/tot):0;
             fdt(w->x+2,w->y+4,"[",vga_entry_color(VGA_GREEN,VGA_BLACK));
             for(int i=0;i<f;i++)fdt(w->x+3+i,w->y+4,"=",vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));
@@ -211,7 +209,7 @@ static void draw_content(Win*w){
             } break;
     case 3: fdt(w->x+2,w->y,"PID  Name    State",vga_entry_color(VGA_YELLOW,VGA_BLACK));
             fdt(w->x+2,w->y+1,"---  ------- -----",vga_entry_color(VGA_YELLOW,VGA_BLACK));
-            {task_t*t=task_get_current();if(t){int y=w->y+2;task_t*cur=t;do{char b[32];int p=0;nts(&b[p],cur->pid);p=slen(b);while(p<6)b[p++]=' ';for(const char*s=cur->name;*s;s++)b[p++]=*s;while(p<16)b[p++]=' ';const char*st=cur->state==1?"RUN":"RDY";for(const char*s=st;*s;s++)b[p++]=*s;b[p]=0;fdt(w->x+2,y++,b,vga_entry_color(VGA_CYAN,VGA_BLACK));cur=cur->next;}while(cur&&cur!=t&&y<w->y+w->h-1);}} break;
+            {task_t*t=task_get_current();if(t){int y=w->y+2;task_t*cur=t;do{char b[32];int p=0;u32_to_dec(b,cur->pid);p=(int)strlen(b);while(p<6)b[p++]=' ';for(const char*s=cur->name;*s;s++)b[p++]=*s;while(p<16)b[p++]=' ';const char*st=cur->state==1?"RUN":"RDY";for(const char*s=st;*s;s++)b[p++]=*s;b[p]=0;fdt(w->x+2,y++,b,vga_entry_color(VGA_CYAN,VGA_BLACK));cur=cur->next;}while(cur&&cur!=t&&y<w->y+w->h-1);}} break;
     case 4: fdt(w->x+2,w->y+1,"TAB:Switch  Arrows:Move",vga_entry_color(VGA_BLACK,VGA_LIGHT_GREY));
             fdt(w->x+2,w->y+2,"DEL:Close  F1-5:Pick",vga_entry_color(VGA_BLACK,VGA_LIGHT_GREY));
             fdt(w->x+2,w->y+3,"ESC:Quit   Shell:type cmd",vga_entry_color(VGA_BLACK,VGA_LIGHT_GREY));
@@ -240,8 +238,8 @@ static void cmd_gui(void){
     redraw_all();
 
     while(1){
-        {uint32_t s=pit_get_ticks()/100;char b[16];nts(b,s);fdt(65,0,b,vga_entry_color(VGA_LIGHT_GREEN,VGA_BLUE));fdt(65+slen(b),0,"s",vga_entry_color(VGA_LIGHT_GREEN,VGA_BLUE));}
-        {mouse_state_t ms=mouse_get_state();int mx=ms.x/8,my=ms.y/16;char b[16];b[0]='X';b[1]=':';nts(b+2,(uint32_t)mx);int p=2+slen(b+2);b[p++]='Y';b[p++]=':';nts(b+p,(uint32_t)my);b[p+slen(b+p)]=0;fdt(44,24,b,vga_entry_color(VGA_BLACK,VGA_LIGHT_GREY));}
+        {uint32_t s=pit_get_ticks()/100;char b[16];u32_to_dec(b,s);fdt(65,0,b,vga_entry_color(VGA_LIGHT_GREEN,VGA_BLUE));fdt(65+(int)strlen(b),0,"s",vga_entry_color(VGA_LIGHT_GREEN,VGA_BLUE));}
+        {mouse_state_t ms=mouse_get_state();int mx=ms.x/8,my=ms.y/16;char b[16];b[0]='X';b[1]=':';u32_to_dec(b+2,(uint32_t)mx);int p=2+(int)strlen(b+2);b[p++]='Y';b[p++]=':';u32_to_dec(b+p,(uint32_t)my);b[p+strlen(b+p)]=0;fdt(44,24,b,vga_entry_color(VGA_BLACK,VGA_LIGHT_GREY));}
         char c=keyboard_getchar();
         switch((unsigned char)c){
         case KEY_ESC: vga_clear(); vga_update_cursor(); return;

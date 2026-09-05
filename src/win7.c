@@ -6,6 +6,7 @@
 #include "mm.h"
 #include "task.h"
 #include "fs.h"
+#include "string.h"
 
 #define MAX_WIN 8
 typedef struct {
@@ -30,16 +31,6 @@ static void ft(int x, int y, const char* s, uint8_t c) {
         ((volatile uint16_t*)0xB8000)[y*80+x] = vga_entry(*s, c);
         x++; s++;
     }
-}
-static void nts(char* b, uint32_t n) {
-    int p = 0;
-    if (!n) b[p++] = '0';
-    else {
-        int d[10], c = 0;
-        while (n) { d[c++] = n % 10; n /= 10; }
-        while (c) b[p++] = '0' + d[--c];
-    }
-    b[p] = 0;
 }
 
 /* ── Win7 Colors ────────────────────────────────────── */
@@ -77,8 +68,8 @@ static void draw_taskbar(void) {
     /* Memory */
     { char b[12]; b[0]='M'; b[1]=':';
       uint32_t fm = mm_get_free_pages()*4/1024;
-      nts(b+2, fm);
-      int ml = 2; while (b[ml]) ml++;
+      u32_to_dec(b+2, fm);
+      int ml = 2 + (int)strlen(b + 2);
       b[ml++] = 'M'; b[ml] = 0;
       ft(64, y, b, vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
     }
@@ -174,12 +165,12 @@ static void draw_content(Win* w) {
           ft(wx+2, wy+3, "Arch:   x86 32-bit", vga_entry_color(VGA_GREEN, VGA_BLACK));
           ft(wx+2, wy+4, "RAM:    256 MB", vga_entry_color(VGA_GREEN, VGA_BLACK));
           ft(wx+2, wy+5, "Total:  ", vga_entry_color(VGA_GREEN, VGA_BLACK));
-          nts(b, tot); ft(wx+10, wy+5, b, vga_entry_color(VGA_GREEN, VGA_BLACK));
+          u32_to_dec(b, tot); ft(wx+10, wy+5, b, vga_entry_color(VGA_GREEN, VGA_BLACK));
           ft(wx+10+2, wy+5, "KB", vga_entry_color(VGA_GREEN, VGA_BLACK));
           ft(wx+2, wy+6, "Used:   ", vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
-          nts(b, us); ft(wx+10, wy+6, b, vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
+          u32_to_dec(b, us); ft(wx+10, wy+6, b, vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
           ft(wx+2, wy+7, "Free:   ", vga_entry_color(VGA_GREEN, VGA_BLACK));
-          nts(b, fr); ft(wx+10, wy+7, b, vga_entry_color(VGA_GREEN, VGA_BLACK));
+          u32_to_dec(b, fr); ft(wx+10, wy+7, b, vga_entry_color(VGA_GREEN, VGA_BLACK));
           /* Usage bar */
           int bar = 24, f = tot ? (int)((uint32_t)us*bar/tot) : 0;
           ft(wx+2, wy+8, "[", vga_entry_color(VGA_GREEN, VGA_BLACK));
@@ -199,7 +190,7 @@ static void draw_content(Win* w) {
               do {
                   char b[40];
                   int p = 0;
-                  { char tb[12]; nts(tb, cur->pid);
+                  { char tb[12]; u32_to_dec(tb, cur->pid);
                     int tl = 0; while (tb[tl]) tl++;
                     while (tl < 5) { b[p++] = ' '; tl++; }
                     for (int i = 0; tb[i]; i++) b[p++] = tb[i];
@@ -246,7 +237,7 @@ static void draw_content(Win* w) {
     case 7: /* File Browser */
         ft(wx+2, wy+1, "=== File Browser ===", vga_entry_color(VGA_YELLOW, VGA_BLACK));
         { int n = fs_count();
-          char b[8]; nts(b, n);
+          char b[8]; u32_to_dec(b, n);
           ft(wx+2, wy+2, "Files: ", vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
           ft(wx+9, wy+2, b, vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK));
           int yy = wy + 3;
@@ -254,7 +245,7 @@ static void draw_content(Win* w) {
               const char* name = fs_name(i);
               uint32_t sz = fs_size(i);
               ft(wx+2, yy, name, vga_entry_color(VGA_CYAN, VGA_BLACK));
-              nts(b, sz);
+              u32_to_dec(b, sz);
               ft(wx+20, yy, b, vga_entry_color(VGA_DARK_GREY, VGA_BLACK));
               ft(wx+20+2, yy, "B", vga_entry_color(VGA_DARK_GREY, VGA_BLACK));
               yy++;
