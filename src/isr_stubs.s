@@ -5,8 +5,6 @@ bits 32
 
 extern isr_handler
 extern irq_handler
-extern task_schedule
-extern current_task_esp
 
 ; ---------------------------------------------------------------------------
 ; Common ISR handler (exceptions)
@@ -75,16 +73,6 @@ irq_common:
 global isr_ignore
 isr_ignore:
     iret
-
-; ---------------------------------------------------------------------------
-; Scheduler variables (kept for symbol compatibility; not actually used)
-; ---------------------------------------------------------------------------
-section .bss
-global need_reschedule
-need_reschedule: resb 1
-
-global current_task_ptr
-current_task_ptr: resd 1
 
 ; ---------------------------------------------------------------------------
 ; Macros

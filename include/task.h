@@ -2,12 +2,17 @@
 #define MUOS_TASK_H
 #include "types.h"
 
-/* Assembly-visible scheduler flag (defined in isr_stubs.s) */
-extern volatile uint8_t need_reschedule;
-extern uint32_t current_task_ptr;
+/* MuOS is currently a single-task system: the shell runs on the
+ * kernel stack and no context switching happens (see kernel.c).
+ * Task structs exist for introspection (`tasks` / `ps`) and the
+ * self-test suite.
+ *
+ * Ring 3 groundwork already present: GDT slots 3/4 hold user code/
+ * data selectors (see gdt.c). A real process model — per-task page
+ * directories, TSS, separate kernel stacks, scheduling — is the
+ * user-mode milestone in ROADMAP.md. */
 
 #define TASK_NAME_MAX   32
-#define TASK_STACK_SIZE 16384  /* 16KB — Win7 GUI has deep call chains */
 
 typedef enum {
     TASK_READY = 0,
@@ -17,30 +22,19 @@ typedef enum {
 } task_state_t;
 
 typedef struct task {
-    uint32_t        esp;            /* Saved stack pointer */
-    uint32_t        pid;            /* Process ID */
+    uint32_t        pid;
     char            name[TASK_NAME_MAX];
     task_state_t    state;
-    uint32_t*       stack_base;     /* Stack page for freeing */
     struct task*    next;
 } task_t;
 
 void task_init(void);
-task_t* task_create(void (*entry)(void), const char* name);
-task_t* task_register(const char* name);  /* register an already-running task */
-void task_exit(void);
-void task_yield(void);
+task_t* task_register(const char* name);  /* register the running entity */
 
 task_t* task_get_current(void);
 uint32_t task_get_count(void);
 extern uint32_t task_count;
 
 void task_list(void);
-
-/* Scheduler - called from timer ISR */
-void task_schedule(void);
-
-/* Assembly helper */
-extern uint32_t task_switch(uint32_t current_esp);
 
 #endif

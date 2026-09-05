@@ -19,6 +19,7 @@
 #include "task.h"
 #include "shell.h"
 #include "test.h"
+#include "string.h"
 
 /* Linker symbol - end of kernel image */
 extern uint32_t _kernel_end;
@@ -133,17 +134,18 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
 
     /* 10. Enter shell directly on the kernel stack. The original
      * task-stack handoff (built a fake interrupt frame in a freshly
-     * mm_alloc_page'd stack) was unreliable and the source of the
-     * post-Starting splash crash. For a single-task system, calling
-     * shell_run() from the kernel stack works fine. */
-    need_reschedule = 0;
+     * allocated stack) was unreliable — the physical frames handed out
+     * above 4MB were not mapped by the page tables, so touching the
+     * stack page faulted. For a single-task system, calling shell_run()
+     * from the kernel stack works fine; real multitasking returns with
+     * the user-mode milestone (see ROADMAP.md). */
 
     /* Rename the registered task to "shell" so the running entity
      * still appears with the right name in `tasks` / `ps`. */
     if (task_get_current()) {
         task_t* t = task_get_current();
-        for (int i = 0; i < TASK_NAME_MAX - 1 && "shell"[i]; i++) t->name[i] = "shell"[i];
-        t->name[5] = '\0';
+        strncpy(t->name, "shell", TASK_NAME_MAX - 1);
+        t->name[TASK_NAME_MAX - 1] = '\0';
     }
 
     /* The shell runs as a normal C call from the boot task entry
