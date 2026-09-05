@@ -7,6 +7,7 @@
 #include "task.h"
 #include "fs.h"
 #include "string.h"
+#include "logo.h"
 
 #define MAX_WIN 8
 typedef struct {
@@ -218,11 +219,8 @@ static void draw_content(Win* w) {
         ft(wx+2, wy+9, "ESC     Exit desktop", vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
         break;
     case 5: /* About / Logo */
-        ft(wx+2, wy+1, "  __  __    ___  ____   ", vga_entry_color(VGA_WHITE, VGA_BLUE));
-        ft(wx+2, wy+2, " |  \\/  |__/_ _|  _ \\ ", vga_entry_color(VGA_WHITE, VGA_BLUE));
-        ft(wx+2, wy+3, " | |\\/| '_ \\ | || |_) |", vga_entry_color(VGA_WHITE, VGA_BLUE));
-        ft(wx+2, wy+4, " | |  | | | || ||  _ < ", vga_entry_color(VGA_WHITE, VGA_BLUE));
-        ft(wx+2, wy+5, " |_|  |_| |_| |___|_| \\_\\", vga_entry_color(VGA_WHITE, VGA_BLUE));
+        for (int i = 0; i < 5; i++)
+            ft(wx+2, wy+1+i, muos_logo[i], vga_entry_color(VGA_WHITE, VGA_BLUE));
         ft(wx+2, wy+7, "MuOS 7 Ultimate Edition", vga_entry_color(VGA_LIGHT_CYAN, VGA_BLUE));
         ft(wx+2, wy+8, "x86 32-bit Microkernel", vga_entry_color(VGA_LIGHT_GREY, VGA_BLUE));
         ft(wx+2, wy+9, "Built: " __DATE__, vga_entry_color(VGA_LIGHT_GREY, VGA_BLUE));

@@ -13,9 +13,8 @@ typedef struct {
     uint32_t eip, cs, eflags, useresp, ss;
 } __attribute__((packed)) registers_t;
 
-typedef void (*isr_handler_t)(registers_t* regs);
-
-void isr_register_handler(uint8_t n, isr_handler_t handler);
+/* Exception dispatch: every CPU exception is fatal and panics.
+ * isr_handler is the common entry called from isr_stubs.s. */
 void isr_handler(registers_t* regs);
 
 /* Assembly stubs - declared here, defined in isr_stubs.s */

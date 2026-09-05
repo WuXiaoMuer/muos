@@ -101,7 +101,7 @@ $step++
 
 # GCC: all C files
 $CFiles = @(
-    "kernel", "vga", "vgagfx", "serial", "gdt", "idt", "isr", "pic",
+    "kernel", "vga", "serial", "gdt", "idt", "isr", "pic",
     "pit", "keyboard", "mouse", "mm", "kheap", "string", "fs", "editor",
     "win7", "task", "shell", "irq", "test"
 )

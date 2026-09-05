@@ -25,10 +25,6 @@ void vga_setcolor(uint8_t color) {
     vga_color = color;
 }
 
-uint8_t vga_getcolor(void) {
-    return vga_color;
-}
-
 void vga_clear(void) {
     for (size_t i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         VGA_BUFFER[i] = vga_entry(' ', vga_color);
@@ -89,12 +85,6 @@ void vga_putchar(char c) {
 
     vga_scroll();
     vga_update_cursor();
-}
-
-void vga_write(const char* data, size_t size) {
-    for (size_t i = 0; i < size; i++) {
-        vga_putchar(data[i]);
-    }
 }
 
 void vga_print(const char* str) {

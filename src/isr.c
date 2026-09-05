@@ -36,17 +36,8 @@ const char* exception_names[32] = {
     "Reserved"
 };
 
-static isr_handler_t isr_handlers[256];
-
-void isr_register_handler(uint8_t n, isr_handler_t handler) {
-    isr_handlers[n] = handler;
-}
-
 void isr_handler(registers_t* regs) {
-    if (isr_handlers[regs->int_no] != NULL) {
-        isr_handlers[regs->int_no](regs);
-        return;
-    }
+    /* Exceptions are fatal: print state and halt */
 
     /* Default: print exception info */
     vga_setcolor(vga_entry_color(VGA_WHITE, VGA_RED));

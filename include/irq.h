@@ -6,7 +6,6 @@
 typedef void (*irq_handler_t)(registers_t* regs);
 
 void irq_register_handler(uint8_t irq, irq_handler_t handler);
-void irq_unregister_handler(uint8_t irq);
 
 /* Assembly stubs */
 extern void irq0(void);   extern void irq1(void);

@@ -11,13 +11,6 @@ void irq_register_handler(uint8_t irq, irq_handler_t handler) {
     }
 }
 
-void irq_unregister_handler(uint8_t irq) {
-    if (irq < 16) {
-        irq_handlers[irq] = NULL;
-        pic_mask(irq);
-    }
-}
-
 /* Called from assembly irq_common stub */
 void irq_handler(registers_t* regs) {
     uint8_t irq = regs->int_no - 0x20;

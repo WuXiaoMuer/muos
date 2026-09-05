@@ -66,8 +66,6 @@ int fs_open(const char* name) {
     return -1;
 }
 
-void fs_list(void) { }  /* Done in shell via fs_count/fs_name */
-
 int fs_count(void) {
     int n = 0;
     for (int i = 0; i < FS_MAX_FILES; i++)
