@@ -59,8 +59,8 @@ if (-not $qemuPath) {
         # 先尝试下载 QEMU 便携版 / zip 版本
         $qemuZip = "$qemuDir\qemu.zip"
         try {
-            # 使用 QEMU Windows 64-bit 预编译 zip（来自 qemu.weilnetz.de）
-            Download-File -Url "https://qemu.weilnetz.de/w64/qemu-w64-setup-20250424.exe" -OutFile "$qemuDir\qemu-setup.exe"
+            # 使用 QEMU Windows 64-bit 预编译安装包（来自 qemu.weilnetz.de，旧版本会被下架）
+            Download-File -Url "https://qemu.weilnetz.de/w64/qemu-w64-setup-20260811.exe" -OutFile "$qemuDir\qemu-setup.exe"
             Write-Host "[QEMU] Downloaded installer. Extracting with 7z..." -ForegroundColor Cyan
             # 如果没有 7z，尝试直接运行静默安装
             Write-Host "[QEMU] Running silent install to $qemuDir ..." -ForegroundColor Cyan

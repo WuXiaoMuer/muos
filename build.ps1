@@ -22,7 +22,8 @@ function Find-Tool {
         "C:\Program Files\qemu\$Name.exe",
         "C:\Program Files (x86)\qemu\$Name.exe",
         "$PSScriptRoot\toolchain\bin\$Name.exe",
-        "$PSScriptRoot\tools\nasm\$Name.exe"
+        "$PSScriptRoot\tools\nasm\$Name.exe",
+        "$PSScriptRoot\tools\qemu\$Name.exe"
     ) + $ExtraPaths
     foreach ($p in $commonPaths) {
         if ($p -and (Test-Path $p)) { return $p }
