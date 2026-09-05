@@ -11,6 +11,8 @@
 #include "task.h"
 #include "string.h"
 #include "logo.h"
+#include "io.h"
+#include "serial.h"
 
 /* ── Types ────────────────────────────── */
 #define CMD_MAX   128
@@ -119,9 +121,33 @@ static void cmd_logo(void){
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
 }
 static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS v0.3\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
-static void cmd_reboot(void){vga_print("Reboot...\n");for(volatile int i=0;i<5000000;i++)__asm__ volatile("nop");uint8_t z[6]={0};__asm__ volatile("lidt %0"::"m"(z));__asm__ volatile("int $0");}
-static void cmd_halt(void){vga_print("Halted.\n");__asm__ volatile("cli;hlt");}
-static void cmd_crash(void){vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));vga_print("\nPANIC!\n\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));*(volatile uint32_t*)0=0xDEADBEEF;}
+static void cmd_reboot(void){
+    vga_print("Reboot...\n");
+    serial_write("[shell] reboot requested (8042 reset line)\n");
+    for(volatile int i=0;i<1000000;i++)__asm__ volatile("nop");
+    __asm__ volatile("cli");
+    /* Pulse the 8042 CPU-reset line (A20 gate port, 0xFE = pulse reset).
+     * Reliable on QEMU/real hardware; the old lidt+int$0 triple-fault
+     * trick did not even reliably reset. */
+    outb(0x64, 0xFE);
+    for(volatile int i=0;i<2000000;i++)__asm__ volatile("nop");
+    /* Fallback if the controller is unresponsive: zeroed IDT -> triple fault */
+    serial_write("[shell] 8042 reset failed, forcing triple fault\n");
+    uint8_t z[6]={0};
+    __asm__ volatile("lidt %0"::"m"(z));
+    __asm__ volatile("int $0");
+}
+static void cmd_halt(void){vga_print("Halted.\n");serial_write("[shell] halt\n");__asm__ volatile("cli;hlt");}
+static void cmd_crash(void){
+    /* The identity map covers all RAM, so a null write no longer faults.
+     * 0xE0000000 lies above ram_top with no page table -> guaranteed
+     * Page Fault (CR2 = 0xE0000000) for the panic-path demo. */
+    vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));
+    vga_print("\nPANIC!\n\n");
+    vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
+    serial_write("[shell] crash: writing to unmapped 0xE0000000\n");
+    *(volatile uint32_t*)0xE0000000 = 0xDEADBEEF;
+}
 
 /* ── FS Commands ──────────────────────── */
 static void cmd_touch(char**a,int n){if(n<2){vga_print("touch <name>\n");return;}int f=fs_create(a[1]);if(f>=0){vga_print("OK: ");vga_print(a[1]);vga_putchar('\n');}else{vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));vga_print("Fail\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}}
@@ -155,6 +181,7 @@ static void cmd_write(char**a,int n){if(n<3){vga_print("write <file> <text>\n");
 static void execute(void){
     if(!cmd_len)return;
     h_add(cmd_buf);
+    serial_write("[cmd] "); serial_write(cmd_buf); serial_write("\n");
     char*av[MAX_ARGS]; int ac=tokenize(cmd_buf,av,MAX_ARGS); if(!ac)return;
     char*cmd=av[0];
     if(streq(cmd,"help"))cmd_help();
@@ -182,6 +209,7 @@ static void execute(void){
 }
 
 void shell_run(void){
+    serial_write("[shell] ready\n");
     fs_init();
     fs_create("readme.txt");
     fs_write(fs_open("readme.txt"), "Welcome to MuOS 7!\nType 'help' for commands.\nType 'win7' for desktop.", 69);

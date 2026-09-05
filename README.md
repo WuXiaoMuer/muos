@@ -107,6 +107,7 @@ ISO 路径没有 multiboot 信息(EBX=0),内存管理回退到 mem_upper 默认�
 | 中断处理里裸 `sti` 破坏调用方临界区 | cli/sti 应成对保存/恢复 EFLAGS(pushfl/popfl),而不是盲目开中断 | keyboard.c 的 kbd_lock/kbd_unlock 模式 |
 | 物理分配器发 4MB 以上帧却 Page Fault | 分页只恒等映射了前 4MB(旧版) | mm_init 现在恒等映射全部 RAM |
 | multiboot mmap 字段读出来是垃圾 | mmap_length/mmap_addr 在偏移 44/48,截断的结构体少定义了 syms[4] | 用 include\multiboot.h 的完整定义 |
+| panic 寄存器全是乱码 / 中断随机错派甚至野跳转 | `registers_t` 字段序与 isr_stubs.s 压栈序不一致(段寄存器压栈序 ds→es→fs→gs,gs 在最低地址) | 结构体必须按 gs,fs,es,ds 开头,与汇编严格对齐;irq 分发处再加 `irq < 16` 边界防护 |
 | 下载 qemu-w64-setup-20250424.exe 404 | 上游只保留最近几个版本 | setup-tools.ps1 已指向当前版本;旧版本号需手动更新 |
 
 ## 参考资源

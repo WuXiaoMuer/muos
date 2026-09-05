@@ -14,6 +14,7 @@ void irq_register_handler(uint8_t irq, irq_handler_t handler) {
 /* Called from assembly irq_common stub */
 void irq_handler(registers_t* regs) {
     uint8_t irq = regs->int_no - 0x20;
+    if (irq >= 16) return;  /* not a PIC vector; never trust blindly */
 
     /* Handle spurious IRQ7/IRQ15 */
     if (irq == 7) {
