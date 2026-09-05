@@ -8,7 +8,6 @@ extern uint32_t _kernel_end;
 static uint32_t* bitmap = NULL;
 static uint32_t  total_pages = 0;
 static uint32_t  free_pages = 0;
-static uint32_t  bitmap_size_pages = 0;
 
 /* Page directory (must be page-aligned) */
 static uint32_t* page_directory __attribute__((aligned(PAGE_SIZE))) = NULL;
@@ -20,30 +19,35 @@ static uint32_t* page_table_0 __attribute__((aligned(PAGE_SIZE))) = NULL;
 static void bitmap_set(uint32_t frame) {
     uint32_t idx = frame / 32;
     uint32_t bit = frame % 32;
-    bitmap[idx] |= (1 << bit);
+    bitmap[idx] |= (1u << bit);
 }
 
 static void bitmap_clear(uint32_t frame) {
     uint32_t idx = frame / 32;
     uint32_t bit = frame % 32;
-    bitmap[idx] &= ~(1 << bit);
+    bitmap[idx] &= ~(1u << bit);
 }
 
 static bool_t bitmap_test(uint32_t frame) {
     uint32_t idx = frame / 32;
     uint32_t bit = frame % 32;
-    return (bitmap[idx] & (1 << bit)) != 0;
+    return (bitmap[idx] & (1u << bit)) != 0;
+}
+
+/* Number of 32-bit words the bitmap needs for total_pages frames */
+static uint32_t bitmap_words(void) {
+    return (total_pages + 31) / 32;
 }
 
 static uint32_t bitmap_find_first_free(void) {
-    for (uint32_t i = 0; i < total_pages / 32; i++) {
+    uint32_t words = bitmap_words();
+    for (uint32_t i = 0; i < words; i++) {
         if (bitmap[i] != 0xFFFFFFFF) {
             for (uint32_t j = 0; j < 32; j++) {
-                if (!(bitmap[i] & (1 << j))) {
-                    uint32_t frame = i * 32 + j;
-                    if (frame < total_pages) {
-                        return frame;
-                    }
+                uint32_t frame = i * 32 + j;
+                if (frame >= total_pages) return (uint32_t)-1;
+                if (!(bitmap[i] & (1u << j))) {
+                    return frame;
                 }
             }
         }
@@ -57,15 +61,17 @@ void mm_init(uint32_t mem_upper_kb, uint32_t kernel_end) {
     total_pages = total_mem_kb * 1024 / PAGE_SIZE;
 
     /* Place bitmap after kernel */
-    bitmap_size_pages = (total_pages / 8 + PAGE_SIZE - 1) / PAGE_SIZE;
     bitmap = (uint32_t*)kernel_end;
 
     /* Reserve kernel area (0 to kernel_end + bitmap) in bitmap */
-    uint32_t reserved_pages = (kernel_end + bitmap_size_pages * PAGE_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t bitmap_bytes = bitmap_words() * 4;
+    uint32_t reserved_pages = (kernel_end + bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    /* Initialize bitmap: all free */
-    for (uint32_t i = 0; i < total_pages / 32; i++) {
-        bitmap[i] = 0;
+    /* Initialize bitmap: everything used, then free the usable range.
+     * This also marks out-of-range tail bits as used so they are
+     * never handed out (total_pages is not always a multiple of 32). */
+    for (uint32_t i = 0; i < bitmap_words(); i++) {
+        bitmap[i] = 0xFFFFFFFF;
     }
 
     /* Mark reserved pages as used */
@@ -137,8 +143,9 @@ uint32_t mm_get_free_pages(void)  { return free_pages; }
 uint32_t mm_get_used_pages(void)  { return total_pages - free_pages; }
 
 void* mm_alloc_pages(uint32_t count) {
+    if (count == 0 || count > total_pages || free_pages < count) return NULL;
     /* Find contiguous free pages */
-    for (uint32_t start = 0; start < total_pages - count; start++) {
+    for (uint32_t start = 0; start + count <= total_pages; start++) {
         bool_t found = true;
         for (uint32_t i = 0; i < count; i++) {
             if (bitmap_test(start + i)) {
@@ -160,6 +167,9 @@ void* mm_alloc_pages(uint32_t count) {
 
 void mm_free_pages(void* addr, uint32_t count) {
     uint32_t frame = (uint32_t)addr / PAGE_SIZE;
+    if (count == 0) return;
+    if ((uint32_t)addr & (PAGE_SIZE - 1)) return;  /* must be page-aligned */
+    if (frame >= total_pages || frame + count > total_pages) return;
     for (uint32_t i = 0; i < count; i++) {
         if (bitmap_test(frame + i)) {
             bitmap_clear(frame + i);
