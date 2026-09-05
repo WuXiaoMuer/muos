@@ -14,29 +14,13 @@
 #include "keyboard.h"
 #include "mouse.h"
 #include "mm.h"
+#include "multiboot.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
 
-/* Multiboot constants */
-#define MULTIBOOT_MAGIC    0x2BADB002
-#define MULTIBOOT_FLAG_MEM 0x1
-
-/* Multiboot info structure (partial) */
-typedef struct {
-    uint32_t flags;
-    uint32_t mem_lower;
-    uint32_t mem_upper;
-    uint32_t boot_device;
-    uint32_t cmdline;
-    uint32_t mods_count;
-    uint32_t mods_addr;
-    /* ... more fields ... */
-} __attribute__((packed)) multiboot_info_t;
-
 /* Linker symbol - end of kernel image */
 extern uint32_t _kernel_end;
-extern uint32_t task_count;  /* from task.c */
 
 /* Timer IRQ handler */
 static void timer_handler(registers_t* regs) {
@@ -78,25 +62,23 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     serial_write("[OK] PIC remapped\n");
 
     /* 4. Memory management */
-    uint32_t mem_upper_kb = 0;
+    const multiboot_info_t* mb = NULL;
     if (magic == MULTIBOOT_MAGIC && mb_info_addr != 0) {
-        multiboot_info_t* mb_info = (multiboot_info_t*)mb_info_addr;
-        if (mb_info->flags & MULTIBOOT_FLAG_MEM) {
-            mem_upper_kb = mb_info->mem_upper;
-        }
-    }
-    if (mem_upper_kb == 0) {
-        mem_upper_kb = 32768; /* Default: 32 MB upper memory */
-        vga_print("[WARN] No multiboot memory info, assuming 32MB\n");
-        serial_write("[WARN] No multiboot memory info, assuming 32MB\n");
+        mb = (const multiboot_info_t*)mb_info_addr;
     }
 
     /* Align kernel_end to page boundary */
     uint32_t kernel_end = ((uint32_t)&_kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    mm_init(mem_upper_kb, kernel_end);
+    mm_init(mb, kernel_end);
     vga_print("[OK] Physical memory: "); vga_print_dec(mm_get_total_pages() * 4);
     vga_print(" KB total, "); vga_print_dec(mm_get_free_pages() * 4);
     vga_print(" KB free\n");
+    if (mm_get_mmap_regions() > 0) {
+        vga_print("[OK] Memory map: "); vga_print_dec(mm_get_mmap_regions());
+        vga_print(" usable region(s)\n");
+    } else {
+        vga_print("[WARN] No multiboot memory map, using mem_upper fallback\n");
+    }
     serial_write("[OK] Physical memory manager initialized\n");
 
     /* 5. Enable paging */

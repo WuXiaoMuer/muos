@@ -1,13 +1,19 @@
 #include "mm.h"
+#include "multiboot.h"
 #include "vga.h"
 
 /* External symbol defined in linker script */
 extern uint32_t _kernel_end;
 
+/* 32-bit kernel: ignore RAM above this cap (262144 pages keeps the
+ * bitmap and page-table set finite and every count in uint32 range) */
+#define MM_MAX_RAM_MB 1024
+
 /* Bitmap for physical page frames */
 static uint32_t* bitmap = NULL;
 static uint32_t  total_pages = 0;
 static uint32_t  free_pages = 0;
+static uint32_t  mmap_region_count = 0;
 
 /* Page directory (must be page-aligned) */
 static uint32_t* page_directory __attribute__((aligned(PAGE_SIZE))) = NULL;
@@ -55,31 +61,78 @@ static uint32_t bitmap_find_first_free(void) {
     return (uint32_t)-1;
 }
 
-void mm_init(uint32_t mem_upper_kb, uint32_t kernel_end) {
-    /* Calculate total physical pages */
-    uint32_t total_mem_kb = mem_upper_kb + 1024; /* mem_upper + first 1MB */
-    total_pages = total_mem_kb * 1024 / PAGE_SIZE;
-
+void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
     /* Place bitmap after kernel */
     bitmap = (uint32_t*)kernel_end;
+
+    const uint64_t ram_cap = (uint64_t)MM_MAX_RAM_MB * 1024 * 1024;
+
+    /* Pass 1: determine RAM top. Prefer the BIOS memory map (E820 via
+     * multiboot); fall back to mem_upper when the loader provided none
+     * (e.g. the ISO boot path passes no multiboot info). */
+    uint64_t ram_top = 0;
+    if (mb && (mb->flags & MULTIBOOT_FLAG_MMAP)) {
+        uint32_t p = mb->mmap_addr;
+        uint32_t end = mb->mmap_addr + mb->mmap_length;
+        while (p + 4 <= end) {
+            const multiboot_mmap_entry_t* e = (const multiboot_mmap_entry_t*)p;
+            if (e->type == 1) {
+                uint64_t e_end = e->base_addr + e->length;
+                if (e_end > ram_cap) e_end = ram_cap;
+                if (e->base_addr < ram_cap && e_end > ram_top) ram_top = e_end;
+                mmap_region_count++;
+            }
+            p += e->size + 4;
+        }
+    }
+    if (ram_top == 0) {
+        uint32_t mem_upper_kb = 0;
+        if (mb && (mb->flags & MULTIBOOT_FLAG_MEM)) mem_upper_kb = mb->mem_upper;
+        if (mem_upper_kb == 0) mem_upper_kb = 32768;  /* sane default: 32MB */
+        ram_top = ((uint64_t)mem_upper_kb + 1024) * 1024;  /* + first MB */
+        if (ram_top > ram_cap) ram_top = ram_cap;
+    }
+
+    total_pages = (uint32_t)(ram_top / PAGE_SIZE);
 
     /* Reserve kernel area (0 to kernel_end + bitmap) in bitmap */
     uint32_t bitmap_bytes = bitmap_words() * 4;
     uint32_t reserved_pages = (kernel_end + bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    /* Initialize bitmap: everything used, then free the usable range.
-     * This also marks out-of-range tail bits as used so they are
-     * never handed out (total_pages is not always a multiple of 32). */
+    /* Initialize bitmap: everything used, then free only the frames
+     * that the memory map reports as usable RAM. This naturally keeps
+     * the sub-1MB legacy area, BIOS/EBDA holes and mmap holes reserved. */
     for (uint32_t i = 0; i < bitmap_words(); i++) {
         bitmap[i] = 0xFFFFFFFF;
     }
 
-    /* Mark reserved pages as used */
-    for (uint32_t i = 0; i < reserved_pages; i++) {
-        bitmap_set(i);
+    free_pages = 0;
+    if (mb && (mb->flags & MULTIBOOT_FLAG_MMAP)) {
+        uint32_t p = mb->mmap_addr;
+        uint32_t end = mb->mmap_addr + mb->mmap_length;
+        while (p + 4 <= end) {
+            const multiboot_mmap_entry_t* e = (const multiboot_mmap_entry_t*)p;
+            if (e->type == 1) {
+                uint64_t e_end = e->base_addr + e->length;
+                if (e_end > ram_cap) e_end = ram_cap;
+                uint32_t first = (uint32_t)((e->base_addr + PAGE_SIZE - 1) / PAGE_SIZE);
+                uint32_t last  = (uint32_t)(e_end / PAGE_SIZE);
+                if (first < reserved_pages) first = reserved_pages;
+                if (last > total_pages) last = total_pages;
+                for (uint32_t f = first; f < last; f++) {
+                    bitmap_clear(f);
+                    free_pages++;
+                }
+            }
+            p += e->size + 4;
+        }
+    } else {
+        /* No memory map: treat everything above the reserved area as usable */
+        for (uint32_t f = reserved_pages; f < total_pages; f++) {
+            bitmap_clear(f);
+            free_pages++;
+        }
     }
-
-    free_pages = total_pages - reserved_pages;
 
     /* Allocate page directory and first page table */
     page_directory = (uint32_t*)mm_alloc_page();
@@ -141,6 +194,7 @@ void mm_free_page(void* addr) {
 uint32_t mm_get_total_pages(void) { return total_pages; }
 uint32_t mm_get_free_pages(void)  { return free_pages; }
 uint32_t mm_get_used_pages(void)  { return total_pages - free_pages; }
+uint32_t mm_get_mmap_regions(void) { return mmap_region_count; }
 
 void* mm_alloc_pages(uint32_t count) {
     if (count == 0 || count > total_pages || free_pages < count) return NULL;

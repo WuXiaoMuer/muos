@@ -1,6 +1,7 @@
 #ifndef MUOS_MM_H
 #define MUOS_MM_H
 #include "types.h"
+#include "multiboot.h"
 
 #define PAGE_SIZE       4096
 #define PAGE_SHIFT      12
@@ -25,7 +26,7 @@
 #define PAGE_KERNEL     (PDE_PRESENT | PDE_WRITABLE)
 #define PAGE_KERNEL_RO  (PDE_PRESENT)
 
-void mm_init(uint32_t mem_upper_kb, uint32_t kernel_end);
+void mm_init(const multiboot_info_t* mb, uint32_t kernel_end);
 void mm_enable_paging(void);
 
 void*  mm_alloc_page(void);
@@ -33,6 +34,7 @@ void   mm_free_page(void* addr);
 uint32_t mm_get_total_pages(void);
 uint32_t mm_get_free_pages(void);
 uint32_t mm_get_used_pages(void);
+uint32_t mm_get_mmap_regions(void);
 
 void*  mm_alloc_pages(uint32_t count);
 void   mm_free_pages(void* addr, uint32_t count);
