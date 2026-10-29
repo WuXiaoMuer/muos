@@ -143,15 +143,17 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 - Linux i386 ABI:eax=调用号,ebx/ecx/edx(以及 esi/edi/ebp)传参;错误用 `-errno`。
 - 已实现(按用途分组):
   - 进程/stdio:`exit(1) exit_group(252) read(3) write(4) readv(145) writev(146) getpid(20) getppid(64) getuid/getgid/geteuid/getegid(24/47/49/50) 及其 32 位变体(199-202) getgroups(80/205)`;`rt_sigaction/rt_sigprocmask(174/175)` 空实现,`modify_ldt(123)` 返回 ENOSYS(由 set_thread_area 取代)
-  - 文件:`open(5) close(6) lseek(19) llseek(140) dup(41) dup2(63,仅同 fd) fcntl(55/221) access(33) getcwd(183) chdir(12,仅 "/") unlink(10) rename(38) sendfile(187/239)`
-  - 目录/元数据:`getdents(141) getdents64(220) stat/lstat/fstat(106-108) stat64/lstat64/fstat64(195-197) statx(383) utimes(271) futimesat(299) utimensat(320)`
-  - 内存/其他:`brk(45) old_mmap(90) mmap2(192) munmap(91) mprotect(125) uname(122) set/get_thread_area(243/244) time(13) gettimeofday(78) clock_gettime(265/403)`
+  - 文件:`open(5) close(6) lseek(19) llseek(140) dup(41) dup2(63,含 stdio 重定向) fcntl(55/221) access(33) getcwd(183) chdir(12) unlink(10) rename(38) sendfile(187/239)`
+  - 目录/元数据:`getdents(141) getdents64(220) stat/lstat/fstat(106-108) stat64/lstat64/fstat64(195-197) statx(383) statfs/fstatfs(99/100) statfs64/fstatfs64(268/269) utimes(271) futimesat(299) utimensat(320)`
+  - 内存/其他:`brk(45) old_mmap(90) mmap2(192) munmap(91) mprotect(125) uname(122) sysinfo(116) set/get_thread_area(243/244) time(13) gettimeofday(78) clock_gettime(265/403)`
   - 未知号返回 `-ENOSYS(-38)` 并在串口打印一次编号,作为 ROADMAP 阶段 4 的待办清单。
-- fd 表在 user.c:`0/1/2` 是 stdio,并带独立 open 状态(可被 `close(0/1/2)`);文件 fd 从 3 起映射 RAM FS 槽位并维护字节偏移;目录 fd 用 `USER_FD_DIR(-2)` 标记,偏移是下一个目录项序号。`USER_FD_MAX=8`。
-- 路径解析 `resolve_flat`:跳过前导 `/` 与 `./`;`""`/`"/"` 是根目录;其余名字不得再含 `/`(返回 `ENOTDIR`)。`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`;`O_DIRECTORY` 打开根返回目录 fd。
-- `getdents/getdents64` 动态枚举 `.`、`..` 与全部文件,分别按 i386 `linux_dirent`(10 字节头)与 `linux_dirent64`(19 字节头)打包;`d_off` 写下一项序号,缓冲区不足时保留偏移。
-- `stat` 族:`stat64` 写 96 字节 i386 布局,旧 `stat` 写 64 字节布局;根目录 `S_IFDIR|0755`/nlink 2,文件 `S_IFREG|0644`/nlink 1,`st_dev=1`。`statx(383)` 写 256 字节 `struct statx`(mask=STATX_BASIC_STATS),空路径且 `AT_EMPTY_PATH` 时改为 stat dirfd。
-- `write` 对 fd 1/2 逐字节输出到 VGA+串口(关闭 stdin/stdout 后返回 EBADF),对文件 fd 调 `fs_write_at`;所有用户缓冲区先用 `user_ptr_ok` 校验。`read` 对 fd 0 复用 `keyboard_getchar`(内部 `sti; hlt; cli`),对文件 fd 调 `fs_read_at`。
+- fd 表在 user.c 统一管理 0..10:启动时 0/1/2 是 `USER_FD_STDIN/STDOUT/STDERR`,其余条目可为 RAM FS 文件、目录、`/dev` 节点、`/proc` 快照或已关闭(FREE)。新 fd 从 3 起分配;`dup(41)` 复制任意条目,`dup2(63)` 可把文件/设备重定向到 0..2(或反向),`dd` 的 `dup2(if_fd,0)` 由此可用。
+- 路径解析 `vfs_normalize`:以进程 cwd(`user_cwd_get/set`,启动时 `/`)为基准处理绝对/相对路径、`.`、`..`(越界停在 `/`),输出规范绝对路径。命名空间:`/` 是 RAM FS(仅单段文件名),另有虚拟 `/dev`、`/proc`、`/etc`。
+- 虚拟文件:`/dev/null` 读 EOF/写丢弃,`/dev/zero` 读零/写丢弃,`/dev/console` 接键盘与 VGA+串口;`/proc/{meminfo,uptime,version,cpuinfo,mounts}` 与 `/etc/mtab` 在 `open` 时由内核生成快照存入 fd,`/proc/meminfo` 取 mm 页统计,`uptime` 取 PIT 100Hz。
+- `getdents/getdents64` 按目录 fd 的绝对路径枚举 `.`、`..`、RAM FS 文件以及 `dev/proc/etc` 虚拟子目录,分别按 i386 `linux_dirent`(10 字节头)与 `linux_dirent64`(19 字节头)打包;`d_off` 写下一项序号,缓冲区不足时保留偏移。
+- `stat` 族:`stat64` 写 96 字节 i386 布局,旧 `stat` 写 64 字节布局;目录 `S_IFDIR|0755`/nlink 2,文件 `S_IFREG|0644`,设备 `S_IFCHR|0666`,`/proc` 快照 `S_IFREG|0444`,`st_dev=1`。`statx(383)` 写 256 字节 `struct statx`(mask=STATX_BASIC_STATS),空路径且 `AT_EMPTY_PATH` 时改为 stat dirfd。
+- `statfs/fstatfs(99/100)` 与 `statfs64/fstatfs64(268/269)` 按 16×64KB 容量与空闲槽位填充,`df`/`stat -f` 可用;`sysinfo(116)` 回报 uptime/内存/任务数。`/proc/mounts` 输出 `/dev/root / ext2` 等真实设备行,BusyBox `df` 会跳过 `rootfs` 伪设备。
+- `write/read` 按 fd 类型分发:`STDIN`/`DEV_CONSOLE` 读复用 `keyboard_getchar`(内部 `sti; hlt; cli`),`STDOUT/STDERR/DEV_CONSOLE` 写 VGA+串口,`FILE` 走 `fs_read_at/fs_write_at`,`VFILE` 读内核快照、写返回 EACCES,`DEV_NULL/DEV_ZERO` 分别 EOF/零填充与丢弃写入。所有用户缓冲区先用 `user_ptr_ok` 校验。
 - `writev/readv` 按 iovec 顺序复用 `do_write/do_read`,部分成功时返回已处理字节数。musl 的 stdio 缓冲正是用 `writev` 刷出——这是 BusyBox `ls` 能打印的关键。
 - `sendfile64(239)` 从 in_fd(可选用户 offset 指针)读入内核缓冲并写 out_fd,更新偏移;BusyBox 的 fd 拷贝优先用它,失败再退回 read/write。
 - `brk` 与匿名 `mmap` 共用沙箱 bump 指针:brk 只改 `brk_current`(页早已映射),mmap 按页对齐分配并清零;文件映射、`MAP_FIXED` 拒绝。`munmap/mprotect` 是空操作(平坦沙箱)。
@@ -220,10 +222,10 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 ## 十一、已知局限(真实清单)
 
 1. 用户态是**单进程、固定 8MB 沙箱**:无 higher-half、无每进程页目录、无 fork/调度;一次只跑一个用户程序(ROADMAP 阶段 1 剩余项)
-2. 系统调用仍缺进程/并发原语:`fork/clone/waitpid/signals/pipe/execve/mkdir/mount/statfs` 与 `/proc`、`/dev`、文件 mmap 均未实现(ROADMAP 阶段 2/4)
-3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;BusyBox 的 `ls/cat` 与 VFS 元数据已跑通,但还不能 fork+execve 运行子进程,也没有管道/多级目录/磁盘
+2. 系统调用仍缺进程/并发原语:`fork/clone/waitpid/signals/pipe/execve/mkdir` 与文件 mmap 均未实现;`/proc` 只有静态文件,没有 `/proc/<pid>`,因此 `ps` 不可用(ROADMAP 阶段 2/4)
+3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;BusyBox 的 `ls/cat/free/df/dd` 已跑通,但还不能 fork+execve 运行子进程,也没有管道/多级目录/磁盘
 4. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
-5. fs 无句柄保护、无目录层级/时间戳/持久化;write 截断不告警
+5. fs 无句柄保护、无目录层级/时间戳/持久化;write 截断不告警;`/dev`、`/proc`、`/etc` 为只读虚拟层
 6. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
 7. 桌面仍是 80×25 文本模式,无图形帧缓冲、字体渲染与动画;窗口内容除 Calculator 外主要是状态展示
 8. 单处理器(PIC,非 APIC);内核仍是协作式单任务

@@ -25,21 +25,45 @@ int     user_run_image_argv(const void* image, uint32_t size,
                             int argc, const char* const* argv);
 int     user_run_embedded(const char* arg0, const char* arg1);
 
-/* Per-process fd table (fd 0/1/2 are stdin/stdout/stderr). File entries
- * map to RAM FS slot indices and keep a byte offset. USER_FD_DIR marks an
- * open directory (only "/" exists); its offset is the next entry index. */
-#define USER_FD_MAX 8
-#define USER_FD_DIR (-2)
+/* Per-process fd table (fd 0/1/2 are stdin/stdout/stderr). An entry is a
+ * RAM FS file, a directory (offset = next entry index), a virtual /dev
+ * node, or a snapshot of a /proc file. */
+#define USER_FD_MAX 11          /* fds 0..10; 0/1/2 start as stdio */
+#define USER_FD_PATH_MAX 64
+#define USER_FD_VBUF_MAX 512
+
+typedef enum {
+    USER_FD_FREE = 0,
+    USER_FD_STDIN,
+    USER_FD_STDOUT,
+    USER_FD_STDERR,
+    USER_FD_FILE,
+    USER_FD_DIR,
+    USER_FD_DEV_NULL,
+    USER_FD_DEV_ZERO,
+    USER_FD_DEV_CONSOLE,
+    USER_FD_VFILE
+} user_fd_kind_t;
+
 void     user_fds_reset(void);
 int      user_fd_alloc(int fs_slot);
-int      user_fd_alloc_dir(void);
+int      user_fd_alloc_dir(const char* path);
+int      user_fd_alloc_dev(int kind);
+int      user_fd_alloc_vfile(const char* data, uint32_t len);
+int      user_fd_kind(int fd);
 bool_t   user_fd_is_dir(int fd);
-bool_t   user_stdio_is_open(int fd);
-void     user_stdio_close(int fd);
+const char* user_fd_dir_path(int fd);
+uint32_t user_fd_vfile(int fd, const char** data);
+int      user_fd_dup(int oldfd);
+bool_t   user_fd_dup2(int oldfd, int newfd);
 int      user_fd_slot(int fd);
 uint32_t user_fd_offset(int fd);
 bool_t   user_fd_set_offset(int fd, uint32_t offset);
 void     user_fd_close(int fd);
+
+/* Single-process cwd used for relative path resolution ("/" at launch). */
+const char* user_cwd_get(void);
+bool_t   user_cwd_set(const char* path);
 
 /* Anonymous mmap arena: page-granular bump inside the sandbox.
  * Returns 0 when the request does not fit. */

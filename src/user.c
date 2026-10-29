@@ -23,69 +23,137 @@ static uint32_t brk_base = 0;
 static uint32_t brk_current = 0;
 
 typedef struct {
-    int      fs_slot;   /* -1 = free */
+    int      kind;      /* user_fd_kind_t; FREE = slot unused */
+    int      fs_slot;   /* RAM FS slot for FILE */
     uint32_t offset;
+    char     path[USER_FD_PATH_MAX];   /* DIR: absolute directory */
+    char     vbuf[USER_FD_VBUF_MAX];   /* VFILE: generated /proc text */
+    uint32_t vlen;
 } user_fd_t;
 
 static user_fd_t user_fds[USER_FD_MAX];
-static bool_t stdio_state[3];   /* fd 0/1/2 can be closed like Linux */
+static char cwd_path[USER_FD_PATH_MAX];
 
 static uint32_t align_up_page(uint32_t v) {
     return (v + PAGE_SIZE - 1) & PAGE_MASK;
 }
 
 static int fd_index(int fd) {
-    if (fd < 3 || fd >= 3 + USER_FD_MAX) return -1;
-    return fd - 3;
+    if (fd < 0 || fd >= USER_FD_MAX) return -1;
+    return fd;
+}
+
+/* New file-like fds always start at 3; 0..2 stay as stdio unless dup2'd. */
+static int fd_alloc_kind(int kind) {
+    for (int i = 3; i < USER_FD_MAX; i++) {
+        if (user_fds[i].kind == USER_FD_FREE) {
+            memset(&user_fds[i], 0, sizeof(user_fds[i]));
+            user_fds[i].kind = kind;
+            user_fds[i].fs_slot = -1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int fd_alloc_raw(void) {
+    for (int i = 3; i < USER_FD_MAX; i++) {
+        if (user_fds[i].kind == USER_FD_FREE) return i;
+    }
+    return -1;
 }
 
 void user_fds_reset(void) {
     for (int i = 0; i < USER_FD_MAX; i++) {
+        memset(&user_fds[i], 0, sizeof(user_fds[i]));
         user_fds[i].fs_slot = -1;
-        user_fds[i].offset = 0;
     }
-    for (int i = 0; i < 3; i++) stdio_state[i] = true;
-}
-
-bool_t user_stdio_is_open(int fd) {
-    if (fd < 0 || fd > 2) return false;
-    return stdio_state[fd];
-}
-
-void user_stdio_close(int fd) {
-    if (fd >= 0 && fd <= 2) stdio_state[fd] = false;
+    user_fds[0].kind = USER_FD_STDIN;
+    user_fds[1].kind = USER_FD_STDOUT;
+    user_fds[2].kind = USER_FD_STDERR;
+    strncpy(cwd_path, "/", USER_FD_PATH_MAX - 1);
+    cwd_path[USER_FD_PATH_MAX - 1] = '\0';
 }
 
 int user_fd_alloc(int fs_slot) {
-    for (int i = 0; i < USER_FD_MAX; i++) {
-        if (user_fds[i].fs_slot == -1) {
-            user_fds[i].fs_slot = fs_slot;
-            user_fds[i].offset = 0;
-            return 3 + i;   /* 0..2 are stdio */
-        }
-    }
-    return -1;
+    int fd = fd_alloc_kind(USER_FD_FILE);
+    if (fd < 0) return -1;
+    user_fds[fd].fs_slot = fs_slot;
+    return fd;
 }
 
-int user_fd_alloc_dir(void) {
-    for (int i = 0; i < USER_FD_MAX; i++) {
-        if (user_fds[i].fs_slot == -1) {
-            user_fds[i].fs_slot = USER_FD_DIR;
-            user_fds[i].offset = 0;
-            return 3 + i;
-        }
-    }
-    return -1;
+int user_fd_alloc_dir(const char* path) {
+    int fd = fd_alloc_kind(USER_FD_DIR);
+    if (fd < 0) return -1;
+    if (!path || path[0] != '/') path = "/";
+    strncpy(user_fds[fd].path, path, USER_FD_PATH_MAX - 1);
+    user_fds[fd].path[USER_FD_PATH_MAX - 1] = '\0';
+    return fd;
+}
+
+int user_fd_alloc_dev(int kind) {
+    if (kind != USER_FD_DEV_NULL && kind != USER_FD_DEV_ZERO &&
+        kind != USER_FD_DEV_CONSOLE) return -1;
+    return fd_alloc_kind(kind);
+}
+
+int user_fd_alloc_vfile(const char* data, uint32_t len) {
+    int fd = fd_alloc_kind(USER_FD_VFILE);
+    if (fd < 0) return -1;
+    if (len > USER_FD_VBUF_MAX) len = USER_FD_VBUF_MAX;
+    if (data && len) memcpy(user_fds[fd].vbuf, data, len);
+    user_fds[fd].vlen = len;
+    return fd;
+}
+
+int user_fd_kind(int fd) {
+    int i = fd_index(fd);
+    if (i < 0 || user_fds[i].kind == USER_FD_FREE) return -1;
+    return user_fds[i].kind;
 }
 
 bool_t user_fd_is_dir(int fd) {
     int i = fd_index(fd);
-    return (i >= 0 && user_fds[i].fs_slot == USER_FD_DIR) ? true : false;
+    return (i >= 0 && user_fds[i].kind == USER_FD_DIR) ? true : false;
+}
+
+const char* user_fd_dir_path(int fd) {
+    int i = fd_index(fd);
+    if (i < 0 || user_fds[i].kind != USER_FD_DIR) return "";
+    return user_fds[i].path;
+}
+
+uint32_t user_fd_vfile(int fd, const char** data) {
+    int i = fd_index(fd);
+    if (i < 0 || user_fds[i].kind != USER_FD_VFILE) return 0;
+    if (data) *data = user_fds[i].vbuf;
+    return user_fds[i].vlen;
+}
+
+/* Note: dup copies the descriptor entry including its offset; offsets are
+ * not shared between duplicates (dd-style redirection does not care). */
+int user_fd_dup(int oldfd) {
+    int oi = fd_index(oldfd);
+    if (oi < 0 || user_fds[oi].kind == USER_FD_FREE) return -1;
+    int ni = fd_alloc_raw();
+    if (ni < 0) return -1;
+    user_fds[ni] = user_fds[oi];
+    return ni;
+}
+
+bool_t user_fd_dup2(int oldfd, int newfd) {
+    int oi = fd_index(oldfd);
+    int ni = fd_index(newfd);
+    if (oi < 0 || ni < 0) return false;
+    if (user_fds[oi].kind == USER_FD_FREE) return false;
+    if (oi == ni) return true;
+    user_fds[ni] = user_fds[oi];
+    return true;
 }
 
 int user_fd_slot(int fd) {
     int i = fd_index(fd);
-    if (i < 0) return -1;
+    if (i < 0 || user_fds[i].kind != USER_FD_FILE) return -1;
     return user_fds[i].fs_slot;
 }
 
@@ -97,7 +165,7 @@ uint32_t user_fd_offset(int fd) {
 
 bool_t user_fd_set_offset(int fd, uint32_t offset) {
     int i = fd_index(fd);
-    if (i < 0 || user_fds[i].fs_slot == -1) return false;
+    if (i < 0 || user_fds[i].kind == USER_FD_FREE) return false;
     user_fds[i].offset = offset;
     return true;
 }
@@ -105,8 +173,19 @@ bool_t user_fd_set_offset(int fd, uint32_t offset) {
 void user_fd_close(int fd) {
     int i = fd_index(fd);
     if (i < 0) return;
+    memset(&user_fds[i], 0, sizeof(user_fds[i]));
     user_fds[i].fs_slot = -1;
-    user_fds[i].offset = 0;
+}
+
+const char* user_cwd_get(void) {
+    return cwd_path;
+}
+
+bool_t user_cwd_set(const char* path) {
+    if (!path || path[0] != '/' || strlen(path) >= USER_FD_PATH_MAX) return false;
+    strncpy(cwd_path, path, USER_FD_PATH_MAX - 1);
+    cwd_path[USER_FD_PATH_MAX - 1] = '\0';
+    return true;
 }
 
 uint32_t user_mmap_anon(uint32_t len) {

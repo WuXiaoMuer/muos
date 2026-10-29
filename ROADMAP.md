@@ -68,17 +68,19 @@
 - [x] BusyBox `ls/cat` 需求集:根目录 fd + `getdents(141)/getdents64(220)`、`stat/lstat/fstat(64)`、`statx(383)`、`access(33)`、`getcwd(183)`、`writev/readv(145/146)`、`rt_sigaction(174)`、`fcntl(64)`、`llseek(140)`、`sendfile(64)`、可关闭的 stdio fd
 - [x] 扁平 VFS 文件变更:`unlink(10)`、`rename(38)`、`fs_rename`;`utimes/futimesat/utimensat` 校验路径后成功(时间戳不持久化)
 - [x] 验收:`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a` 与 20+ applet(含 `ls -l`、`wc`、`grep`、`sed`、`od`、`cp/rm/mv/touch`)全部通过;`ENOENT`/`ENOTDIR`/`EBADF` 路径也符合 Linux 行为
+- [x] 设备与虚拟文件:`/dev/null` `/dev/zero` `/dev/console` 内核态字符设备;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/etc/mtab` 只读快照
+- [x] `statfs/fstatfs(99/100)`、`statfs64/fstatfs64(268/269)`、`sysinfo(116)`;统一 0..10 fd 表后 `dup/dup2` 支持 stdio 重定向,`free/df/dd/stat -f` 实测通过
 - [ ] 下一批进程/并发 ABI:`fork/clone`、`waitpid`、`execve`、`pipe/pipe2`、`kill`;shell 才能跑管道与子进程
-- [ ] 目录层级与设备:`mkdir/rmdir/renameat`、子目录查找、`/dev/null` `/dev/console`、简单字符设备框架
-- [ ] `/proc` 最小集(meminfo/mounts/self)与 `statfs/fstatfs64`,以支持 `ps/free/df`
+- [ ] 目录层级:`mkdir/rmdir/renameat`、子目录查找与多级 RAM FS(当前虚拟 `/dev` `/proc` `/etc` 之外仍是扁平的)
+- [ ] `/proc/<pid>`(stat/status/cmdline)与动态 PID 目录,以支持 `ps`;同时补 `/proc/loadavg`、`/proc/stat`
 - [x] errno 起步对齐(EBADF/EFAULT/EINVAL/ENOENT/ENOTDIR/EISDIR/ENOMEM/ENOSYS 等);`uname` 已回报 MuOS/muos/i386
 - [x] `stat` 族返回 MuOS 假 identity:根目录 `S_IFDIR|0755`、文件 `S_IFREG|0644`、`st_dev=1`、块大小/块数按 64KB 文件计算
 - [ ] errno 与 Linux 做一次全量审计(尤其 `statx` flags/mask 与 `sendfile` 边界)
 - [x] RTC 读取(CMOS,桌面任务栏时钟)与 `time(13)`/`gettimeofday(78)`/`clock_gettime(265/403)` 系统调用(统一返回 epoch,布局正确)
 - [ ] RTC → epoch 换算,让 `time/gettimeofday/clock_gettime` 返回真实秒数(需 CMOS 年月日 + 闰年换算)
 - [ ] a.out/ELF 的零页(empty bad-address page,0x08048000 之前不可映射)与地址布局兼容
-- [x] 方法学落地:每个真实二进制暴露的缺失 syscall 即刻补齐,串口只记录一次未知号;本轮 BusyBox 已驱动出完整 VFS 元数据面
-- 验收:`echo/ls/cat` 已通过;下一步以 `sh -c`、管道、`ps/df` 暴露的 `fork/pipe/proc` 需求作为清单
+- [x] 方法学落地:每个真实二进制暴露的缺失 syscall 即刻补齐,串口只记录一次未知号;本轮 BusyBox 已驱动出完整 VFS 元数据面与 `/dev`/`/proc` 基础
+- 验收:`echo/ls/cat/free/df/dd` 已通过;下一步以 `sh -c`、管道、`ps` 暴露的 `fork/pipe/proc` 需求作为清单
 
 **方法学**:不要预先实现"完整 Linux"——用真实二进制当测试驱动,qemu 串口 + panic dump 定位缺失调用,逐个补齐。
 

@@ -6,8 +6,8 @@
 - **硬件抽象**:GDT / IDT(256 项全覆盖)/ PIC / PIT / PS/2 键盘 + PS/2 鼠标 / 串口 / VGA 文本模式
 - **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、全 RAM 恒等映射分页、内核堆(kmalloc/kfree/kcalloc)
 - **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,可在 0x08048000 沙箱内运行 C 程序;ELF 可来自内核内嵌(`run`)或 RAM FS(`exec hello.elf`);用户态故障只杀进程,不 panic 内核
-- **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;扁平 VFS 暴露根目录 `/` 与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族
-- **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`
+- **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;扁平 VFS 暴露根目录 `/` 与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`
+- **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`
 - **RAM 文件系统**:16 槽 × 64KB(足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
 - **66 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
@@ -115,11 +115,12 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - 进入 Ring3 使用 TSS.esp0 切换内核栈;`int 0x80`(DPL3 门)按 Linux i386 ABI 分发(eax=号,ebx/ecx/edx 传参);退出/故障时恢复 `user_enter` 保存的内核上下文返回 Shell。
 - 已实现调用(按用途分组):
   - 进程/stdio:`exit(1)`、`exit_group(252)`、`read(3)`、`write(4)`、`readv(145)`、`writev(146)`、`getpid(20)`、`getppid(64)`、uid/gid 及其 32 位变体(24/47/49/50、199-202)、`getgroups(80/205)`;`close(6)` 可关闭 0/1/2
-  - 文件/目录:`open(5)`、`close(6)`、`lseek(19)`、`llseek(140)`、`sendfile(187/239)`、`dup(41)`、`dup2(63,仅同 fd)`、`fcntl(55/221)`、`access(33)`、`getcwd(183)`、`chdir(12,仅 "/")`、`unlink(10)`、`rename(38)`
-  - 目录/元数据:`getdents(141)`、`getdents64(220)`、`stat/lstat/fstat(106-108)`、`stat64/lstat64/fstat64(195-197)`、`statx(383)`;`utimes(271)`、`futimesat(299)`、`utimensat(320)` 校验路径后返回成功(时间戳暂未持久化)
-  - 内存/其他:`brk(45)`、`old_mmap(90)`、`mmap2(192)`、`munmap(91)`、`mprotect(125)`、`uname(122)`、`set/get_thread_area(243/244)`、`modify_ldt(123,ENOSYS)`、`rt_sigaction/rt_sigprocmask(174/175,空实现)`、`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)`
+  - 文件/目录:`open(5)`、`close(6)`、`lseek(19)`、`llseek(140)`、`sendfile(187/239)`、`dup(41)`、`dup2(63,含 stdio 重定向)`、`fcntl(55/221)`、`access(33)`、`getcwd(183)`、`chdir(12)`、`unlink(10)`、`rename(38)`
+  - 目录/元数据:`getdents(141)`、`getdents64(220)`、`stat/lstat/fstat(106-108)`、`stat64/lstat64/fstat64(195-197)`、`statx(383)`、`statfs/fstatfs(99/100)`、`statfs64/fstatfs64(268/269)`;`utimes(271)`、`futimesat(299)`、`utimensat(320)` 校验路径后返回成功(时间戳暂未持久化)
+  - 内存/其他:`brk(45)`、`old_mmap(90)`、`mmap2(192)`、`munmap(91)`、`mprotect(125)`、`uname(122)`、`sysinfo(116)`、`set/get_thread_area(243/244)`、`modify_ldt(123,ENOSYS)`、`rt_sigaction/rt_sigprocmask(174/175,空实现)`、`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)`
   - 未知调用返回 `-ENOSYS` 并在串口记录编号,便于用真实二进制驱动后续补齐。
-- 文件 fd 从 3 开始,映射 RAM FS 槽位并维护字节偏移;`"/"` 以目录 fd 打开(偏移为目录项序号),路径解析跳过前导 `/` 且暂不接受子目录。`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`。`mmap` 只支持 `MAP_PRIVATE|MAP_ANONYMOUS`(沙箱 bump 分配,文件映射/`MAP_FIXED` 拒绝)。
+- fd 表统一管理 0..10:`0/1/2` 初始为 stdin/stdout/stderr,`dup/dup2` 可把任意文件/设备 fd 重定向到 0..2(或反之);文件 fd 映射 RAM FS 槽位并维护字节偏移,目录 fd 保存绝对路径与目录项序号。
+- 路径统一规范化:支持绝对/相对路径、`.` 与 `..`(父目录越界时停在 `/`)。命名空间 = 扁平 RAM FS 根目录 + `/dev`、`/proc`、`/etc` 虚拟目录;`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`。`mmap` 只支持 `MAP_PRIVATE|MAP_ANONYMOUS`(沙箱 bump 分配,文件映射/`MAP_FIXED` 拒绝)。
 - 沙箱要求物理 RAM > 128MB;ISO 路径因无 multiboot 信息回退 32MB,`run`/`exec` 会明确提示内存不足。
 
 ## 真实 Linux 二进制(BusyBox)
@@ -148,11 +149,25 @@ Built with GCC 15 + NASM
 已验证对象是 Alpine v3.20 的 **busybox-static 1.36.1-r31(i386, musl 静态)**。
 `busybox-static-1.36.1-r31.apk` 解包后的 `bin/busybox.static`。为跑通它补齐了 i386 TLS(`set_thread_area` + GDT slot 6)、`exit_group`、`set_tid_address`、uid32、`ioctl`、`dup2`、`envp`/`auxv` 初始栈,以及扁平 VFS 的 `getdents64`/`stat64`/`statx`/`writev`/`sendfile64` 等调用。
 
-已实测 applet:`ls`(含 `-l`)、`cat`、`pwd`、`id`、`uname`、`wc`、`grep`、`head`、`tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp`、`rm`、`mv`、`touch`;不存在的路径会正确返回 `ENOENT`。
+已实测 applet:`ls`(含 `-l`)、`cat`、`pwd`、`id`、`uname`、`wc`、`grep`、`head`、`tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp`、`rm`、`mv`、`touch`、`free`、`df`、`dd`、`uptime`;不存在的路径会正确返回 `ENOENT`。
+
+```text
+muos> execmod 0 free
+              total        used        free      shared  buff/cache   available
+Mem:         262016       13776      248240           0           0      248240
+muos> execmod 0 df
+Filesystem           1K-blocks      Used Available Use% Mounted on
+/dev/root                 1024       192       832  19% /
+proc                      1024       192       832  19% /proc
+devtmpfs                  1024       192       832  19% /dev
+muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
+1+0 records in
+1+0 records out
+```
 
 注意:
 - BusyBox 静态包约 1MB,OS 模块只接受外部 `-initrd`,不放进 64KB RAM FS。
-- VFS 是扁平的:只有根目录 `/`,没有子目录、`/proc`、`/dev`;`mkdir/rmdir`、`pipe`、`fork/execve` 等仍未实现,因此 `df`、`ps`、`free`、管道与交互式 `sh` 尚不可用。
+- RAM FS 仍无子目录;虚拟 `/dev`、`/proc`、`/etc` 是只读最小实现:`/proc` 没有 `/<pid>` 目录,所以 `ps` 仍不可用;`mkdir/rmdir`、`pipe`、`fork/execve` 未实现,管道与交互式 `sh` 尚不可用。
 - 文件时间戳未持久化,`ls -l`/`stat` 显示 1970-01-01;`touch`/`utimensat` 只校验路径后返回成功。
 - 首次运行会分配 257 页连续内存做模块副本;256MB 内存下正常。
 
@@ -197,6 +212,8 @@ Built with GCC 15 + NASM
 | BusyBox `ls` 退出 0 但没有任何输出 | musl stdio 用 `writev` 刷缓冲,未实现时整批输出丢失 | 实现 `writev(146)`/`readv(145)`,按 iovec 复用 do_write/do_read |
 | `od` 读完后报 `standard input: Bad file descriptor` | od 会关闭 fd 0,而旧的 fd 表把 0/1/2 当作永远打开 | stdio 增加 open 状态;read/write/close/fstat/fcntl/statx 均检查 |
 | musl 先调 `statx(383)` 再退回 stat64 | 新版 musl 的 `fstatat` 优先使用 statx | 按 256 字节 `struct statx` 填 basic stats,空路径支持 AT_EMPTY_PATH |
+| `df` 只打印表头(`can't find mount point`) | BusyBox 跳过 `rootfs` 行,需要真实设备名 | `/proc/mounts` 与 `/etc/mtab` 输出 `/dev/root / ext2`、`proc /proc`、`devtmpfs /dev` |
+| `dd` 报 `can't duplicate file descriptor` | dd 会 `dup2(if_fd, 0)`,旧实现把 0/1/2 当作固定 stdio | fd 表统一管理 0..10,`dup/dup2` 复制任意条目(含 stdio 重定向) |
 
 ## 版本
 
@@ -204,7 +221,7 @@ Built with GCC 15 + NASM
 
 桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 66 项)。
 
-**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ **`ls /`、`cat /notes.txt` 及 20+ 个 applet 实测通过**。下一步:`pipe`/`fork`/`execve`、`/proc` 与 `/dev`、多级目录。
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过。下一步:`fork/execve/pipe`、`/proc/<pid>`(ps)、多级目录与 RTC 时间戳。
 
 ## 参考资源
 

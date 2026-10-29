@@ -6,6 +6,9 @@
 #include "serial.h"
 #include "keyboard.h"
 #include "string.h"
+#include "mm.h"
+#include "pit.h"
+#include "task.h"
 
 /* Linux i386 syscall numbers (the ABI MuOS targets). This is the starter
  * set needed by freestanding user programs; anything else is rejected
@@ -34,6 +37,9 @@
 #define SYS_umask     60
 #define SYS_dup2      63
 #define SYS_getppid   64
+#define SYS_statfs    99
+#define SYS_fstatfs  100
+#define SYS_sysinfo  116
 #define SYS_getgroups 80
 #define SYS_gettimeofday 78
 #define SYS_stat     106
@@ -67,6 +73,8 @@
 #define SYS_getegid32       202
 #define SYS_getdents64      220
 #define SYS_fcntl64         221
+#define SYS_statfs64        268
+#define SYS_fstatfs64       269
 #define SYS_set_thread_area 243
 #define SYS_get_thread_area 244
 #define SYS_exit_group      252
@@ -79,6 +87,7 @@
 #define ERR_EPERM      1
 #define ERR_ENOENT     2
 #define ERR_EBADF      9
+#define ERR_EACCES    13
 #define ERR_ENOMEM    12
 #define ERR_EFAULT    14
 #define ERR_ENODEV    19
@@ -88,10 +97,14 @@
 #define ERR_EMFILE    24
 #define ERR_ENOSPC    28
 #define ERR_ENOTTY    25
+#define ERR_ERANGE    34
 #define ERR_ENAMETOOLONG 36
 #define ERR_ENOSYS    38
 
 /* open(2) flags and mmap(2) constants (Linux i386 values) */
+#define O_WRONLY    0x01
+#define O_RDWR      0x02
+#define O_ACCMODE   0x03
 #define O_CREAT     0x40
 #define O_TRUNC     0x200
 #define O_DIRECTORY 0x10000
@@ -101,6 +114,9 @@
 #define STAT_OLD_SIZE 64
 #define STATX_SIZE 256
 #define STATX_BASIC_STATS 0x7ffu
+#define STATFS_OLD_SIZE 64
+#define STATFS64_SIZE 84
+#define SYSINFO_SIZE 64
 #define S_IFREG 0100000u
 #define S_IFDIR 0040000u
 #define S_IFCHR 0020000u
@@ -115,53 +131,93 @@ static uint32_t err(uint32_t code) {
     return (uint32_t)(-(int32_t)code);
 }
 
+static uint32_t read_keyboard_char(uint32_t buf) {
+    /* keyboard_getchar spins with interrupts enabled internally, which
+     * is required here: int 0x80 also runs with IF=0. */
+    char c = keyboard_getchar();
+    *(char*)buf = c;
+    vga_putchar(c);
+    serial_putchar(c);
+    return 1;
+}
+
 static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
     if (count == 0) return 0;
     if (!user_ptr_ok(buf, count)) return err(ERR_EFAULT);
 
-    if (fd == 1 || fd == 2) {
-        if (!user_stdio_is_open((int)fd)) return err(ERR_EBADF);
-        for (uint32_t i = 0; i < count; i++) {
-            char c = ((const char*)buf)[i];
-            vga_putchar(c);
-            serial_putchar(c);
+    int kind = user_fd_kind((int)fd);
+    if (kind < 0) return err(ERR_EBADF);
+    switch (kind) {
+        case USER_FD_FILE: {
+            int slot = user_fd_slot((int)fd);
+            if (slot < 0) return err(ERR_EBADF);
+            uint32_t off = user_fd_offset((int)fd);
+            int n = fs_write_at(slot, off, (const char*)buf, count);
+            if (n < 0) return err(ERR_EBADF);
+            user_fd_set_offset((int)fd, off + (uint32_t)n);
+            return (uint32_t)n;
         }
-        return count;
+        case USER_FD_DEV_NULL:
+        case USER_FD_DEV_ZERO:
+            return count;              /* writes are discarded */
+        case USER_FD_STDOUT:
+        case USER_FD_STDERR:
+        case USER_FD_DEV_CONSOLE:
+            for (uint32_t i = 0; i < count; i++) {
+                char c = ((const char*)buf)[i];
+                vga_putchar(c);
+                serial_putchar(c);
+            }
+            return count;
+        case USER_FD_VFILE:
+            return err(ERR_EACCES);
+        case USER_FD_DIR:
+            return err(ERR_EISDIR);
+        default:
+            return err(ERR_EBADF);     /* e.g. writing to stdin */
     }
-
-    if (user_fd_is_dir((int)fd)) return err(ERR_EISDIR);
-    int slot = user_fd_slot((int)fd);
-    if (slot < 0) return err(ERR_EBADF);
-    uint32_t off = user_fd_offset((int)fd);
-    int n = fs_write_at(slot, off, (const char*)buf, count);
-    if (n < 0) return err(ERR_EBADF);
-    user_fd_set_offset((int)fd, off + (uint32_t)n);
-    return (uint32_t)n;
 }
 
 static uint32_t do_read(uint32_t fd, uint32_t buf, uint32_t count) {
     if (count == 0) return 0;
     if (!user_ptr_ok(buf, count)) return err(ERR_EFAULT);
 
-    if (fd == 0) {
-        if (!user_stdio_is_open(0)) return err(ERR_EBADF);
-        /* keyboard_getchar spins with interrupts enabled internally, which
-         * is required here: int 0x80 also runs with IF=0. */
-        char c = keyboard_getchar();
-        *(char*)buf = c;
-        vga_putchar(c);
-        serial_putchar(c);
-        return 1;
+    int kind = user_fd_kind((int)fd);
+    if (kind < 0) return err(ERR_EBADF);
+    switch (kind) {
+        case USER_FD_FILE: {
+            int slot = user_fd_slot((int)fd);
+            if (slot < 0) return err(ERR_EBADF);
+            uint32_t off = user_fd_offset((int)fd);
+            int n = fs_read_at(slot, off, (char*)buf, count);
+            if (n < 0) return err(ERR_EBADF);
+            user_fd_set_offset((int)fd, off + (uint32_t)n);
+            return (uint32_t)n;
+        }
+        case USER_FD_VFILE: {
+            const char* data = NULL;
+            uint32_t len = user_fd_vfile((int)fd, &data);
+            uint32_t off = user_fd_offset((int)fd);
+            if (off >= len) return 0;
+            uint32_t n = len - off;
+            if (n > count) n = count;
+            memcpy((void*)buf, data + off, n);
+            user_fd_set_offset((int)fd, off + n);
+            return n;
+        }
+        case USER_FD_DEV_NULL:
+            return 0;
+        case USER_FD_DEV_ZERO:
+            memset((void*)buf, 0, count);
+            return count;
+        case USER_FD_STDIN:
+        case USER_FD_DEV_CONSOLE:
+            return read_keyboard_char(buf);
+        case USER_FD_DIR:
+            return err(ERR_EISDIR);
+        default:
+            return err(ERR_EBADF);     /* reading from stdout/stderr */
     }
-
-    if (user_fd_is_dir((int)fd)) return err(ERR_EISDIR);
-    int slot = user_fd_slot((int)fd);
-    if (slot < 0) return err(ERR_EBADF);
-    uint32_t off = user_fd_offset((int)fd);
-    int n = fs_read_at(slot, off, (char*)buf, count);
-    if (n < 0) return err(ERR_EBADF);
-    user_fd_set_offset((int)fd, off + (uint32_t)n);
-    return (uint32_t)n;
 }
 
 /* Copy a user-space NUL-terminated string into a kernel buffer. */
@@ -177,30 +233,292 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
     return true;
 }
 
-/* The RAM FS is flat: "/" is the only directory, "/name" is a regular
- * file. Map a user path onto that model.
- * Returns 0 with the file name in "name", 1 for the root directory,
- * or a negative errno. */
-static int resolve_flat(const char* path, char* name, uint32_t max) {
-    const char* p = path;
-    for (;;) {
-        while (*p == '/') p++;
-        if (*p == '\0') { name[0] = '\0'; return 1; }
-        if (p[0] == '.' && p[1] == '/') { p += 2; continue; }
-        if (p[0] == '.' && (p[1] == '\0' || (p[1] == '.' && p[2] == '\0'))) {
-            name[0] = '\0';      /* "." and ".." both resolve to "/" */
-            return 1;
+/* ---- virtual namespace: flat RAM FS at "/" plus /dev, /proc, /etc ---- */
+
+#define VFS_T_NONE  0
+#define VFS_T_FILE  1
+#define VFS_T_DIR   2
+#define VFS_T_DEV   3
+#define VFS_T_VFILE 4
+
+#define VFS_DIR_ROOT 1
+#define VFS_DIR_DEV  2
+#define VFS_DIR_PROC 3
+#define VFS_DIR_ETC  4
+
+#define VFS_DEV_NULL    1
+#define VFS_DEV_ZERO    2
+#define VFS_DEV_CONSOLE 3
+
+#define VFS_VF_MEMINFO 1
+#define VFS_VF_UPTIME  2
+#define VFS_VF_VERSION 3
+#define VFS_VF_CPUINFO 4
+#define VFS_VF_MOUNTS  5
+#define VFS_VF_MTAB    6
+
+typedef struct {
+    int  type;
+    int  slot;       /* VFS_T_FILE */
+    int  id;         /* directory / device / proc-file id */
+    char path[USER_FD_PATH_MAX];
+} vfs_ent_t;
+
+static bool_t has_slash(const char* s) {
+    for (; *s; s++) if (*s == '/') return true;
+    return false;
+}
+
+/* Canonicalize a path against the process cwd ("." and ".." supported).
+ * Returns 0 with an absolute path in out, or -ENAMETOOLONG. */
+static uint32_t vfs_normalize(const char* in, char* out, uint32_t max) {
+    char tmp[USER_FD_PATH_MAX];
+    uint32_t n = 0;
+    tmp[0] = '\0';
+
+    if (in[0] != '/') {
+        const char* cwd = user_cwd_get();
+        if (cwd[0] == '/' && cwd[1] != '\0') {
+            uint32_t cl = strlen(cwd);
+            if (cl >= sizeof(tmp)) return err(ERR_ENAMETOOLONG);
+            strncpy(tmp, cwd, sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+            n = cl;
         }
-        break;
     }
-    uint32_t i = 0;
-    for (; p[i]; i++) {
-        if (p[i] == '/') return -ERR_ENOTDIR;   /* no subdirectories yet */
-        if (i + 1 >= max) return -ERR_ENAMETOOLONG;
-        name[i] = p[i];
+
+    const char* p = in;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char* start = p;
+        while (*p && *p != '/') p++;
+        uint32_t len = (uint32_t)(p - start);
+
+        if (len == 1 && start[0] == '.') continue;
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (n == 0) continue;
+            uint32_t i = n;
+            while (i > 0 && tmp[i - 1] != '/') i--;
+            n = i ? i - 1 : 0;        /* cut at the slash; root is empty */
+            tmp[n] = '\0';
+            continue;
+        }
+        if (n + len + 2 >= sizeof(tmp)) return err(ERR_ENAMETOOLONG);
+        tmp[n++] = '/';
+        memcpy(tmp + n, start, len);
+        n += len;
+        tmp[n] = '\0';
     }
-    name[i] = '\0';
+
+    if (n == 0) {
+        if (max < 2) return err(ERR_ENAMETOOLONG);
+        out[0] = '/';
+        out[1] = '\0';
+        return 0;
+    }
+    if (n + 1 > max) return err(ERR_ENAMETOOLONG);
+    memcpy(out, tmp, n + 1);
     return 0;
+}
+
+static int vfs_proc_file_id(const char* name) {
+    if (strcmp(name, "meminfo") == 0) return VFS_VF_MEMINFO;
+    if (strcmp(name, "uptime") == 0) return VFS_VF_UPTIME;
+    if (strcmp(name, "version") == 0) return VFS_VF_VERSION;
+    if (strcmp(name, "cpuinfo") == 0) return VFS_VF_CPUINFO;
+    if (strcmp(name, "mounts") == 0) return VFS_VF_MOUNTS;
+    return 0;
+}
+
+static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
+    memset(e, 0, sizeof(*e));
+    uint32_t rc = vfs_normalize(in, e->path, USER_FD_PATH_MAX);
+    if ((int32_t)rc < 0) return rc;
+
+    if (strcmp(e->path, "/") == 0) { e->type = VFS_T_DIR; e->id = VFS_DIR_ROOT; return 0; }
+    if (strcmp(e->path, "/dev") == 0) { e->type = VFS_T_DIR; e->id = VFS_DIR_DEV; return 0; }
+    if (strcmp(e->path, "/proc") == 0) { e->type = VFS_T_DIR; e->id = VFS_DIR_PROC; return 0; }
+    if (strcmp(e->path, "/etc") == 0) { e->type = VFS_T_DIR; e->id = VFS_DIR_ETC; return 0; }
+
+    if (strncmp(e->path, "/dev/", 5) == 0) {
+        const char* n = e->path + 5;
+        if (has_slash(n)) return err(ERR_ENOENT);
+        if (strcmp(n, "null") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_NULL; return 0; }
+        if (strcmp(n, "zero") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_ZERO; return 0; }
+        if (strcmp(n, "console") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_CONSOLE; return 0; }
+        return err(ERR_ENOENT);
+    }
+    if (strncmp(e->path, "/proc/", 6) == 0) {
+        const char* n = e->path + 6;
+        if (has_slash(n)) return err(ERR_ENOENT);
+        int id = vfs_proc_file_id(n);
+        if (!id) return err(ERR_ENOENT);
+        e->type = VFS_T_VFILE;
+        e->id = id;
+        return 0;
+    }
+    if (strncmp(e->path, "/etc/", 5) == 0) {
+        const char* n = e->path + 5;
+        if (strcmp(n, "mtab") == 0) { e->type = VFS_T_VFILE; e->id = VFS_VF_MTAB; return 0; }
+        return err(ERR_ENOENT);
+    }
+
+    const char* name = e->path + 1;
+    if (has_slash(name)) return err(ERR_ENOTDIR);
+    int slot = fs_open(name);
+    if (slot < 0) return err(ERR_ENOENT);
+    e->type = VFS_T_FILE;
+    e->slot = slot;
+    return 0;
+}
+
+/* ---- generated /proc content ---- */
+
+static uint32_t sb_add(char* b, uint32_t pos, uint32_t max, const char* s) {
+    while (*s && pos + 1 < max) b[pos++] = *s++;
+    b[pos] = '\0';
+    return pos;
+}
+
+static uint32_t sb_dec(char* b, uint32_t pos, uint32_t max, uint32_t v) {
+    char tmp[12];
+    uint32_t n = u32_to_dec(tmp, v);
+    if (n > max - 1 - pos) n = max - 1 - pos;
+    memcpy(b + pos, tmp, n);
+    pos += n;
+    b[pos] = '\0';
+    return pos;
+}
+
+static uint32_t sb_dec02(char* b, uint32_t pos, uint32_t max, uint32_t v) {
+    if (v < 10) pos = sb_add(b, pos, max, "0");
+    return sb_dec(b, pos, max, v);
+}
+
+static uint32_t vfs_vfile_text(int id, char* out, uint32_t max) {
+    uint32_t pos = 0;
+    out[0] = '\0';
+
+    switch (id) {
+        case VFS_VF_MEMINFO: {
+            uint32_t total_kb = mm_get_total_pages() * (PAGE_SIZE / 1024);
+            uint32_t free_kb = mm_get_free_pages() * (PAGE_SIZE / 1024);
+            pos = sb_add(out, pos, max, "MemTotal:       ");
+            pos = sb_dec(out, pos, max, total_kb);
+            pos = sb_add(out, pos, max, " kB\nMemFree:        ");
+            pos = sb_dec(out, pos, max, free_kb);
+            pos = sb_add(out, pos, max, " kB\nMemAvailable:   ");
+            pos = sb_dec(out, pos, max, free_kb);
+            pos = sb_add(out, pos, max, " kB\nBuffers:        0 kB\nCached:         0 kB\n");
+            pos = sb_add(out, pos, max, "SwapTotal:      0 kB\nSwapFree:       0 kB\n");
+            break;
+        }
+        case VFS_VF_UPTIME: {
+            uint32_t t = pit_get_ticks();   /* 100 Hz */
+            pos = sb_dec(out, pos, max, t / 100);
+            pos = sb_add(out, pos, max, ".");
+            pos = sb_dec02(out, pos, max, t % 100);
+            pos = sb_add(out, pos, max, " ");
+            pos = sb_dec(out, pos, max, t / 100);
+            pos = sb_add(out, pos, max, ".");
+            pos = sb_dec02(out, pos, max, t % 100);
+            pos = sb_add(out, pos, max, "\n");
+            break;
+        }
+        case VFS_VF_VERSION:
+            pos = sb_add(out, pos, max, "Linux version 1.2.0 (muos@i386) #1\n");
+            break;
+        case VFS_VF_CPUINFO:
+            pos = sb_add(out, pos, max,
+                         "processor\t: 0\nmodel name\t: MuOS virtual i386\n\n");
+            break;
+        case VFS_VF_MOUNTS:
+        case VFS_VF_MTAB:
+            pos = sb_add(out, pos, max,
+                         "/dev/root / ext2 rw 0 0\n"
+                         "proc /proc proc rw 0 0\n"
+                         "devtmpfs /dev devtmpfs rw 0 0\n");
+            break;
+        default:
+            break;
+    }
+    return pos;
+}
+
+static uint32_t vfs_vfile_size(int id) {
+    char tmp[USER_FD_VBUF_MAX];
+    return vfs_vfile_text(id, tmp, sizeof(tmp));
+}
+
+/* ---- directory enumeration ---- */
+
+static int vfs_dir_id(const char* path) {
+    if (strcmp(path, "/") == 0) return VFS_DIR_ROOT;
+    if (strcmp(path, "/dev") == 0) return VFS_DIR_DEV;
+    if (strcmp(path, "/proc") == 0) return VFS_DIR_PROC;
+    if (strcmp(path, "/etc") == 0) return VFS_DIR_ETC;
+    return 0;
+}
+
+static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
+                            uint32_t* ino, uint8_t* type) {
+    int dir = vfs_dir_id(path);
+    if (!dir) return false;
+
+    if (idx == 0) { strncpy(name, ".", USER_FD_PATH_MAX); *ino = 1; *type = 4; return true; }
+    if (idx == 1) { strncpy(name, "..", USER_FD_PATH_MAX); *ino = 1; *type = 4; return true; }
+    idx -= 2;
+
+    if (dir == VFS_DIR_ROOT) {
+        int files = fs_count();
+        if ((int)idx < files) {
+            const char* n = fs_name((int)idx);
+            if (!n) return false;
+            strncpy(name, n, USER_FD_PATH_MAX - 1);
+            name[USER_FD_PATH_MAX - 1] = '\0';
+            *ino = idx + 3;
+            *type = 8;                  /* DT_REG */
+            return true;
+        }
+        idx -= (uint32_t)files;
+        const char* extra[3] = { "dev", "proc", "etc" };
+        if (idx < 3) {
+            strncpy(name, extra[idx], USER_FD_PATH_MAX);
+            *ino = 100 + idx;
+            *type = 4;                  /* DT_DIR */
+            return true;
+        }
+        return false;
+    }
+
+    if (dir == VFS_DIR_DEV) {
+        const char* devs[3] = { "null", "zero", "console" };
+        if (idx < 3) {
+            strncpy(name, devs[idx], USER_FD_PATH_MAX);
+            *ino = 200 + idx;
+            *type = 2;                  /* DT_CHR */
+            return true;
+        }
+        return false;
+    }
+    if (dir == VFS_DIR_PROC) {
+        const char* files[5] = { "meminfo", "uptime", "version", "cpuinfo", "mounts" };
+        if (idx < 5) {
+            strncpy(name, files[idx], USER_FD_PATH_MAX);
+            *ino = 300 + idx;
+            *type = 8;
+            return true;
+        }
+        return false;
+    }
+    if (dir == VFS_DIR_ETC && idx < 1) {
+        strncpy(name, "mtab", USER_FD_PATH_MAX);
+        *ino = 400;
+        *type = 8;
+        return true;
+    }
+    return false;
 }
 
 static uint32_t do_open(uint32_t path, uint32_t flags, uint32_t mode) {
@@ -208,40 +526,59 @@ static uint32_t do_open(uint32_t path, uint32_t flags, uint32_t mode) {
     char buf[128];
     if (!copy_user_string(path, buf, sizeof(buf))) return err(ERR_EFAULT);
 
-    char name[FS_MAX_NAME];
-    int kind = resolve_flat(buf, name, sizeof(name));
-    if (kind < 0) return err((uint32_t)(-kind));
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) {
+        if ((uint32_t)(-(int32_t)rc) != ERR_ENOENT) return rc;
+        if (!(flags & O_CREAT) || (flags & O_DIRECTORY)) return rc;
 
-    if (kind == 1) {
-        if (flags & (O_CREAT | O_TRUNC)) return err(ERR_EISDIR);
-        int dfd = user_fd_alloc_dir();
-        if (dfd < 0) return err(ERR_EMFILE);
-        return (uint32_t)dfd;
-    }
-
-    int slot = fs_open(name);
-    if (slot < 0) {
-        if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
-        if (!(flags & O_CREAT)) return err(ERR_ENOENT);
-        slot = fs_create(name);
+        const char* name = e.path + 1;
+        if (!*name || has_slash(name)) return err(ERR_ENOTDIR);
+        if (strlen(name) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
+        int slot = fs_create(name);
         if (slot < 0) return err(ERR_ENOSPC);
-    } else if (flags & O_DIRECTORY) {
-        return err(ERR_ENOTDIR);   /* a regular file is not a directory */
+        int fd = user_fd_alloc(slot);
+        if (fd < 0) return err(ERR_EMFILE);
+        return (uint32_t)fd;
     }
-    if (flags & O_TRUNC) fs_fd_truncate(slot);
 
-    int fd = user_fd_alloc(slot);
-    if (fd < 0) return err(ERR_EMFILE);
-    return (uint32_t)fd;
+    switch (e.type) {
+        case VFS_T_DIR: {
+            if (flags & (O_CREAT | O_TRUNC)) return err(ERR_EISDIR);
+            int fd = user_fd_alloc_dir(e.path);
+            if (fd < 0) return err(ERR_EMFILE);
+            return (uint32_t)fd;
+        }
+        case VFS_T_DEV: {
+            int kind = USER_FD_DEV_NULL;
+            if (e.id == VFS_DEV_ZERO) kind = USER_FD_DEV_ZERO;
+            else if (e.id == VFS_DEV_CONSOLE) kind = USER_FD_DEV_CONSOLE;
+            int fd = user_fd_alloc_dev(kind);
+            if (fd < 0) return err(ERR_EMFILE);
+            return (uint32_t)fd;
+        }
+        case VFS_T_VFILE: {
+            if ((flags & O_ACCMODE) != 0) return err(ERR_EACCES);
+            char tmp[USER_FD_VBUF_MAX];
+            uint32_t len = vfs_vfile_text(e.id, tmp, sizeof(tmp));
+            int fd = user_fd_alloc_vfile(tmp, len);
+            if (fd < 0) return err(ERR_EMFILE);
+            return (uint32_t)fd;
+        }
+        case VFS_T_FILE: {
+            if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
+            if (flags & O_TRUNC) fs_fd_truncate(e.slot);
+            int fd = user_fd_alloc(e.slot);
+            if (fd < 0) return err(ERR_EMFILE);
+            return (uint32_t)fd;
+        }
+        default:
+            return err(ERR_ENOENT);
+    }
 }
 
 static uint32_t do_close(uint32_t fd) {
-    if (fd <= 2) {
-        if (!user_stdio_is_open((int)fd)) return err(ERR_EBADF);
-        user_stdio_close((int)fd);
-        return 0;
-    }
-    if (user_fd_slot((int)fd) < 0 && !user_fd_is_dir((int)fd)) return err(ERR_EBADF);
+    if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
     user_fd_close((int)fd);
     return 0;
 }
@@ -284,29 +621,105 @@ static void fill_stat_old(char* st, uint32_t ino, uint32_t mode,
     put_u32(st, 28, (size + 511) / 512);
 }
 
+static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
+                             uint32_t* mode, uint32_t* nlink, uint32_t* size) {
+    switch (e->type) {
+        case VFS_T_FILE:
+            *ino = (uint32_t)(e->slot + 3);
+            *mode = S_IFREG | 0644;
+            *nlink = 1;
+            *size = fs_fd_size(e->slot);
+            return true;
+        case VFS_T_DIR: {
+            uint32_t base = 1;
+            if (e->id == VFS_DIR_DEV) base = 100;
+            else if (e->id == VFS_DIR_PROC) base = 101;
+            else if (e->id == VFS_DIR_ETC) base = 102;
+            *ino = base;
+            *mode = S_IFDIR | 0755;
+            *nlink = 2;
+            *size = 0;
+            return true;
+        }
+        case VFS_T_DEV:
+            *ino = 200 + (uint32_t)e->id;
+            *mode = S_IFCHR | 0666;
+            *nlink = 1;
+            *size = 0;
+            return true;
+        case VFS_T_VFILE:
+            *ino = 300 + (uint32_t)e->id;
+            *mode = S_IFREG | 0444;
+            *nlink = 1;
+            *size = vfs_vfile_size(e->id);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
+                            uint32_t* nlink, uint32_t* size) {
+    int kind = user_fd_kind(fd);
+    switch (kind) {
+        case USER_FD_STDIN:
+        case USER_FD_STDOUT:
+        case USER_FD_STDERR:
+            *ino = (uint32_t)fd + 1;
+            *mode = S_IFCHR | 0666;
+            *nlink = 1;
+            *size = 0;
+            return true;
+        case USER_FD_FILE: {
+            int slot = user_fd_slot(fd);
+            if (slot < 0) return false;
+            *ino = (uint32_t)(slot + 3);
+            *mode = S_IFREG | 0644;
+            *nlink = 1;
+            *size = fs_fd_size(slot);
+            return true;
+        }
+        case USER_FD_DIR: {
+            vfs_ent_t e;
+            memset(&e, 0, sizeof(e));
+            e.type = VFS_T_DIR;
+            e.id = vfs_dir_id(user_fd_dir_path(fd));
+            if (!e.id) return false;
+            return vfs_ent_fields(&e, ino, mode, nlink, size);
+        }
+        case USER_FD_DEV_NULL:
+        case USER_FD_DEV_ZERO:
+        case USER_FD_DEV_CONSOLE:
+            *ino = 200 + (uint32_t)(kind - USER_FD_DEV_NULL);
+            *mode = S_IFCHR | 0666;
+            *nlink = 1;
+            *size = 0;
+            return true;
+        case USER_FD_VFILE:
+            *ino = 300;
+            *mode = S_IFREG | 0444;
+            *nlink = 1;
+            *size = user_fd_vfile(fd, NULL);
+            return true;
+        default:
+            return false;
+    }
+}
+
 static uint32_t do_stat(uint32_t path_ptr, uint32_t st_ptr, bool_t is64) {
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
     if (!user_ptr_ok(st_ptr, is64 ? STAT64_SIZE : STAT_OLD_SIZE))
         return err(ERR_EFAULT);
 
-    char name[FS_MAX_NAME];
-    int kind = resolve_flat(buf, name, sizeof(name));
-    if (kind < 0) return err((uint32_t)(-kind));
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+
+    uint32_t ino, mode, nlink, size;
+    if (!vfs_ent_fields(&e, &ino, &mode, &nlink, &size)) return err(ERR_ENOENT);
 
     char st[STAT64_SIZE];
-    uint32_t ino, mode, nlink, size;
-    if (kind == 1) {
-        ino = 1; mode = S_IFDIR | 0755; nlink = 2; size = 0;
-    } else {
-        int slot = fs_open(name);
-        if (slot < 0) return err(ERR_ENOENT);
-        ino = (uint32_t)(slot + 1);
-        mode = S_IFREG | 0644;
-        nlink = 1;
-        size = fs_fd_size(slot);
-    }
-
     if (is64) fill_stat64(st, ino, mode, nlink, size);
     else      fill_stat_old(st, ino, mode, nlink, size);
     memcpy((void*)st_ptr, st, is64 ? STAT64_SIZE : STAT_OLD_SIZE);
@@ -317,22 +730,10 @@ static uint32_t do_fstat(uint32_t fd, uint32_t st_ptr, bool_t is64) {
     if (!user_ptr_ok(st_ptr, is64 ? STAT64_SIZE : STAT_OLD_SIZE))
         return err(ERR_EFAULT);
 
-    char st[STAT64_SIZE];
     uint32_t ino, mode, nlink, size;
-    if (fd <= 2) {
-        if (!user_stdio_is_open((int)fd)) return err(ERR_EBADF);
-        ino = fd + 1; mode = S_IFCHR | 0666; nlink = 1; size = 0;
-    } else if (user_fd_is_dir((int)fd)) {
-        ino = 1; mode = S_IFDIR | 0755; nlink = 2; size = 0;
-    } else {
-        int slot = user_fd_slot((int)fd);
-        if (slot < 0) return err(ERR_EBADF);
-        ino = (uint32_t)(slot + 1);
-        mode = S_IFREG | 0644;
-        nlink = 1;
-        size = fs_fd_size(slot);
-    }
+    if (!vfs_fd_fields((int)fd, &ino, &mode, &nlink, &size)) return err(ERR_EBADF);
 
+    char st[STAT64_SIZE];
     if (is64) fill_stat64(st, ino, mode, nlink, size);
     else      fill_stat_old(st, ino, mode, nlink, size);
     memcpy((void*)st_ptr, st, is64 ? STAT64_SIZE : STAT_OLD_SIZE);
@@ -366,33 +767,12 @@ static uint32_t do_statx(uint32_t dirfd, uint32_t path_ptr, uint32_t buf) {
     if (path[0] == '\0') {
         int fd = (int32_t)dirfd;
         if (fd < 0) return err(ERR_ENOENT);
-        if (fd <= 2) {
-            if (!user_stdio_is_open(fd)) return err(ERR_EBADF);
-            ino = (uint32_t)fd + 1; mode = S_IFCHR | 0666; nlink = 1; size = 0;
-        } else if (user_fd_is_dir(fd)) {
-            ino = 1; mode = S_IFDIR | 0755; nlink = 2; size = 0;
-        } else {
-            int slot = user_fd_slot(fd);
-            if (slot < 0) return err(ERR_EBADF);
-            ino = (uint32_t)(slot + 1);
-            mode = S_IFREG | 0644;
-            nlink = 1;
-            size = fs_fd_size(slot);
-        }
+        if (!vfs_fd_fields(fd, &ino, &mode, &nlink, &size)) return err(ERR_EBADF);
     } else {
-        char name[FS_MAX_NAME];
-        int kind = resolve_flat(path, name, sizeof(name));
-        if (kind < 0) return err((uint32_t)(-kind));
-        if (kind == 1) {
-            ino = 1; mode = S_IFDIR | 0755; nlink = 2; size = 0;
-        } else {
-            int slot = fs_open(name);
-            if (slot < 0) return err(ERR_ENOENT);
-            ino = (uint32_t)(slot + 1);
-            mode = S_IFREG | 0644;
-            nlink = 1;
-            size = fs_fd_size(slot);
-        }
+        vfs_ent_t e;
+        uint32_t rc = vfs_lookup(path, &e);
+        if ((int32_t)rc < 0) return rc;
+        if (!vfs_ent_fields(&e, &ino, &mode, &nlink, &size)) return err(ERR_ENOENT);
     }
 
     char st[STATX_SIZE];
@@ -401,23 +781,115 @@ static uint32_t do_statx(uint32_t dirfd, uint32_t path_ptr, uint32_t buf) {
     return 0;
 }
 
+/* ---- statfs / sysinfo (enough for df and free) ---- */
+
+static uint32_t fs_free_slots(void) {
+    int used = fs_count();
+    return used >= 0 && used < FS_MAX_FILES ? (uint32_t)(FS_MAX_FILES - used) : 0;
+}
+
+static void fill_statfs64(char* st) {
+    uint32_t free_slots = fs_free_slots();
+    memset(st, 0, STATFS64_SIZE);
+    put_u32(st, 0, 0x4D554F53);            /* f_type "MUOS" */
+    put_u32(st, 4, FS_MAX_SIZE);           /* f_bsize */
+    put_u64(st, 8, (uint64_t)FS_MAX_FILES);
+    put_u64(st, 16, (uint64_t)free_slots);
+    put_u64(st, 24, (uint64_t)free_slots);
+    put_u64(st, 32, (uint64_t)FS_MAX_FILES);
+    put_u64(st, 40, (uint64_t)free_slots);
+    put_u32(st, 56, FS_MAX_NAME);          /* f_namelen */
+    put_u32(st, 60, FS_MAX_SIZE);          /* f_frsize */
+}
+
+static void fill_statfs_old(char* st) {
+    uint32_t free_slots = fs_free_slots();
+    memset(st, 0, STATFS_OLD_SIZE);
+    put_u32(st, 0, 0x4D554F53);
+    put_u32(st, 4, FS_MAX_SIZE);
+    put_u32(st, 8, FS_MAX_FILES);
+    put_u32(st, 12, free_slots);
+    put_u32(st, 16, free_slots);
+    put_u32(st, 20, FS_MAX_FILES);
+    put_u32(st, 24, free_slots);
+    put_u32(st, 36, FS_MAX_NAME);
+    put_u32(st, 40, FS_MAX_SIZE);
+}
+
+static uint32_t do_statfs_path(uint32_t path_ptr, uint32_t buf, bool_t is64) {
+    char path[128];
+    if (!copy_user_string(path_ptr, path, sizeof(path))) return err(ERR_EFAULT);
+    if (!user_ptr_ok(buf, is64 ? STATFS64_SIZE : STATFS_OLD_SIZE))
+        return err(ERR_EFAULT);
+
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(path, &e);
+    if ((int32_t)rc < 0) return rc;
+
+    char st[STATFS64_SIZE];
+    if (is64) fill_statfs64(st);
+    else      fill_statfs_old(st);
+    memcpy((void*)buf, st, is64 ? STATFS64_SIZE : STATFS_OLD_SIZE);
+    return 0;
+}
+
+static uint32_t do_fstatfs(uint32_t fd, uint32_t buf, bool_t is64) {
+    if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
+    if (!user_ptr_ok(buf, is64 ? STATFS64_SIZE : STATFS_OLD_SIZE))
+        return err(ERR_EFAULT);
+
+    char st[STATFS64_SIZE];
+    if (is64) fill_statfs64(st);
+    else      fill_statfs_old(st);
+    memcpy((void*)buf, st, is64 ? STATFS64_SIZE : STATFS_OLD_SIZE);
+    return 0;
+}
+
+static uint32_t do_sysinfo(uint32_t ptr) {
+    if (!user_ptr_ok(ptr, SYSINFO_SIZE)) return err(ERR_EFAULT);
+
+    char si[SYSINFO_SIZE];
+    memset(si, 0, sizeof(si));
+    put_u32(si, 0, pit_get_ticks() / 100);            /* uptime, seconds */
+    put_u32(si, 16, mm_get_total_pages() * PAGE_SIZE);
+    put_u32(si, 20, mm_get_free_pages() * PAGE_SIZE);
+    put_u16(si, 40, (uint16_t)task_get_count());      /* procs */
+    put_u32(si, 52, 1);                               /* mem_unit = 1 byte */
+    memcpy((void*)ptr, si, SYSINFO_SIZE);
+    return 0;
+}
+
 /* Write a kernel buffer (sendfile path cannot use user_ptr_ok checks). */
 static int kbuf_write(uint32_t fd, const char* data, uint32_t count) {
-    if (fd == 1 || fd == 2) {
-        if (!user_stdio_is_open((int)fd)) return -ERR_EBADF;
-        for (uint32_t i = 0; i < count; i++) {
-            vga_putchar(data[i]);
-            serial_putchar(data[i]);
+    int kind = user_fd_kind((int)fd);
+    switch (kind) {
+        case USER_FD_FILE: {
+            int slot = user_fd_slot((int)fd);
+            if (slot < 0) return -ERR_EBADF;
+            uint32_t off = user_fd_offset((int)fd);
+            int n = fs_write_at(slot, off, data, count);
+            if (n < 0) return -ERR_EBADF;
+            user_fd_set_offset((int)fd, off + (uint32_t)n);
+            return n;
         }
-        return (int)count;
+        case USER_FD_DEV_NULL:
+        case USER_FD_DEV_ZERO:
+            return (int)count;
+        case USER_FD_STDOUT:
+        case USER_FD_STDERR:
+        case USER_FD_DEV_CONSOLE:
+            for (uint32_t i = 0; i < count; i++) {
+                vga_putchar(data[i]);
+                serial_putchar(data[i]);
+            }
+            return (int)count;
+        case USER_FD_VFILE:
+            return -ERR_EACCES;
+        case USER_FD_DIR:
+            return -ERR_EISDIR;
+        default:
+            return -ERR_EBADF;
     }
-    int slot = user_fd_slot((int)fd);
-    if (slot < 0) return -ERR_EBADF;
-    uint32_t off = user_fd_offset((int)fd);
-    int n = fs_write_at(slot, off, data, count);
-    if (n < 0) return -ERR_EBADF;
-    user_fd_set_offset((int)fd, off + (uint32_t)n);
-    return n;
 }
 
 /* sendfile(187)/sendfile64(239): used by BusyBox's fd-copy path. */
@@ -456,35 +928,22 @@ static uint32_t do_sendfile(uint32_t out_fd, uint32_t in_fd,
     return total;
 }
 
-/* One entry of the root directory. idx 0 = ".", 1 = "..", then files. */
-static bool_t dir_entry_at(uint32_t idx, char* name, uint32_t* ino,
-                           uint8_t* type) {
-    if (idx == 0) { strncpy(name, ".", FS_MAX_NAME); *ino = 1; *type = 4; return true; }
-    if (idx == 1) { strncpy(name, "..", FS_MAX_NAME); *ino = 1; *type = 4; return true; }
-    const char* n = fs_name((int)(idx - 2));
-    if (!n) return false;
-    strncpy(name, n, FS_MAX_NAME - 1);
-    name[FS_MAX_NAME - 1] = '\0';
-    *ino = idx + 1;
-    *type = 8;          /* DT_REG */
-    return true;
-}
-
-/* getdents(141) and getdents64(220): both walk the same virtual root. */
+/* getdents(141) and getdents64(220): walk the open directory fd. */
 static uint32_t do_getdents(uint32_t fd, uint32_t buf, uint32_t count,
                             bool_t is64) {
     if (!user_fd_is_dir((int)fd)) {
-        return err(user_fd_slot((int)fd) >= 0 ? ERR_ENOTDIR : ERR_EBADF);
+        return err(user_fd_kind((int)fd) >= 0 ? ERR_ENOTDIR : ERR_EBADF);
     }
     if (count < 8) return err(ERR_EINVAL);
 
+    const char* dirpath = user_fd_dir_path((int)fd);
     uint32_t idx = user_fd_offset((int)fd);
     uint32_t total = 0;
-    char name[FS_MAX_NAME];
+    char name[USER_FD_PATH_MAX];
     uint32_t ino;
     uint8_t type;
 
-    while (dir_entry_at(idx, name, &ino, &type)) {
+    while (vfs_dir_entry(dirpath, idx, name, &ino, &type)) {
         uint32_t namelen = strlen(name);
         uint32_t reclen = is64
             ? ((19 + namelen + 1 + 7) & ~7u)
@@ -495,7 +954,7 @@ static uint32_t do_getdents(uint32_t fd, uint32_t buf, uint32_t count,
         }
         if (!user_ptr_ok(buf + total, reclen)) return err(ERR_EFAULT);
 
-        char rec[64];
+        char rec[96];
         memset(rec, 0, sizeof(rec));
         if (is64) {
             put_u64(rec, 0, (uint64_t)ino);
@@ -520,15 +979,31 @@ static uint32_t do_getdents(uint32_t fd, uint32_t buf, uint32_t count,
     return total;
 }
 
+/* Size for the regular-file-like fds (RAM FS files and /proc snapshots). */
+static bool_t fd_regular_size(int fd, uint32_t* size) {
+    int kind = user_fd_kind(fd);
+    if (kind == USER_FD_FILE) {
+        int slot = user_fd_slot(fd);
+        if (slot < 0) return false;
+        *size = fs_fd_size(slot);
+        return true;
+    }
+    if (kind == USER_FD_VFILE) {
+        *size = user_fd_vfile(fd, NULL);
+        return true;
+    }
+    return false;
+}
+
 static uint32_t do_lseek(uint32_t fd, uint32_t offset, uint32_t whence) {
-    int slot = user_fd_slot((int)fd);
-    if (slot < 0) return err(ERR_EBADF);
+    uint32_t fsize;
+    if (!fd_regular_size((int)fd, &fsize)) return err(ERR_EBADF);
 
     int32_t base;
     switch (whence) {
         case 0: base = 0; break;
         case 1: base = (int32_t)user_fd_offset((int)fd); break;
-        case 2: base = (int32_t)fs_fd_size(slot); break;
+        case 2: base = (int32_t)fsize; break;
         default: return err(ERR_EINVAL);
     }
 
@@ -542,15 +1017,15 @@ static uint32_t do_lseek(uint32_t fd, uint32_t offset, uint32_t whence) {
  * the 64-bit result in *result (user pointer). */
 static uint32_t do_llseek(uint32_t fd, uint32_t off_lo, uint32_t off_hi,
                           uint32_t result, uint32_t whence) {
-    int slot = user_fd_slot((int)fd);
-    if (slot < 0) return err(ERR_EBADF);
+    uint32_t fsize;
+    if (!fd_regular_size((int)fd, &fsize)) return err(ERR_EBADF);
     if (!user_ptr_ok(result, 8)) return err(ERR_EFAULT);
 
     int64_t base;
     switch (whence) {
         case 0: base = 0; break;
         case 1: base = (int64_t)user_fd_offset((int)fd); break;
-        case 2: base = (int64_t)fs_fd_size(slot); break;
+        case 2: base = (int64_t)fsize; break;
         default: return err(ERR_EINVAL);
     }
     int64_t pos = base + (int64_t)(((uint64_t)off_hi << 32) | off_lo);
@@ -565,30 +1040,34 @@ static uint32_t do_access(uint32_t path_ptr, uint32_t mode) {
     (void)mode;
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
-    char name[FS_MAX_NAME];
-    int kind = resolve_flat(buf, name, sizeof(name));
-    if (kind < 0) return err((uint32_t)(-kind));
-    if (kind == 1) return 0;
-    return fs_open(name) >= 0 ? 0 : err(ERR_ENOENT);
+    vfs_ent_t e;
+    return vfs_lookup(buf, &e);
 }
 
 static uint32_t do_chdir(uint32_t path_ptr) {
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
-    char name[FS_MAX_NAME];
-    int kind = resolve_flat(buf, name, sizeof(name));
-    if (kind < 0) return err((uint32_t)(-kind));
-    return kind == 1 ? 0 : err(ERR_ENOTDIR);
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+    if (e.type != VFS_T_DIR) return err(ERR_ENOTDIR);
+    return user_cwd_set(e.path) ? 0 : err(ERR_ENAMETOOLONG);
 }
 
 static uint32_t do_unlink(uint32_t path_ptr) {
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
-    char name[FS_MAX_NAME];
-    int kind = resolve_flat(buf, name, sizeof(name));
-    if (kind < 0) return err((uint32_t)(-kind));
-    if (kind == 1) return err(ERR_EPERM);   /* cannot unlink "/" */
-    return fs_delete(name) == 0 ? 0 : err(ERR_ENOENT);
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+    switch (e.type) {
+        case VFS_T_FILE:
+            return fs_delete(e.path + 1) == 0 ? 0 : err(ERR_ENOENT);
+        case VFS_T_DIR:
+            return err(ERR_EISDIR);
+        default:
+            return err(ERR_EPERM);
+    }
 }
 
 static uint32_t do_rename(uint32_t old_ptr, uint32_t new_ptr) {
@@ -596,19 +1075,25 @@ static uint32_t do_rename(uint32_t old_ptr, uint32_t new_ptr) {
     if (!copy_user_string(old_ptr, obuf, sizeof(obuf))) return err(ERR_EFAULT);
     if (!copy_user_string(new_ptr, nbuf, sizeof(nbuf))) return err(ERR_EFAULT);
 
-    char oname[FS_MAX_NAME], nname[FS_MAX_NAME];
-    int okind = resolve_flat(obuf, oname, sizeof(oname));
-    int nkind = resolve_flat(nbuf, nname, sizeof(nname));
-    if (okind < 0) return err((uint32_t)(-okind));
-    if (nkind < 0) return err((uint32_t)(-nkind));
-    if (okind == 1 || nkind == 1) return err(ERR_EPERM);
+    vfs_ent_t oe, ne;
+    uint32_t rc = vfs_lookup(obuf, &oe);
+    if ((int32_t)rc < 0) return rc;
+    if (oe.type == VFS_T_DIR) return err(ERR_EISDIR);
+    if (oe.type != VFS_T_FILE) return err(ERR_EPERM);
 
-    int slot = fs_open(oname);
-    if (slot < 0) return err(ERR_ENOENT);
-    int target = fs_open(nname);
-    if (target == slot) return 0;            /* same file already */
-    if (target >= 0) fs_delete(nname);       /* rename replaces the target */
-    return fs_rename(slot, nname) == 0 ? 0 : err(ERR_EINVAL);
+    rc = vfs_lookup(nbuf, &ne);
+    if ((int32_t)rc < 0 && (uint32_t)(-(int32_t)rc) != ERR_ENOENT) return rc;
+    if ((int32_t)rc == 0) {
+        if (ne.type == VFS_T_DIR) return err(ERR_EISDIR);
+        if (ne.type != VFS_T_FILE) return err(ERR_EPERM);
+        if (ne.slot == oe.slot) return 0;    /* same file already */
+        fs_delete(ne.path + 1);              /* rename replaces the target */
+    }
+
+    const char* nname = ne.path + 1;
+    if (!*nname || has_slash(nname)) return err(ERR_ENOTDIR);
+    if (strlen(nname) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
+    return fs_rename(oe.slot, nname) == 0 ? 0 : err(ERR_EINVAL);
 }
 
 /* utimes/futimesat/utimensat: the RAM FS stores no timestamps, but the
@@ -619,32 +1104,26 @@ static uint32_t do_utime_path(uint32_t path_ptr, int fd) {
 
     if (buf[0] == '\0') {
         if (fd < 0) return err(ERR_ENOENT);
-        if (fd <= 2) return user_stdio_is_open(fd) ? 0 : err(ERR_EBADF);
-        if (user_fd_is_dir(fd) || user_fd_slot(fd) >= 0) return 0;
-        return err(ERR_EBADF);
+        return user_fd_kind(fd) >= 0 ? 0 : err(ERR_EBADF);
     }
 
-    char name[FS_MAX_NAME];
-    int kind = resolve_flat(buf, name, sizeof(name));
-    if (kind < 0) return err((uint32_t)(-kind));
-    if (kind == 1) return 0;
-    return fs_open(name) >= 0 ? 0 : err(ERR_ENOENT);
+    vfs_ent_t e;
+    return vfs_lookup(buf, &e);
 }
 
 static uint32_t do_getcwd(uint32_t buf, uint32_t size) {
-    if (size < 2) return err(ERR_EINVAL);
-    if (!user_ptr_ok(buf, 2)) return err(ERR_EFAULT);
-    ((char*)buf)[0] = '/';
-    ((char*)buf)[1] = '\0';
-    return 1;
+    const char* cwd = user_cwd_get();
+    uint32_t len = strlen(cwd);
+    if (size <= len) return err(ERR_ERANGE);
+    if (!user_ptr_ok(buf, len + 1)) return err(ERR_EFAULT);
+    memcpy((void*)buf, cwd, len + 1);
+    return len;
 }
 
 static uint32_t do_dup(uint32_t fd) {
-    int slot = user_fd_slot((int)fd);
-    if (slot < 0) return err(ERR_EBADF);
-    int nfd = user_fd_alloc(slot);
+    if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
+    int nfd = user_fd_dup((int)fd);
     if (nfd < 0) return err(ERR_EMFILE);
-    user_fd_set_offset(nfd, user_fd_offset((int)fd));
     return (uint32_t)nfd;
 }
 
@@ -706,11 +1185,7 @@ static uint32_t do_clock_gettime(uint32_t ts, uint32_t struct_size) {
 }
 
 static uint32_t do_fcntl(uint32_t fd, uint32_t cmd) {
-    if (fd <= 2) {
-        if (!user_stdio_is_open((int)fd)) return err(ERR_EBADF);
-    } else if (!user_fd_is_dir((int)fd) && user_fd_slot((int)fd) < 0) {
-        return err(ERR_EBADF);
-    }
+    if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
     switch (cmd) {
         case 1: return 0;    /* F_GETFD */
         case 2: return 0;    /* F_SETFD */
@@ -876,6 +1351,23 @@ void syscall_handler(registers_t* regs) {
         case SYS_fcntl64:
             ret = do_fcntl(regs->ebx, regs->ecx);
             break;
+        case SYS_statfs:
+            ret = do_statfs_path(regs->ebx, regs->ecx, false);
+            break;
+        case SYS_statfs64:
+            if (regs->ecx != STATFS64_SIZE) { ret = err(ERR_EINVAL); break; }
+            ret = do_statfs_path(regs->ebx, regs->edx, true);
+            break;
+        case SYS_fstatfs:
+            ret = do_fstatfs(regs->ebx, regs->ecx, false);
+            break;
+        case SYS_fstatfs64:
+            if (regs->ecx != STATFS64_SIZE) { ret = err(ERR_EINVAL); break; }
+            ret = do_fstatfs(regs->ebx, regs->edx, true);
+            break;
+        case SYS_sysinfo:
+            ret = do_sysinfo(regs->ebx);
+            break;
         case SYS_rt_sigaction:
         case SYS_rt_sigprocmask:
         case SYS_umask:
@@ -931,7 +1423,8 @@ void syscall_handler(registers_t* regs) {
             ret = err(ERR_ENOTTY);   /* not a real tty yet */
             break;
         case SYS_dup2:
-            ret = (regs->ebx == regs->ecx) ? regs->ecx : err(ERR_EBADF);
+            ret = user_fd_dup2((int)regs->ebx, (int)regs->ecx)
+                  ? regs->ecx : err(ERR_EBADF);
             break;
         case SYS_brk:
             ret = (regs->ebx == 0 || !user_set_brk(regs->ebx))
