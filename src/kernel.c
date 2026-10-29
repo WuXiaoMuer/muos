@@ -17,6 +17,7 @@
 #include "multiboot.h"
 #include "kheap.h"
 #include "tss.h"
+#include "module.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
@@ -70,6 +71,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
         mb = (const multiboot_info_t*)mb_info_addr;
     }
 
+    /* Parse modules before mm_init: the module table/data live in ordinary
+     * RAM that the page tables and kernel heap would otherwise overwrite. */
+    modules_init(mb);
+
     /* Align kernel_end to page boundary */
     uint32_t kernel_end = ((uint32_t)&_kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     mm_init(mb, kernel_end);
@@ -97,6 +102,14 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     } else {
         vga_print("[WARN] Kernel heap unavailable\n");
         serial_write("[WARN] Kernel heap unavailable\n");
+    }
+
+    /* 5b2. Multiboot modules (parsed before mm_init, reserved by mm) */
+    if (modules_count() > 0) {
+        vga_print("[OK] Modules: ");
+        vga_print_dec(modules_count());
+        vga_putchar('\n');
+        serial_write("[OK] Multiboot modules loaded\n");
     }
 
     /* 5c. TSS + Ring0 entry stack for Ring3 (int 0x80 / IRQs from user) */

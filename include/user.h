@@ -21,13 +21,21 @@ bool_t  user_ptr_ok(uint32_t ptr, uint32_t len);
  * optional arguments become argv[0]/argv[1] on the initial user stack. */
 int     user_run_image(const void* image, uint32_t size,
                        const char* arg0, const char* arg1);
+int     user_run_image_argv(const void* image, uint32_t size,
+                            int argc, const char* const* argv);
 int     user_run_embedded(const char* arg0, const char* arg1);
 
 /* Per-process fd table (fd 0/1/2 are stdin/stdout/stderr). File entries
- * map to RAM FS slot indices and keep a byte offset. */
+ * map to RAM FS slot indices and keep a byte offset. USER_FD_DIR marks an
+ * open directory (only "/" exists); its offset is the next entry index. */
 #define USER_FD_MAX 8
+#define USER_FD_DIR (-2)
 void     user_fds_reset(void);
 int      user_fd_alloc(int fs_slot);
+int      user_fd_alloc_dir(void);
+bool_t   user_fd_is_dir(int fd);
+bool_t   user_stdio_is_open(int fd);
+void     user_stdio_close(int fd);
 int      user_fd_slot(int fd);
 uint32_t user_fd_offset(int fd);
 bool_t   user_fd_set_offset(int fd, uint32_t offset);

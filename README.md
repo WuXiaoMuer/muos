@@ -6,10 +6,11 @@
 - **硬件抽象**:GDT / IDT(256 项全覆盖)/ PIC / PIT / PS/2 键盘 + PS/2 鼠标 / 串口 / VGA 文本模式
 - **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、全 RAM 恒等映射分页、内核堆(kmalloc/kfree/kcalloc)
 - **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,可在 0x08048000 沙箱内运行 C 程序;ELF 可来自内核内嵌(`run`)或 RAM FS(`exec hello.elf`);用户态故障只杀进程,不 panic 内核
-- **Linux ABI 起步集**:`exit/read/write/open/close/lseek/getpid/getuid/getgid/brk/uname/mmap/mmap2/munmap`(文件 fd 带偏移,mmap 仅匿名映射)
+- **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;扁平 VFS 暴露根目录 `/` 与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族
+- **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`
 - **RAM 文件系统**:16 槽 × 64KB(足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
-- **57 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
+- **66 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
 
 演进目标见 **[ROADMAP.md](ROADMAP.md)**:以 Linux ABI 兼容(int 0x80 + ELF32,运行静态 i386 Linux 二进制)为主线;NT/Win32 兼容为长期远景。
 
@@ -27,6 +28,7 @@ muos/
 │   ├── mouse.c      PS/2 鼠标(8042 aux、IRQ12 共享路由、文本光标)
 │   ├── rtc.c        CMOS 实时时钟(任务栏 HH:MM:SS)
 │   ├── tss.c        TSS(esp0 = Ring3 进入 Ring0 的 8KB 栈)
+│   ├── module.c     Multiboot -initrd 模块表/范围(外部 ELF 来源)
 │   ├── elf.c        ELF32 ET_EXEC 加载器(段装入 + bss 清零 + 范围校验)
 │   ├── syscall.c    int 0x80 分发(stdio + 文件 fd + uname + 匿名 mmap)
 │   ├── user.c       用户沙箱、初始栈、进入/退出、故障收尸
@@ -111,9 +113,48 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 
 - 用户地址空间是固定的 8MB 沙箱 `0x08048000`(经典的 Linux i386 ET_EXEC 地址),从物理分配器整段预留并置 U/S 位;内核其余页保持 supervisor,用户无法读写内核。
 - 进入 Ring3 使用 TSS.esp0 切换内核栈;`int 0x80`(DPL3 门)按 Linux i386 ABI 分发(eax=号,ebx/ecx/edx 传参);退出/故障时恢复 `user_enter` 保存的内核上下文返回 Shell。
-- 已实现调用:`exit(1) read(3) write(4) open(5) close(6) lseek(19) getpid(20) getuid(24) brk(45) getgid(47) geteuid(49) getegid(50) getppid(64) old_mmap(90) munmap(91) uname(122) mprotect(125) mmap2(192)`;未知调用返回 `-ENOSYS` 并在串口记录编号,便于用真实二进制驱动后续补齐。
-- 文件 fd 从 3 开始,映射 RAM FS 槽位并维护字节偏移;`open` 支持 `O_CREAT/O_TRUNC`。`mmap` 只支持 `MAP_PRIVATE|MAP_ANONYMOUS`(沙箱 bump 分配,文件映射/`MAP_FIXED` 拒绝)。
+- 已实现调用(按用途分组):
+  - 进程/stdio:`exit(1)`、`exit_group(252)`、`read(3)`、`write(4)`、`readv(145)`、`writev(146)`、`getpid(20)`、`getppid(64)`、uid/gid 及其 32 位变体(24/47/49/50、199-202)、`getgroups(80/205)`;`close(6)` 可关闭 0/1/2
+  - 文件/目录:`open(5)`、`close(6)`、`lseek(19)`、`llseek(140)`、`sendfile(187/239)`、`dup(41)`、`dup2(63,仅同 fd)`、`fcntl(55/221)`、`access(33)`、`getcwd(183)`、`chdir(12,仅 "/")`、`unlink(10)`、`rename(38)`
+  - 目录/元数据:`getdents(141)`、`getdents64(220)`、`stat/lstat/fstat(106-108)`、`stat64/lstat64/fstat64(195-197)`、`statx(383)`;`utimes(271)`、`futimesat(299)`、`utimensat(320)` 校验路径后返回成功(时间戳暂未持久化)
+  - 内存/其他:`brk(45)`、`old_mmap(90)`、`mmap2(192)`、`munmap(91)`、`mprotect(125)`、`uname(122)`、`set/get_thread_area(243/244)`、`modify_ldt(123,ENOSYS)`、`rt_sigaction/rt_sigprocmask(174/175,空实现)`、`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)`
+  - 未知调用返回 `-ENOSYS` 并在串口记录编号,便于用真实二进制驱动后续补齐。
+- 文件 fd 从 3 开始,映射 RAM FS 槽位并维护字节偏移;`"/"` 以目录 fd 打开(偏移为目录项序号),路径解析跳过前导 `/` 且暂不接受子目录。`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`。`mmap` 只支持 `MAP_PRIVATE|MAP_ANONYMOUS`(沙箱 bump 分配,文件映射/`MAP_FIXED` 拒绝)。
 - 沙箱要求物理 RAM > 128MB;ISO 路径因无 multiboot 信息回退 32MB,`run`/`exec` 会明确提示内存不足。
+
+## 真实 Linux 二进制(BusyBox)
+
+除内嵌/RAM FS ELF 外,内核支持 Multiboot modules,可直接把外部静态 ELF 作为 `-initrd` 传给 QEMU:
+
+```powershell
+qemu-system-i386 -kernel build\kernel.elf -initrd E:\github\muos\build\alpine\busybox -m 256M
+```
+
+```text
+muos> mods
+1 module(s)
+  [0] 0x22B000-0x32B000  1049856B  E:\github\muos\build\alpine\busybox
+muos> execmod 0 echo hi
+hi
+muos> execmod 0 ls /
+hello.elf
+notes.txt
+readme.txt
+muos> execmod 0 cat /notes.txt
+MuOS 7 - x86 Microkernel
+Built with GCC 15 + NASM
+```
+
+已验证对象是 Alpine v3.20 的 **busybox-static 1.36.1-r31(i386, musl 静态)**。
+`busybox-static-1.36.1-r31.apk` 解包后的 `bin/busybox.static`。为跑通它补齐了 i386 TLS(`set_thread_area` + GDT slot 6)、`exit_group`、`set_tid_address`、uid32、`ioctl`、`dup2`、`envp`/`auxv` 初始栈,以及扁平 VFS 的 `getdents64`/`stat64`/`statx`/`writev`/`sendfile64` 等调用。
+
+已实测 applet:`ls`(含 `-l`)、`cat`、`pwd`、`id`、`uname`、`wc`、`grep`、`head`、`tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp`、`rm`、`mv`、`touch`;不存在的路径会正确返回 `ENOENT`。
+
+注意:
+- BusyBox 静态包约 1MB,OS 模块只接受外部 `-initrd`,不放进 64KB RAM FS。
+- VFS 是扁平的:只有根目录 `/`,没有子目录、`/proc`、`/dev`;`mkdir/rmdir`、`pipe`、`fork/execve` 等仍未实现,因此 `df`、`ps`、`free`、管道与交互式 `sh` 尚不可用。
+- 文件时间戳未持久化,`ls -l`/`stat` 显示 1970-01-01;`touch`/`utimensat` 只校验路径后返回成功。
+- 首次运行会分配 257 页连续内存做模块副本;256MB 内存下正常。
 
 ## 自检套件
 
@@ -125,6 +166,7 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - mmap:位图覆盖加载器报告的全部 RAM
 - fs / vga / keyboard / pit / task
 - RAM FS 偏移 API:write_at 追加、fd size、read_at 偏移校验、truncate
+- RAM FS 重命名:改名后旧名消失、新名指向同槽、重名被拒绝、内容保留
 - 内嵌 ELF:存在性、ELF32/i386/ET_EXEC 头校验、入口点位于用户沙箱
 
 ## 踩坑备忘
@@ -149,12 +191,20 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 | 键盘/鼠标中断偶发丢事件 | kbd_irq_handler 和 irq.c 都发 EOI(双重 EOI 会提前放行低优先级 IRQ) | EOI 只在 irq.c 发一次;IRQ12 走同一 8042 路由并解蔽 IRQ2 级联 |
 | 鼠标数据被当键盘扫描码 / 鼠标无反应 | 8042 输出缓冲共用,状态位 bit5 才标识 aux;未解蔽 IRQ12/IRQ2 | keyboard.c 统一 drain,按 bit5 分流 `mouse_handle_byte`;初始化时同步读掉 ACK |
 | 任务栏/窗口阴影写坏下一行 | `fd/ft` 未裁剪,最大化窗口的 x+w+1 越过 79 会回卷到下一行 | 所有绘制统一裁剪到 0..79/0..24,阴影不覆盖任务栏 |
+| Multiboot `-initrd` 的 ELF 魔数变成 BAD | 位图原本放在 `_kernel_end` 后,正好压掉 QEMU 紧贴内核放置的模块头 | 位图移入内核 BSS(`bitmap_storage`),mm_init 先预留模块页 |
+| 真实 libc 启动时把字符串当指针,Page Fault | 初始用户栈缺少 envp NULL 与 auxv AT_NULL 终止符 | 按 Linux 布局压 `argc/argv/NULL/envp NULL/AT_NULL/strings` |
+| BusyBox 启动即 GPF | musl 需要 i386 TLS:`set_thread_area` + DPL3 GDT 段 | GDT slot 6 TLS 描述符,返回 entry 6(选择子 0x33);`mov %gs` 可用 |
+| BusyBox `ls` 退出 0 但没有任何输出 | musl stdio 用 `writev` 刷缓冲,未实现时整批输出丢失 | 实现 `writev(146)`/`readv(145)`,按 iovec 复用 do_write/do_read |
+| `od` 读完后报 `standard input: Bad file descriptor` | od 会关闭 fd 0,而旧的 fd 表把 0/1/2 当作永远打开 | stdio 增加 open 状态;read/write/close/fstat/fcntl/statx 均检查 |
+| musl 先调 `statx(383)` 再退回 stat64 | 新版 musl 的 `fstatat` 优先使用 statx | 按 256 字节 `struct statx` 填 basic stats,空路径支持 AT_EMPTY_PATH |
 
 ## 版本
 
 当前 **v1.2**:在 v1.1(mmap 解析、全 RAM 恒等映射、内核堆、寄存器布局修复)基础上加入 Ring3 用户态、TSS、Linux i386 `int 0x80` 调用、ELF32 加载器与 RAM FS 16×64KB,支持 `run`(内嵌 ELF)/`exec hello.elf`(FS ELF)、文件 fd(open/close/lseek/read/write)、`uname` 与匿名 `mmap`。首个用户 C 程序 `user/hello.c` 可由 `run` 或 `exec hello.elf` 启动。
 
-桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;自检 57 项。
+桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 66 项)。
+
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ **`ls /`、`cat /notes.txt` 及 20+ 个 applet 实测通过**。下一步:`pipe`/`fork`/`execve`、`/proc` 与 `/dev`、多级目录。
 
 ## 参考资源
 

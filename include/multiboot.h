@@ -10,6 +10,7 @@
  */
 #define MULTIBOOT_MAGIC      0x2BADB002
 #define MULTIBOOT_FLAG_MEM   0x00000001  /* mem_lower/mem_upper valid   */
+#define MULTIBOOT_FLAG_MODS  0x00000008  /* mods_count/mods_addr valid  */
 #define MULTIBOOT_FLAG_MMAP  0x00000040  /* mmap_length/mmap_addr valid */
 
 typedef struct {

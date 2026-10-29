@@ -66,6 +66,17 @@ int fs_open(const char* name) {
     return -1;
 }
 
+int fs_rename(int slot, const char* new_name) {
+    if (slot < 0 || slot >= FS_MAX_FILES || !files[slot].used) return -1;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (i != slot && files[i].used && strcmp(files[i].name, new_name) == 0)
+            return -1;
+    }
+    strncpy(files[slot].name, new_name, FS_MAX_NAME - 1);
+    files[slot].name[FS_MAX_NAME - 1] = '\0';
+    return 0;
+}
+
 int fs_count(void) {
     int n = 0;
     for (int i = 0; i < FS_MAX_FILES; i++)

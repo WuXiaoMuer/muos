@@ -28,9 +28,15 @@ typedef struct {
 } user_fd_t;
 
 static user_fd_t user_fds[USER_FD_MAX];
+static bool_t stdio_state[3];   /* fd 0/1/2 can be closed like Linux */
 
 static uint32_t align_up_page(uint32_t v) {
     return (v + PAGE_SIZE - 1) & PAGE_MASK;
+}
+
+static int fd_index(int fd) {
+    if (fd < 3 || fd >= 3 + USER_FD_MAX) return -1;
+    return fd - 3;
 }
 
 void user_fds_reset(void) {
@@ -38,11 +44,21 @@ void user_fds_reset(void) {
         user_fds[i].fs_slot = -1;
         user_fds[i].offset = 0;
     }
+    for (int i = 0; i < 3; i++) stdio_state[i] = true;
+}
+
+bool_t user_stdio_is_open(int fd) {
+    if (fd < 0 || fd > 2) return false;
+    return stdio_state[fd];
+}
+
+void user_stdio_close(int fd) {
+    if (fd >= 0 && fd <= 2) stdio_state[fd] = false;
 }
 
 int user_fd_alloc(int fs_slot) {
     for (int i = 0; i < USER_FD_MAX; i++) {
-        if (user_fds[i].fs_slot < 0) {
+        if (user_fds[i].fs_slot == -1) {
             user_fds[i].fs_slot = fs_slot;
             user_fds[i].offset = 0;
             return 3 + i;   /* 0..2 are stdio */
@@ -51,9 +67,20 @@ int user_fd_alloc(int fs_slot) {
     return -1;
 }
 
-static int fd_index(int fd) {
-    if (fd < 3 || fd >= 3 + USER_FD_MAX) return -1;
-    return fd - 3;
+int user_fd_alloc_dir(void) {
+    for (int i = 0; i < USER_FD_MAX; i++) {
+        if (user_fds[i].fs_slot == -1) {
+            user_fds[i].fs_slot = USER_FD_DIR;
+            user_fds[i].offset = 0;
+            return 3 + i;
+        }
+    }
+    return -1;
+}
+
+bool_t user_fd_is_dir(int fd) {
+    int i = fd_index(fd);
+    return (i >= 0 && user_fds[i].fs_slot == USER_FD_DIR) ? true : false;
 }
 
 int user_fd_slot(int fd) {
@@ -70,7 +97,7 @@ uint32_t user_fd_offset(int fd) {
 
 bool_t user_fd_set_offset(int fd, uint32_t offset) {
     int i = fd_index(fd);
-    if (i < 0 || user_fds[i].fs_slot < 0) return false;
+    if (i < 0 || user_fds[i].fs_slot == -1) return false;
     user_fds[i].offset = offset;
     return true;
 }
@@ -188,32 +215,28 @@ static uint32_t push_string(uint32_t sp, const char* s) {
 }
 
 /* Build the initial Linux-style process stack:
- *   [argc][argv0][argv1][NULL][strings...]
- * arg1 may be NULL (argc == 1). */
-static uint32_t build_user_stack(const char* arg0, const char* arg1) {
+ *   argc, argv[], NULL, envp NULL, auxv AT_NULL, strings...
+ * Real libcs (musl/glibc) walk envp and auxv; missing terminators make
+ * them interpret the first string bytes as pointers. */
+static uint32_t build_user_stack(int argc, const char* const* argv) {
     uint32_t sp = USER_END - 32;
-    uint32_t argc = 1;
-    uint32_t arg1_addr = 0;
+    uint32_t addrs[16];
 
-    if (arg1 && *arg1) {
-        sp = push_string(sp, arg1);
-        arg1_addr = sp;
-        argc++;
+    if (argc < 1) argc = 1;
+    if (argc > 16) argc = 16;
+    for (int i = argc - 1; i >= 0; i--) {
+        sp = push_string(sp, argv[i] ? argv[i] : "");
+        addrs[i] = sp;
     }
 
-    sp = push_string(sp, arg0);
-    uint32_t arg0_addr = sp;
-
-    sp -= 4;
-    *(uint32_t*)sp = 0;             /* argv[argc] = NULL */
-    if (argc == 2) {
-        sp -= 4;
-        *(uint32_t*)sp = arg1_addr; /* argv[1] */
+    sp -= 4; *(uint32_t*)sp = 0;    /* auxv[1] (value) = 0 */
+    sp -= 4; *(uint32_t*)sp = 0;    /* auxv[0] (AT_NULL) = 0 */
+    sp -= 4; *(uint32_t*)sp = 0;    /* envp[0] = NULL */
+    sp -= 4; *(uint32_t*)sp = 0;    /* argv[argc] = NULL */
+    for (int i = argc - 1; i >= 0; i--) {
+        sp -= 4; *(uint32_t*)sp = addrs[i];
     }
-    sp -= 4;
-    *(uint32_t*)sp = arg0_addr;     /* argv[0] */
-    sp -= 4;
-    *(uint32_t*)sp = argc;
+    sp -= 4; *(uint32_t*)sp = (uint32_t)argc;
     return sp;
 }
 
@@ -225,6 +248,18 @@ int user_run_embedded(const char* arg0, const char* arg1) {
 
 int user_run_image(const void* img, uint32_t img_size,
                    const char* arg0, const char* arg1) {
+    const char* argv[2];
+    int argc = 1;
+    argv[0] = arg0 ? arg0 : "app";
+    if (arg1 && *arg1) {
+        argv[1] = arg1;
+        argc = 2;
+    }
+    return user_run_image_argv(img, img_size, argc, argv);
+}
+
+int user_run_image_argv(const void* img, uint32_t img_size,
+                        int argc, const char* const* argv) {
     if (active) {
         vga_print("A user program is already running.\n");
         return -1;
@@ -272,7 +307,7 @@ int user_run_image(const void* img, uint32_t img_size,
     if (brk_base < USER_BASE + PAGE_SIZE) brk_base = USER_BASE + PAGE_SIZE;
     brk_current = brk_base;
 
-    uint32_t user_sp = build_user_stack(arg0 ? arg0 : "hello", arg1);
+    uint32_t user_sp = build_user_stack(argc, argv);
     if (user_sp <= brk_current + PAGE_SIZE) {
         vga_print("[user] image leaves no room for the stack\n");
         return -1;
@@ -299,7 +334,7 @@ int user_run_image(const void* img, uint32_t img_size,
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
 
     serial_write("[user] enter ring3 app=");
-    serial_write(arg0 ? arg0 : "hello");
+    serial_write((argc > 0 && argv[0]) ? argv[0] : "app");
     serial_write(" entry="); serial_hex(entry);
     serial_write(" size="); serial_dec(img_size);
     serial_write("\n");

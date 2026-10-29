@@ -17,7 +17,7 @@
 - [x] 内核堆 kmalloc/kfree/kcalloc
 - [x] 调度器死代码清理,task_t 入堆;IDT 256 项全覆盖(0x80 现为系统调用门)
 - [x] 公共字符串库(标准名,防 freestanding 隐式调用链接失败)
-- [x] 键盘/中断 EFLAGS 纪律;自检套件扩到 46 项(含 >4MB 分页、堆、mmap;当前 57 项)
+- [x] 键盘/中断 EFLAGS 纪律;自检套件扩到 46 项(含 >4MB 分页、堆、mmap;当前 66 项)
 - [x] ISO 启动路径修复(入口=镜像首字节);构建脚本零硬编码路径
 
 ## 阶段 1:内核与用户态隔离(基本完成)
@@ -52,7 +52,7 @@
 
 - [x] ELF32 头解析:program headers、p_type=LOAD 段载入沙箱、bss 清零;拒绝非 i386/非静态 ET_EXEC
 - [x] 初始栈:argc/argv 按 System V i386 布局压栈,`_start` 进入 `main`
-- [x] ELF 来源:内核内嵌 blob + RAM FS 文件;`exec hello.elf` 跑通
+- [x] ELF 来源:内核内嵌 blob + RAM FS 文件 + Multiboot `-initrd` 模块(`execmod`)
 - [ ] `execve` 系统调用:销毁旧地址空间 → 建新页目录 → 载入段
 - [ ] 命令行参数可配置传入;stdin/stdout/stderr 三 fd 预开
 - [ ] waitpid/exit 收尸(僵尸态 + 简单 init 进程兜底)
@@ -64,14 +64,21 @@
 目标:运行真实 Linux 静态二进制(如 busybox i386 静态构建)。
 
 - [x] 起步:`old_mmap/munmap(90/91)`(仅匿名)、`uname(122)`、`lseek(19)`、uid/gid
-- [ ] 继续补 busybox 启动需求集:文件 mmap、`writev(146)`、`rt_sigaction(174)`、`stat/fcntl/ioctl` 等
+- [x] 真实静态 i386 BusyBox 1.36.1 进入 Ring3 并运行 `echo`(i386 TLS、exit_group、uid32、ioctl、dup2、envp/auxv 栈)
+- [x] BusyBox `ls/cat` 需求集:根目录 fd + `getdents(141)/getdents64(220)`、`stat/lstat/fstat(64)`、`statx(383)`、`access(33)`、`getcwd(183)`、`writev/readv(145/146)`、`rt_sigaction(174)`、`fcntl(64)`、`llseek(140)`、`sendfile(64)`、可关闭的 stdio fd
+- [x] 扁平 VFS 文件变更:`unlink(10)`、`rename(38)`、`fs_rename`;`utimes/futimesat/utimensat` 校验路径后成功(时间戳不持久化)
+- [x] 验收:`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a` 与 20+ applet(含 `ls -l`、`wc`、`grep`、`sed`、`od`、`cp/rm/mv/touch`)全部通过;`ENOENT`/`ENOTDIR`/`EBADF` 路径也符合 Linux 行为
+- [ ] 下一批进程/并发 ABI:`fork/clone`、`waitpid`、`execve`、`pipe/pipe2`、`kill`;shell 才能跑管道与子进程
+- [ ] 目录层级与设备:`mkdir/rmdir/renameat`、子目录查找、`/dev/null` `/dev/console`、简单字符设备框架
+- [ ] `/proc` 最小集(meminfo/mounts/self)与 `statfs/fstatfs64`,以支持 `ps/free/df`
+- [x] errno 起步对齐(EBADF/EFAULT/EINVAL/ENOENT/ENOTDIR/EISDIR/ENOMEM/ENOSYS 等);`uname` 已回报 MuOS/muos/i386
+- [x] `stat` 族返回 MuOS 假 identity:根目录 `S_IFDIR|0755`、文件 `S_IFREG|0644`、`st_dev=1`、块大小/块数按 64KB 文件计算
+- [ ] errno 与 Linux 做一次全量审计(尤其 `statx` flags/mask 与 `sendfile` 边界)
+- [x] RTC 读取(CMOS,桌面任务栏时钟)与 `time(13)`/`gettimeofday(78)`/`clock_gettime(265/403)` 系统调用(统一返回 epoch,布局正确)
+- [ ] RTC → epoch 换算,让 `time/gettimeofday/clock_gettime` 返回真实秒数(需 CMOS 年月日 + 闰年换算)
 - [ ] a.out/ELF 的零页(empty bad-address page,0x08048000 之前不可映射)与地址布局兼容
-- [ ] `/dev/null` `/dev/console` 设备文件;简单字符设备框架
-- [x] errno 起步对齐(EBADF/EFAULT/EINVAL/ENOENT/ENOMEM/ENOSYS 等);`uname` 已回报 MuOS/muos/i386
-- [ ] errno 与 Linux 做一次全量审计;补 `stat` 族返回的假 identity
-- [x] RTC 读取(CMOS,桌面任务栏时钟);`time(13)`/`gettimeofday(78)` syscall 尚未接
-- [ ] 时钟调用:`time(13)`/`gettimeofday(78)`(RTC → epoch 换算)
-- 验收:busybox 静态 i386 能跑 `echo`/`ls`;此后每个真实二进制暴露的缺失 syscall 就是待办清单
+- [x] 方法学落地:每个真实二进制暴露的缺失 syscall 即刻补齐,串口只记录一次未知号;本轮 BusyBox 已驱动出完整 VFS 元数据面
+- 验收:`echo/ls/cat` 已通过;下一步以 `sh -c`、管道、`ps/df` 暴露的 `fork/pipe/proc` 需求作为清单
 
 **方法学**:不要预先实现"完整 Linux"——用真实二进制当测试驱动,qemu 串口 + panic dump 定位缺失调用,逐个补齐。
 

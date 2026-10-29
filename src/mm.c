@@ -1,5 +1,6 @@
 #include "mm.h"
 #include "multiboot.h"
+#include "module.h"
 #include "vga.h"
 
 /* External symbol defined in linker script */
@@ -9,8 +10,13 @@ extern uint32_t _kernel_end;
  * bitmap and page-table set finite and every count in uint32 range) */
 #define MM_MAX_RAM_MB 1024
 
-/* Bitmap for physical page frames */
-static uint32_t* bitmap = NULL;
+/* Physical frame bitmap. It lives in kernel BSS instead of after
+ * _kernel_end: QEMU places Multiboot -initrd modules right after the
+ * kernel image, and an on-the-fly bitmap there overwrote the first
+ * bytes of the module (ELF magic included). */
+#define MM_MAX_PAGES ((MM_MAX_RAM_MB * 1024u * 1024u) / PAGE_SIZE)
+static uint32_t bitmap_storage[(MM_MAX_PAGES + 31) / 32];
+static uint32_t* bitmap = bitmap_storage;
 static uint32_t  total_pages = 0;
 static uint32_t  free_pages = 0;
 static uint32_t  mmap_region_count = 0;
@@ -60,9 +66,6 @@ static uint32_t bitmap_find_first_free(void) {
 }
 
 void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
-    /* Place bitmap after kernel */
-    bitmap = (uint32_t*)kernel_end;
-
     const uint64_t ram_cap = (uint64_t)MM_MAX_RAM_MB * 1024 * 1024;
     if (mb && (mb->flags & MULTIBOOT_FLAG_MEM)) reported_mem_upper_kb = mb->mem_upper;
 
@@ -94,9 +97,8 @@ void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
 
     total_pages = (uint32_t)(ram_top / PAGE_SIZE);
 
-    /* Reserve kernel area (0 to kernel_end + bitmap) in bitmap */
-    uint32_t bitmap_bytes = bitmap_words() * 4;
-    uint32_t reserved_pages = (kernel_end + bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    /* Reserve kernel area (the static bitmap is part of the kernel BSS). */
+    uint32_t reserved_pages = (kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
 
     /* Initialize bitmap: everything used, then free only the frames
      * that the memory map reports as usable RAM. This naturally keeps
@@ -130,6 +132,15 @@ void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
         for (uint32_t f = reserved_pages; f < total_pages; f++) {
             bitmap_clear(f);
             free_pages++;
+        }
+    }
+
+    /* Keep Multiboot module images away from the page-table/heap allocator.
+     * modules_init() ran before mm_init() (paging off, direct RAM access). */
+    for (uint32_t i = 0; i < modules_count(); i++) {
+        uint32_t s = 0, e = 0;
+        if (modules_get(i, &s, &e)) {
+            (void)mm_reserve_range(s, e);
         }
     }
 

@@ -14,6 +14,7 @@
 #include "io.h"
 #include "serial.h"
 #include "user.h"
+#include "module.h"
 
 /* ── Types ────────────────────────────── */
 #define CMD_MAX   128
@@ -47,7 +48,7 @@ static void isrt(char c){
 }
 
 /* ── Tab Completion ──────────────────── */
-static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec",NULL};
+static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod",NULL};
 static void tab(void){
     if(!cmd_pos)return;
     int ws=0;
@@ -99,6 +100,7 @@ static void cmd_help(void){
     vga_print("  touch ls cat rm write edit  - filesystem\n");
     vga_print("  run [fault]                 - Ring3 C program (Linux ABI)\n");
     vga_print("  exec <file>                 - run an ELF from the RAM FS\n");
+    vga_print("  mods / execmod <n>          - run a Multiboot -initrd module\n");
     vga_print("  help clear echo mem tasks time ps logo\n");
     vga_print("  version gui win7 desktop test reboot halt crash\n");
 }
@@ -109,6 +111,66 @@ static void cmd_run(char**a,int n){
      * demonstrates that a Ring3 fault kills only the process. */
     user_run_embedded("hello", n>1?a[1]:NULL);
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+}
+static void slog_u32(uint32_t v){ char b[12]; u32_to_dec(b,v); serial_write(b); }
+static void cmd_mods(void){
+    uint32_t n=modules_count();
+    vga_print_dec(n); vga_print(" module(s)\n");
+    serial_write("[mods] count="); slog_u32(n); serial_write("\n");
+    for(uint32_t i=0;i<n;i++){
+        uint32_t s=0,e=0;
+        modules_get(i,&s,&e);
+        serial_write("[mods] "); slog_u32(i);
+        serial_write(" start="); slog_u32(s);
+        serial_write(" end="); slog_u32(e);
+        serial_write(" size="); slog_u32(e-s); serial_write("\n");
+        vga_print("  ["); vga_print_dec(i); vga_print("] ");
+        vga_print_hex(s); vga_print("-"); vga_print_hex(e);
+        vga_print("  "); vga_print_dec(e-s); vga_print("B  ");
+        const char* nm=modules_name(i);
+        vga_print(nm&&nm[0]?nm:"(unnamed)");
+        vga_putchar('\n');
+    }
+}
+static void cmd_execmod(char**a,int n){
+    uint32_t idx=0;
+    if(n>1){ for(const char* p=a[1]; *p>='0'&&*p<='9'; p++) idx=idx*10+(uint32_t)(*p-'0'); }
+    uint32_t s=0,e=0;
+    if(!modules_get(idx,&s,&e)){ vga_print("No such module\n"); return; }
+    uint32_t size=e-s;
+    if(size==0){ vga_print("Empty module\n"); return; }
+
+    /* The ELF may live inside the user sandbox address range; user_run_image
+     * clears the sandbox, so copy it to kernel pages first. */
+    uint32_t pages=(size+PAGE_SIZE-1)/PAGE_SIZE;
+    void* copy=mm_alloc_pages(pages);
+    if(!copy){ vga_print("Not enough contiguous memory for module copy\n"); return; }
+    uint32_t cs=(uint32_t)copy, ce=cs+size;
+    if(cs < USER_END && ce > USER_BASE){
+        mm_free_pages(copy,pages);
+        vga_print("Module copy landed inside the user sandbox; retry\n");
+        return;
+    }
+    memcpy(copy,(const void*)s,size);
+
+    serial_write("[execmod] start="); slog_u32(s);
+    serial_write(" size="); slog_u32(size);
+    serial_write(" magic=");
+    if(memcmp(copy,"\x7f""ELF",4)==0) serial_write("ELF\n"); else serial_write("BAD\n");
+
+    const char* nm=modules_name(idx);
+    const char* base=nm&&nm[0]?nm:"module";
+    for(const char* p=base; *p; p++){
+        if(*p=='/'||*p=='\\') base=p+1;   /* argv[0] must be a bare name */
+    }
+
+    const char* argv[16];
+    int argc=1;
+    argv[0]=base[0]?base:"module";
+    for(int i=2;i<n && argc<16;i++) argv[argc++]=a[i];
+    user_run_image_argv(copy,size,argc,argv);
+    mm_free_pages(copy,pages);
+    vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
 }
 static void cmd_exec(char**a,int n){
     if(n<2){vga_print("exec <file>\n");return;}
@@ -234,6 +296,8 @@ static void execute(void){
     else if(streq(cmd,"test"))cmd_test();
     else if(streq(cmd,"run")||streq(cmd,"hello"))cmd_run(av,ac);
     else if(streq(cmd,"exec"))cmd_exec(av,ac);
+    else if(streq(cmd,"mods"))cmd_mods();
+    else if(streq(cmd,"execmod"))cmd_execmod(av,ac);
 }
 
 void shell_run(void){

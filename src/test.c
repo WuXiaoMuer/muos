@@ -262,6 +262,27 @@ static void test_fs_offsets(void) {
     CHECK(fs_delete("__test_off") == 0, "offset test file removed");
 }
 
+/* ---------- RAM FS rename ---------- */
+static void test_fs_rename(void) {
+    int n0 = fs_count();
+    int fd = fs_create("__test_rn");
+    CHECK(fd >= 0, "fs_create for rename test");
+    if (fd < 0) return;
+
+    CHECK(fs_write(fd, "rename", 6) == 6, "rename test write");
+    int other = fs_create("__test_rn_b");
+    CHECK(other >= 0, "second file for duplicate rename");
+    CHECK(fs_rename(fd, "__test_rn_b") == -1, "fs_rename rejects duplicate name");
+    CHECK(fs_rename(fd, "__test_rn2") == 0, "fs_rename renames file");
+    CHECK(fs_open("__test_rn") == -1, "old name gone after rename");
+    CHECK(fs_open("__test_rn2") == fd, "new name resolves to same slot");
+    CHECK(fs_fd_size(fd) == 6, "rename preserves contents");
+
+    fs_delete("__test_rn2");
+    fs_delete("__test_rn_b");
+    CHECK(fs_count() == n0, "rename cleanup restores file count");
+}
+
 /* ---------- Embedded Ring3 image ---------- */
 static void test_user_image(void) {
     uint32_t size = 0;
@@ -302,6 +323,7 @@ int tests_run(void) {
     test_mmap();
     test_fs();
     test_fs_offsets();
+    test_fs_rename();
     test_vga();
     test_keyboard();
     test_pit();
