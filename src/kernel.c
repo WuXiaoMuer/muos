@@ -16,6 +16,7 @@
 #include "mm.h"
 #include "multiboot.h"
 #include "kheap.h"
+#include "tss.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
@@ -42,7 +43,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     /* Boot banner - VGA */
     vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
     vga_print("============================================\n");
-    vga_print("             MuOS Kernel v0.3\n");
+    vga_print("             MuOS Kernel v0.4\n");
     vga_print("         x86 32-bit Microkernel\n");
     vga_print("============================================\n\n");
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
@@ -98,6 +99,15 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
         serial_write("[WARN] Kernel heap unavailable\n");
     }
 
+    /* 5c. TSS + Ring0 entry stack for Ring3 (int 0x80 / IRQs from user) */
+    if (tss_init()) {
+        vga_print("[OK] TSS (Ring3 entry stack 8KB)\n");
+        serial_write("[OK] TSS initialized\n");
+    } else {
+        vga_print("[WARN] TSS unavailable, user mode disabled\n");
+        serial_write("[WARN] TSS unavailable\n");
+    }
+
     /* 6. PIT timer */
     pit_init(100); /* 100 Hz */
     irq_register_handler(0, timer_handler);
@@ -108,9 +118,13 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     keyboard_init();
     vga_print("[OK] Keyboard\n");
 
-    /* 8. Mouse */
-    mouse_init();
-    vga_print("[OK] Mouse\n");
+    /* 8. Mouse (PS/2 aux port; IRQ12 routed through keyboard.c) */
+    if (mouse_init()) {
+        vga_print("[OK] PS/2 mouse\n");
+        serial_write("[OK] PS/2 mouse\n");
+    } else {
+        vga_print("[WARN] PS/2 mouse unavailable\n");
+    }
 
     /* 9. Multitasking */
     task_init();

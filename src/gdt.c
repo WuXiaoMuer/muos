@@ -1,6 +1,6 @@
 #include "gdt.h"
 
-static struct gdt_entry gdt[5];
+static struct gdt_entry gdt[6];
 static struct gdt_ptr   gdt_ptr;
 
 static void gdt_set_gate(int32_t num, uint32_t base, uint32_t limit,
@@ -44,6 +44,9 @@ void gdt_init(void) {
                  0xCF
     );
 
+    /* Slot 5 stays empty until tss_init() fills it and issues `ltr`.
+     * The GDT limit already covers it, so no reload of lgdt is needed. */
+
     /* Load GDT and reload segment registers */
     __asm__ volatile (
         "lgdt %0\n\t"
@@ -59,4 +62,9 @@ void gdt_init(void) {
         : "m"(gdt_ptr)
         : "eax"
     );
+}
+
+void gdt_set_tss(uint32_t base, uint32_t limit) {
+    /* 0x89 = present, DPL0, 32-bit TSS (available); byte-granular limit */
+    gdt_set_gate(5, base, limit, 0x89, 0x00);
 }

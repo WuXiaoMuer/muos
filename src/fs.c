@@ -94,3 +94,39 @@ uint32_t fs_size(int idx) {
     }
     return 0;
 }
+
+/* ---- fd-oriented API (fd is the slot index, as fs_open returns) ---- */
+
+const char* fs_fd_data(int fd) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return NULL;
+    return files[fd].data;
+}
+
+uint32_t fs_fd_size(int fd) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return 0;
+    return files[fd].size;
+}
+
+int fs_fd_truncate(int fd) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return -1;
+    files[fd].size = 0;
+    return 0;
+}
+
+int fs_read_at(int fd, uint32_t offset, char* buf, uint32_t len) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return -1;
+    if (offset >= files[fd].size) return 0;
+    uint32_t n = files[fd].size - offset;
+    if (n > len) n = len;
+    memcpy(buf, files[fd].data + offset, n);
+    return (int)n;
+}
+
+int fs_write_at(int fd, uint32_t offset, const char* data, uint32_t len) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return -1;
+    if (offset >= FS_MAX_SIZE) return -1;
+    if (len > FS_MAX_SIZE - offset) len = FS_MAX_SIZE - offset;
+    if (len) memcpy(files[fd].data + offset, data, len);
+    if (offset + len > files[fd].size) files[fd].size = offset + len;
+    return (int)len;
+}

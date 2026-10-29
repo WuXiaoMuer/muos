@@ -1,17 +1,18 @@
-# MuOS 代码逻辑(v0.3)
+# MuOS 代码逻辑(v0.4)
 
-本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、46 项自检。演进计划见 ROADMAP.md。
+本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、57 项自检。演进计划见 ROADMAP.md。
 
 ## 一、总体结构
 
 ```
 启动(汇编)          内核入口              硬件抽象                系统服务              用户可见
-boot.s          →   kernel.c         →   gdt/idt/isr/pic/irq  →  mm.c  kheap.c  →  shell.c(23 命令)
-boot_cd.s           初始化序列            pit keyboard serial        string.c fs.c      editor.c
-isr_stubs.s                              vga mouse                  task.c test.c      win7.c(桌面)
+boot.s          →   kernel.c         →   gdt/idt/isr/pic/irq  →  mm.c  kheap.c  →  shell.c(27 命令)
+boot_cd.s           初始化序列            pit keyboard mouse         string.c fs.c      editor.c
+isr_stubs.s                              vga serial rtc             task.c test.c      win7.c(桌面)
+                                                                      tss/elf/syscall/user → user/hello.c
 ```
 
-- `src/` 平铺 20 个 `.c` + 3 个 `.s`;`include/` 配对头文件,guard 统一 `MUOS_*` 前缀。
+- `src/` 平铺 25 个 `.c` + 3 个 `.s`;`include/` 配对头文件,guard 统一 `MUOS_*` 前缀。
 - `linker.ld`:内核加载到 `0x100000`,`_kernel_end` 供内存管理使用。
 - 两条启动路径最终都把控制权交给 `kernel_main(magic, mb_info)`。
 
@@ -46,17 +47,19 @@ serial → vga → GDT → IDT(256 项)→ PIC(重映射+全屏蔽)
 → mm_init(mb, kernel_end)         [mmap 解析 + 位图 + 全 RAM 恒等映射]
 → mm_enable_paging()              [CR0.PG|WP]
 → kheap_init()                    [1MB 内核堆]
-→ PIT 100Hz + IRQ0 → keyboard → mouse
+→ tss_init()                      [TSS + 8KB Ring0 入口栈 + ltr]
+→ PIT 100Hz + IRQ0 → keyboard → mouse(8042 aux / IRQ12)
 → task_init + task_register("kernel")
-→ tests_run()                     [46 项自检,失败打印 SELF-TEST FAILED]
+→ tests_run()                     [57 项自检,失败打印 SELF-TEST FAILED]
 → 启动动画 → shell_run()(内核栈上)
 ```
 
 ## 三、中断体系
 
-- **IDT 256 项全覆盖**:0–31 异常、0x20–0x2F IRQ、**0x30–0xFF 填充 `isr_ignore` 桩(纯 iret)**——未预期向量/伪中断安静返回,不会 #NF 级联。**0x80 预留给未来 int 0x80 系统调用**(ROADMAP 阶段 2)。
+- **IDT 256 项全覆盖**:0–31 异常、0x20–0x2F IRQ、**0x30–0xFF 填充 `isr_ignore` 桩(纯 iret)**——未预期向量/伪中断安静返回,不会 #NF 级联。**0x80 覆盖为 DPL3 系统调用门**(flags 0xEE),入口 `syscall_entry`。
 - **调用链**:`ISR/IRQ 桩(压栈)→ isr_common/irq_common(保存全寄存器+段)→ C handler → 恢复 → iret`。
-- **irq.c**:分发到 irq_handlers[16](keyboard 用 IRQ1,timer 用 IRQ0),处理伪 IRQ7/15(ISR 寄存器检查),每 IRQ 发 EOI。
+- **irq.c**:分发到 irq_handlers[16](IRQ0 timer、IRQ1 键盘、IRQ12 鼠标共享 8042 drain),处理伪 IRQ7/15(ISR 寄存器检查),每 IRQ 只发一次 EOI。kbd_irq_handler 自己不再发 EOI(旧版双重 EOI 会提前放行低优先级中断)。
+- **8042 路由**:键盘与鼠标共用输出缓冲,状态位 bit5 标识 aux;IRQ1/IRQ12 都进同一个 handler,按 bit5 分流到 `kbd_process_scancode` 或 `mouse_handle_byte`。IRQ12 必须先解蔽主片 IRQ2 级联。
 - **isr.c**:CPU 异常一律致命 → 打印异常名 + EIP/CS/EFLAGS/通用寄存器 dump → 停机。`crash` 命令即走此路径。
 - **EFLAGS 纪律**:内核里禁止裸 `cli…sti` 对(会破坏 IRQ 上下文和调用方临界区)。keyboard.c 的 `kbd_lock/kbd_unlock`(pushfl/popfl)是标准模式,新代码请照抄。
 
@@ -107,23 +110,72 @@ mm_init 末尾:for pfn in [0, total_pages):
 
 - **现状:单任务**。shell 直接跑在内核栈上,PIT 中断只 tick,无上下文切换。
 - 历史:旧版 task_create 手工伪造中断帧 + irq_common 切 ESP。崩溃的真实根因是 §4.3 的分页失配(任务栈页落在 4MB 以上未映射区)。如今分页已修好,但多任务暂未恢复——直接做正确的 Ring3 方案(TSS + 用户栈 + 每进程页目录),不再回头修 Ring0 轮转。
-- 保留物:`task_t`(pid/name/state/next)、`task_register/get_current/get_count/list` 供 `tasks`/`ps`/自检;GDT 槽 3/4 已备 Ring3 代码/数据段选择子(0x0B/0x13)。
+- 保留物:`task_t`(pid/name/state/next)、`task_register/get_current/get_count/list` 供 `tasks`/`ps`/自检;GDT 槽 3/4 是 Ring3 代码/数据段(0x1B/0x23),槽 5 是 TSS(0x28)。
 - task_t 由 kmalloc 分配。
 
-## 七、Shell / FS / 桌面
+## 七、Ring3 用户态与系统调用
 
-- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 有 MAX_ARGS=16 硬边界(曾有 17+ token 栈溢出漏洞);23 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步)。
-- **fs.c**:RAM 文件系统,64 槽 × 1KB,fd 即槽位下标(无句柄/引用保护——`fs_open` 后文件可被删,这是已知局限);write/read 截断无告警。架构级改造见 ROADMAP。
-- **editor.c**:229 行全屏编辑器,128 行 × 79 列,^S 保存 ^R 重载(需文件名)。
-- **win7.c**:文本模式伪图形桌面——8 窗口管理(开/关/最大化/拖拽去抖)、开始菜单状态机、任务栏时钟/内存显示。`gui`/`desktop` 命令已并入此实现。
+### 7.1 沙箱为什么是固定地址
 
-## 八、构建系统
+内核仍是全 RAM 恒等映射(VA=PA),因此用户页不能"随便映射到别处":如果把 0x08048000 重映射到另一个物理帧,内核原本通过 0x08048000 访问的物理页就消失。当前方案是**整段预留**:
 
-- **build.ps1**:`-Clean/-Run/-Iso` 组合;工具探测顺序 PATH → toolchain\ → tools\ → 常见安装位置;编译 `-m32 -ffreestanding -O2 -g -Wall -Wextra -fno-tree-loop-distribute-patterns -nostdinc`;链接经 `i686-elf-gcc -nostdlib -T linker.ld`(GCC 驱动而非裸 ld)。
+```
+USER_BASE = 0x08048000 (经典 Linux i386 ET_EXEC 地址)
+USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
+```
+
+`mm_reserve_range()` 在首次 `run` 时把这段物理页从位图分配器整段标记占用(全有或全无);`mm_user_map_range()` 再把覆盖它的 PDE/PTE 置 U/S 并重载 CR3。其余 RAM 仍是 supervisor 页,用户读写内核会 #PF。
+
+代价:单地址空间、一次只能跑一个用户进程、要求 RAM > 128MB;收益:在没有 higher-half / 每进程页目录之前,先把 Ring3 + Linux ABI 跑通。
+
+### 7.2 进入/退出 Ring3(isr_stubs.s)
+
+- `user_enter(entry, user_stack)`:`cli` → 保存 ebp/ebx/esi/edi 与 ESP 到 `user_kernel_esp_save` → **DS/ES/FS/GS 置 0x23**(iret 不会重载它们,DPL0 选择子会立刻 #GP)→ 压 SS=0x23/ESP/EFLAGS=0x202/CS=0x1B/EIP → `iret`。
+- 进入 Ring3 后,TSS.esp0(8KB 专用栈)接管所有中断/int 0x80 的 Ring0 入口;PIT 100Hz 在用户态照常运行。
+- `user_return_to_kernel()`:exit/故障时**丢弃 TSS 栈**,恢复保存的 ESP 与 callee-saved 寄存器、段寄存器回到 0x10,`sti; ret` 回到 `user_run_embedded`。注意同特权级 iret 不会恢复 ESP/SS,所以不能用 iret 回内核。
+- `registers_t` 布局对 Ring3 帧额外包含 useresp/ss,与 isr_stubs.s 的压栈顺序一致。
+
+### 7.3 int 0x80 分发(syscall.c)
+
+- `syscall_entry`:push 0/0x80 → 与 isr_common 相同的保存序列 → `syscall_handler(registers_t*)` → `regs->eax` 即返回值 → iret 回用户。
+- Linux i386 ABI:eax=调用号,ebx/ecx/edx(以及 esi/edi/ebp)传参;错误用 `-errno`。
+- 已实现:`exit(1) read(3) write(4) open(5) close(6) lseek(19) getpid(20) getuid(24) brk(45) getgid(47) geteuid(49) getegid(50) getppid(64) old_mmap(90) munmap(91) uname(122) mprotect(125) mmap2(192)`;未知号返回 `-ENOSYS(-38)` 并在串口打印一次编号,作为 ROADMAP 阶段 4 的待办清单。
+- fd 表在 user.c:`0/1/2` 是 stdio,文件 fd 从 3 起,内部映射 RAM FS 槽位并维护字节偏移;`open` 支持 `O_CREAT/O_TRUNC`,`lseek` 支持 SEEK_SET/CUR/END。
+- `write` 对 fd 1/2 逐字节输出到 VGA+串口,对文件 fd 调 `fs_write_at`;所有用户缓冲区先用 `user_ptr_ok` 校验完全落在沙箱内。`read` 对 fd 0 复用 `keyboard_getchar`(内部 `sti; hlt; cli`,解决中断门 IF=0 的等待问题),对文件 fd 调 `fs_read_at`。
+- `brk` 与匿名 `mmap` 共用沙箱 bump 指针:brk 只改 `brk_current`(页早已映射),mmap 按页对齐分配并清零;文件映射、`MAP_FIXED` 明确拒绝。`munmap/mprotect` 是空操作(平坦沙箱)。
+- `uname` 按 Linux i386 的 6×65 字节 utsname 填充 MuOS/muos/0.4.0/i386。
+
+### 7.4 ELF32 加载器(elf.c)
+
+- 仅接受 `ET_EXEC` + `EM_386` + 静态镜像;校验 class/data/version、e_phentsize/phnum 边界(p_offset+p_filesz 不越界)、每个 `PT_LOAD` 完全落在 `[USER_BASE, USER_END-64KB)`。
+- 逐段 `memcpy` + bss `memset`,记录最高装入地址作为 brk 起点;入口必须在沙箱内。
+- 镜像由 build.ps1 用同一交叉编译器链接到 0x08048000,再用 `objcopy -I binary -O elf32-i386` 变成 `hello_elf.o` 链进内核(`_binary_hello_elf_start/end`);运行前整段 memset 清零,重复 `run` 安全。
+- 两个入口共用 `user_run_image(image,size,...)`:`run` 用内嵌 blob,`exec <file>` 用 `fs_open` + `fs_fd_data/size` 从 RAM FS 读取。ELF 加载器只读源镜像,不依赖它在沙箱内。
+
+### 7.5 用户程序(user/)
+
+- `start.s`:`_start` 从内核构造的 System V 栈布局取 argc/argv,调用 `main`,返回值交给 `muos_exit`。
+- `runtime.c`:内联 `int $0x80` 的 muos_* 封装、字符串/数字输出、memset/memcpy(用户镜像 -nostdlib 需要)。不是 libc。
+- `hello.c`:打印 CS(验证 0x1B)、argc/argv、1..100 求和、栈数组、brk 写读、`uname`、RAM FS 打开/读取/写入/回读、匿名 `mmap`、键盘 read;`run fault` 参数让它故意写 0xC0000000。
+- 用户态异常在 `isr_handler` 开头分流:`(regs->cs & 3) == 3 && user_is_active()` → `user_handle_fault` 打印 EIP/CS/CR2 后回 Shell,内核 panic 路径不受影响。
+
+## 八、Shell / FS / 桌面
+
+- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 有 MAX_ARGS=16 硬边界(曾有 17+ token 栈溢出漏洞);27 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault]` 运行内嵌 ELF,`exec <file>` 运行 RAM FS 中的 ELF。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
+- **fs.c**:RAM 文件系统,16 槽 × 64KB(能存放静态 i386 ELF),fd 即槽位下标(无句柄/引用保护——`fs_open` 后文件可被删,这是已知局限)。除 shell 用的整文件 write/read 外,新增 `fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写。架构级改造见 ROADMAP。
+- **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
+- **win7.c**:文本模式 Win7 风格桌面——行 0 标题、1..23 桌面、24 任务栏;窗口按 z-order 绘制(活动窗口最后),鼠标点击/标题栏拖拽/最小化/最大化/关闭,开始菜单鼠标/键盘双操作,桌面图标可见;任务栏显示实时内存与 CMOS RTC `HH:MM:SS`。`gui`/`win7`/`desktop` 命令共用此实现;`run` 之外的 Text Editor/Calculator 可从菜单或图标启动(Calculator 聚焦时直接吃数字/运算符)。
+- **mouse.c + rtc.c**:PS/2 鼠标初始化(0xA8/命令字节/0xF6/0xF4)与 3 字节包解析(9 位 dx/dy、溢出位、按键),映射为 80×25 文本单元;`rtc_read_time` 处理 UIP、BCD/12 小时制,失败时任务栏回退 `UP:MM`。
+- **vga.c**:`vga_hide_cursor/show_cursor` 用 CRTC start/end 保存/恢复 BIOS 光标形状,桌面与编辑器绘制自己的光标。
+
+## 九、构建系统
+
+- **build.ps1**:`-Clean/-Run/-Iso` 组合;工具探测顺序 PATH → toolchain\ → tools\ → 常见安装位置;编内核 `-m32 -ffreestanding -O2 -g -Wall -Wextra -fno-tree-loop-distribute-patterns -nostdinc`;链接经 `i686-elf-gcc -nostdlib -T linker.ld`(GCC 驱动而非裸 ld)。
+- 用户程序:`user/*.c` 用同款交叉编译器、`-fno-pic -fno-pie -nostdlib` 编译,`user/linker.ld` 链接到 0x08048000,`objcopy -I binary -O elf32-i386 -B i386` 生成 `hello_elf.o` 参与内核链接。
 - **make_iso.py**:PROJECT 取脚本所在目录;objcopy 出 flat kernel.bin,bootloader 在偏移 4092 补丁内核大小;pycdlib 打 El Torito ISO。
 - ISO 路径实测:`-cdrom` 启动 → 自检全 PASS(修复前该路径直接把魔数当指令执行)。
 
-## 九、关键全局量
+## 十、关键全局量
 
 | 符号 | 位置 | 说明 |
 |---|---|---|
@@ -133,15 +185,24 @@ mm_init 末尾:for pfn in [0, total_pages):
 | `task_list_head / current_task / task_count` | task.c | 任务 introspection |
 | `kbd_buffer/head/tail` | keyboard.c | 256 字节键盘环形缓冲 |
 | `pit_ticks` | pit.c | 100Hz tick(uptime = ticks/100) |
+| `tss / kernel_stack_top` | tss.c | Ring3→Ring0 的 TSS 与 8KB 入口栈 |
+| `user_kernel_esp_save` | user.c | user_enter 保存的内核上下文 |
+| `brk_base / brk_current` | user.c | 用户堆 bump 指针 |
+| `_binary_hello_elf_start/end` | 链接器 | 内嵌用户 ELF 的起止地址 |
+| `px / py / btn_*` | mouse.c | PS/2 鼠标虚拟像素坐标(640×400)与按键 |
+| `mouse_cx/cy` | win7.c | 软件光标所在文本单元 |
+| `cursor_scan_start/end` | vga.c | BIOS 光标形状(隐藏/恢复) |
 
-## 十、已知局限(真实清单)
+## 十一、已知局限(真实清单)
 
-1. 无用户态:全部 Ring 0,无 TSS,无每进程页目录(ROADMAP 阶段 1)
-2. 无系统调用接口:0x80 向量已预留空桩(ROADMAP 阶段 2)
-3. 无 ELF 加载器,不能运行外部程序(ROADMAP 阶段 3)
+1. 用户态是**单进程、固定 8MB 沙箱**:无 higher-half、无每进程页目录、无 fork/调度;一次只跑一个用户程序(ROADMAP 阶段 1 剩余项)
+2. 系统调用是起步集:已有 stdio/文件 fd/uname/匿名 mmap,但 `fork/waitpid/signals/writev/stat` 等缺失,文件 mmap 不支持(ROADMAP 阶段 2/4)
+3. ELF 可从内核内嵌或 RAM FS(`exec`)加载,但还没有 `execve` 系统调用、进程替换与磁盘文件系统(ROADMAP 阶段 3)
 4. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 5. fs 无句柄保护、无目录/时间戳/持久化;write 截断不告警
-6. 键盘仅 US QWERTY;mouse 是假驱动(固定坐标,真 PS/2 驱动在 ROADMAP)
-7. 单处理器(PIC,非 APIC);调度为协作式单任务
-8. 无内核栈溢出保护(16KB 栈,GUI 深调用链靠它撑着)
-9. 无 guard page / 无 KASLR / panic 信息只有寄存器 dump(有 -g,可 addr2line)
+6. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
+7. 桌面仍是 80×25 文本模式,无图形帧缓冲、字体渲染与动画;窗口内容除 Calculator 外主要是状态展示
+8. 单处理器(PIC,非 APIC);内核仍是协作式单任务
+9. 无内核栈溢出保护(16KB 栈,GUI 深调用链靠它撑着;用户态入口另有 8KB TSS 栈)
+10. 无 guard page / 无 KASLR / panic 信息只有寄存器 dump(有 -g,可 addr2line)
+11. NT/PE 兼容尚未开始:执行前端目前只有 ELF32(ROADMAP 阶段 5)

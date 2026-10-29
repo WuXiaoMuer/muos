@@ -13,6 +13,7 @@
 #include "logo.h"
 #include "io.h"
 #include "serial.h"
+#include "user.h"
 
 /* ── Types ────────────────────────────── */
 #define CMD_MAX   128
@@ -46,7 +47,7 @@ static void isrt(char c){
 }
 
 /* ── Tab Completion ──────────────────── */
-static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","touch","ls","cat","rm","write","edit","calc","test",NULL};
+static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec",NULL};
 static void tab(void){
     if(!cmd_pos)return;
     int ws=0;
@@ -96,10 +97,28 @@ static int tokenize(char*b,char**a,int max_args){int n=0;char*p=b;while(*p){whil
 /* ═══════════════════ Commands ═══════════════════ */
 static void cmd_help(void){
     vga_print("  touch ls cat rm write edit  - filesystem\n");
+    vga_print("  run [fault]                 - Ring3 C program (Linux ABI)\n");
+    vga_print("  exec <file>                 - run an ELF from the RAM FS\n");
     vga_print("  help clear echo mem tasks time ps logo\n");
-    vga_print("  version gui win7 test reboot halt crash\n");
+    vga_print("  version gui win7 desktop test reboot halt crash\n");
 }
 static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
+static void cmd_run(char**a,int n){
+    /* Runs the embedded ELF at Ring3; returns when the process exits or
+     * faults. `run fault` asks hello.c to touch an unmapped address, which
+     * demonstrates that a Ring3 fault kills only the process. */
+    user_run_embedded("hello", n>1?a[1]:NULL);
+    vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+}
+static void cmd_exec(char**a,int n){
+    if(n<2){vga_print("exec <file>\n");return;}
+    int slot=fs_open(a[1]);
+    if(slot<0){vga_print("Not found\n");return;}
+    uint32_t sz=fs_fd_size(slot);
+    if(!sz){vga_print("Empty file\n");return;}
+    user_run_image(fs_fd_data(slot), sz, a[1], n>2?a[2]:NULL);
+    vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+}
 static void cmd_clear(void){vga_clear();}
 static void cmd_echo(char**a,int n){for(int i=1;i<n;i++){vga_print(a[i]);if(i<n-1)vga_putchar(' ');}vga_putchar('\n');}
 static void cmd_mem(void){vga_print("Mem: ");vga_print_dec(mm_get_total_pages()*4);vga_print("KB tot ");vga_print_dec(mm_get_free_pages()*4);vga_print("KB free\n");}
@@ -120,7 +139,7 @@ static void cmd_logo(void){
     vga_print("\n");
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
 }
-static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS v0.3\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
+static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS v0.4 (Ring3 + Linux ABI)\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
 static void cmd_reboot(void){
     vga_print("Reboot...\n");
     serial_write("[shell] reboot requested (8042 reset line)\n");
@@ -152,7 +171,14 @@ static void cmd_crash(void){
 /* ── FS Commands ──────────────────────── */
 static void cmd_touch(char**a,int n){if(n<2){vga_print("touch <name>\n");return;}int f=fs_create(a[1]);if(f>=0){vga_print("OK: ");vga_print(a[1]);vga_putchar('\n');}else{vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));vga_print("Fail\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}}
 static void cmd_ls(void){int n=fs_count();vga_print_dec(n);vga_print(" file(s)\n");for(int i=0;i<n;i++){vga_print("  ");vga_print(fs_name(i));vga_print("  ");vga_print_dec(fs_size(i));vga_print("B\n");}}
-static void cmd_cat(char**a,int n){if(n<2){vga_print("cat <file>\n");return;}int f=fs_open(a[1]);if(f<0){vga_print("Not found\n");return;}char b[1024];int l=fs_read(f,b,1023);b[l]=0;vga_print(b);vga_putchar('\n');}
+static void cmd_cat(char**a,int n){
+    if(n<2){vga_print("cat <file>\n");return;}
+    int f=fs_open(a[1]);if(f<0){vga_print("Not found\n");return;}
+    const char* d=fs_fd_data(f);
+    uint32_t sz=fs_fd_size(f);
+    for(uint32_t i=0;i<sz;i++) vga_putchar(d[i]);
+    if(sz==0||d[sz-1]!='\n') vga_putchar('\n');
+}
 
 /* ── Calculator ──────────────────────── */
 static void cmd_calc(char**a,int n){
@@ -206,6 +232,8 @@ static void execute(void){
     else if(streq(cmd,"edit")){editor_run(ac>1?av[1]:NULL);vga_clear();}
     else if(streq(cmd,"calc"))cmd_calc(av,ac);
     else if(streq(cmd,"test"))cmd_test();
+    else if(streq(cmd,"run")||streq(cmd,"hello"))cmd_run(av,ac);
+    else if(streq(cmd,"exec"))cmd_exec(av,ac);
 }
 
 void shell_run(void){
@@ -215,6 +243,15 @@ void shell_run(void){
     fs_write(fs_open("readme.txt"), "Welcome to MuOS 7!\nType 'help' for commands.\nType 'win7' for desktop.", 69);
     fs_create("notes.txt");
     fs_write(fs_open("notes.txt"), "MuOS 7 - x86 Microkernel\nBuilt with GCC 15 + NASM", 49);
+
+    /* Seed the RAM FS with the embedded Ring3 ELF so `exec hello.elf`
+     * proves the loader also works on a filesystem image. */
+    uint32_t elf_size = 0;
+    const void* elf = user_get_image(&elf_size);
+    int elf_fd = fs_create("hello.elf");
+    if (elf_fd >= 0 && elf_size > 0) {
+        fs_write(elf_fd, (const char*)elf, elf_size);
+    }
 
     vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
     vga_print("\n");

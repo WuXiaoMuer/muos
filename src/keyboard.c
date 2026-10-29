@@ -3,6 +3,7 @@
 #include "isr.h"
 #include "irq.h"
 #include "pic.h"
+#include "mouse.h"
 
 /* Keyboard state tracking */
 static bool_t lshift   = false;
@@ -142,7 +143,15 @@ static void kbd_process_scancode(uint8_t scancode) {
                 if (lower >= 'a' && lower <= 'z') shifted = !shifted;
             }
             char c = shifted ? kbd_upper[scancode] : kbd_lower[scancode];
-            if (c != 0) kbd_buf_put(c);
+            if (c != 0) {
+                /* Ctrl+letter -> ASCII control code (Ctrl+S = 0x13, the
+                 * editor's save key, Ctrl+R = 0x12 reload). */
+                if (lctrl || rctrl) {
+                    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 1);
+                    else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
+                }
+                kbd_buf_put(c);
+            }
             break;
         }
     }
@@ -150,27 +159,23 @@ static void kbd_process_scancode(uint8_t scancode) {
     kbd_unlock(flags);
 }
 
-/* IRQ1 handler — pre-empts polling only briefly.
- * Drains the 8042, drops mouse data, and lets the polled
- * keyboard_getchar() in shell pick up the byte. */
+/* Shared 8042 handler for IRQ1 (keyboard) and IRQ12 (mouse).
+ * Drains ALL pending bytes and routes them by status bit5 (aux port).
+ * IF is already 0 inside the IRQ gate; no cli/sti here. */
 static void kbd_irq_handler(registers_t* regs) {
-    (void)regs;
-    /* Drain ALL pending bytes in the 8042 buffer. A mouse IRQ
-     * can otherwise queue up a 3-byte packet that the next
-     * poll-loop iteration misreads as keyboard scancodes.
-     * IF is already 0 inside the IRQ gate; no cli/sti here. */
+    (void)regs;   /* irq.c sends the EOI after the handler returns */
+
     while (inb(KEYBOARD_STATUS_PORT) & 0x01) {
         uint8_t s = inb(KEYBOARD_STATUS_PORT);
         uint8_t data = inb(KEYBOARD_DATA_PORT);
-        if (!(s & 0x20)) {
+        if (s & 0x20) {
+            mouse_handle_byte(data);
+        } else {
             kbd_process_scancode(data);
         }
-        /* Mouse byte — discard */
     }
-    pic_send_eoi(1);
 }
 
-/* Minimal init: drain and leave 8042 alone */
 void keyboard_init(void) {
     lshift = false; rshift = false;
     lctrl  = false; rctrl  = false;
@@ -185,10 +190,12 @@ void keyboard_init(void) {
         inb(KEYBOARD_DATA_PORT);
     }
 
-    /* Register IRQ1 — the handler just drains the 8042 and
-     * forwards keyboard scancodes; mouse data is discarded. */
+    /* IRQ1 and IRQ12 share the 8042 drain. IRQ12 requires the master's
+     * cascade line (IRQ2) to be unmasked as well. */
     irq_register_handler(1, kbd_irq_handler);
     pic_unmask(1);
+    pic_unmask(2);
+    irq_register_handler(12, kbd_irq_handler);
 }
 
 /* Pure polling read — no CLI/STI needed (single task, PIT doesn't preempt) */
@@ -205,7 +212,9 @@ char keyboard_getchar(void) {
         uint8_t s = inb(KEYBOARD_STATUS_PORT);
         if (s & 0x01) {
             uint8_t data = inb(KEYBOARD_DATA_PORT);
-            if (!(s & 0x20)) {
+            if (s & 0x20) {
+                mouse_handle_byte(data);
+            } else {
                 kbd_process_scancode(data);
             }
         }

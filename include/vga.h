@@ -36,6 +36,8 @@ void vga_print_hex(uint32_t n);
 void vga_print_dec(uint32_t n);
 void vga_scroll(void);
 void vga_update_cursor(void);
+void vga_hide_cursor(void);   /* CRTC cursor off, restore with show */
+void vga_show_cursor(void);
 void vga_set_cursor(uint16_t row, uint16_t col);
 void vga_move_cursor_left(void);
 void vga_move_cursor_right(void);

@@ -9,6 +9,8 @@
 #include "pit.h"
 #include "task.h"
 #include "string.h"
+#include "elf.h"
+#include "user.h"
 
 /* ANSI-ish helpers */
 #define OK  "[PASS] "
@@ -241,6 +243,47 @@ static void test_mmap(void) {
     CHECK(covered >= reported, "bitmap covers reported RAM");
 }
 
+/* ---------- RAM FS fd offsets ---------- */
+static void test_fs_offsets(void) {
+    int fd = fs_create("__test_off");
+    CHECK(fd >= 0, "fs_create for offset test");
+    if (fd < 0) return;
+
+    CHECK(fs_write_at(fd, 0, "abc", 3) == 3, "fs_write_at writes head");
+    CHECK(fs_write_at(fd, 3, "def", 3) == 3, "fs_write_at appends");
+    CHECK(fs_fd_size(fd) == 6, "fs fd size tracks writes");
+
+    char buf[8];
+    CHECK(fs_read_at(fd, 2, buf, 4) == 4, "fs_read_at returns tail");
+    CHECK(buf[0] == 'c' && buf[1] == 'd' && buf[2] == 'e' && buf[3] == 'f',
+          "fs_read_at honors offset");
+
+    CHECK(fs_fd_truncate(fd) == 0 && fs_fd_size(fd) == 0, "fs_fd_truncate clears size");
+    CHECK(fs_delete("__test_off") == 0, "offset test file removed");
+}
+
+/* ---------- Embedded Ring3 image ---------- */
+static void test_user_image(void) {
+    uint32_t size = 0;
+    const void* img = user_get_image(&size);
+
+    CHECK(img != NULL && size >= sizeof(elf32_ehdr_t),
+          "embedded user image present");
+
+    if (!img || size < sizeof(elf32_ehdr_t)) return;
+
+    elf32_ehdr_t eh;
+    memcpy(&eh, img, sizeof(eh));
+    CHECK(memcmp(eh.e_ident, "\x7f" "ELF", 4) == 0 &&
+          eh.e_ident[4] == ELF_CLASS_32 &&
+          eh.e_machine == ELF_MACHINE_386 &&
+          eh.e_type == ELF_TYPE_EXEC,
+          "embedded image is ELF32 i386 ET_EXEC");
+
+    CHECK(eh.e_entry >= USER_BASE && eh.e_entry < USER_END,
+          "user entry point inside sandbox");
+}
+
 int tests_run(void) {
     passed = 0; failed = 0;
 
@@ -258,10 +301,12 @@ int tests_run(void) {
     test_paging_high();
     test_mmap();
     test_fs();
+    test_fs_offsets();
     test_vga();
     test_keyboard();
     test_pit();
     test_task_info();
+    test_user_image();
 
     __asm__ volatile ("sti");
 

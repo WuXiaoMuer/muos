@@ -289,3 +289,45 @@ uint32_t mm_virt_to_phys(uint32_t virt) {
 uint32_t mm_get_page_directory(void) {
     return page_dir_phys;
 }
+
+bool_t mm_reserve_range(uint32_t start, uint32_t end) {
+    if (end <= start) return false;
+
+    uint32_t first = start / PAGE_SIZE;
+    uint32_t last  = (end - 1) / PAGE_SIZE + 1;  /* overflow-safe page round-up */
+    if (first >= total_pages || last > total_pages) return false;
+
+    /* All-or-nothing: never leave a half-reserved range behind. */
+    for (uint32_t f = first; f < last; f++) {
+        if (bitmap_test(f)) return false;
+    }
+    for (uint32_t f = first; f < last; f++) {
+        bitmap_set(f);
+        free_pages--;
+    }
+    return true;
+}
+
+bool_t mm_user_map_range(uint32_t start, uint32_t end) {
+    if (end <= start) return false;
+
+    uint32_t first = start / PAGE_SIZE;
+    uint32_t last  = (end - 1) / PAGE_SIZE + 1;
+    if (first >= total_pages || last > total_pages) return false;
+
+    /* Everything in this range is part of the all-RAM identity map,
+     * so the page tables already exist; only the U/S bits change. */
+    for (uint32_t pfn = first; pfn < last; pfn++) {
+        uint32_t pde = pfn >> 10;
+        if (!(page_directory[pde] & PDE_PRESENT)) return false;
+        uint32_t* pt = (uint32_t*)(page_directory[pde] & PAGE_MASK);
+        if (!(pt[pfn & 0x3FF] & PTE_PRESENT)) return false;
+        page_directory[pde] |= PDE_USER;
+        pt[pfn & 0x3FF] |= PTE_USER;
+    }
+
+    /* One CR3 reload flushes every changed entry (cheaper and less
+     * error-prone than 2048 invlpg instructions). */
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(page_dir_phys) : "memory");
+    return true;
+}

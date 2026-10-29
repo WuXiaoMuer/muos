@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "isr.h"
 #include "irq.h"
+#include "syscall.h"
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idt_ptr;
@@ -71,10 +72,13 @@ void idt_init(void) {
     idt_set_gate(0x2F, (uint32_t)irq15, 0x08, 0x8E);
 
     /* Vectors 0x30-0xFF: present no-op gates so unexpected/spurious
-     * interrupts iret instead of raising #NF cascades. 0x80 is reserved
-     * for the future int 0x80 syscall interface. */
+     * interrupts iret instead of raising #NF cascades. */
     for (uint16_t v = 0x30; v < 256; v++)
         idt_set_gate((uint8_t)v, (uint32_t)isr_ignore, 0x08, 0x8E);
+
+    /* int 0x80: Ring3-callable syscall gate (0xEE = present, DPL3,
+     * 32-bit interrupt gate). Set after the loop so it is not clobbered. */
+    idt_set_gate(0x80, (uint32_t)syscall_entry, 0x08, 0xEE);
 
     __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
 }

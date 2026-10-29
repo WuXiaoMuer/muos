@@ -5,6 +5,8 @@ bits 32
 
 extern isr_handler
 extern irq_handler
+extern syscall_handler
+extern user_kernel_esp_save
 
 ; ---------------------------------------------------------------------------
 ; Common ISR handler (exceptions)
@@ -64,6 +66,102 @@ irq_common:
     popa
     add esp, 8
     iret
+
+; ---------------------------------------------------------------------------
+; int 0x80 syscall entry (DPL=3 gate, see idt.c)
+; ---------------------------------------------------------------------------
+global syscall_entry
+syscall_entry:
+    cli
+    push 0              ; no CPU error code
+    push 0x80           ; vector number
+    jmp syscall_common
+
+syscall_common:
+    cli
+    cld
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+
+    ; Kernel segments for the C handler; user values were saved on the stack.
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    push esp
+    call syscall_handler
+    add esp, 4
+
+    ; sys_exit/user fault never returns here (see user_return_to_kernel),
+    ; so reaching this point means a normal return to Ring3.
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    add esp, 8
+    iret
+
+; ---------------------------------------------------------------------------
+; Ring3 entry/exit helpers
+;
+; user_enter(entry, user_stack):
+;   saves the callee-saved registers + ESP of the kernel caller so
+;   user_return_to_kernel can resume it after exit/fault, then builds a
+;   Ring3 iret frame and drops to CPL3.
+;
+; user_return_to_kernel():
+;   called from C while on the TSS Ring0 stack; discards that stack and
+;   resumes the kernel caller saved by user_enter. Never returns.
+; ---------------------------------------------------------------------------
+global user_enter
+global user_return_to_kernel
+
+user_enter:
+    cli
+    mov ecx, [esp + 8]      ; user stack pointer
+    mov edx, [esp + 4]      ; entry point
+    push ebp
+    push ebx
+    push esi
+    push edi
+    mov [user_kernel_esp_save], esp
+
+    ; Ring3 data selectors must be live before iret: DS/ES/FS/GS are not
+    ; reloaded by iret and a DPL0 selector would fault on first access.
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    push 0x23               ; SS  (user data, RPL3)
+    push ecx                ; ESP (user stack)
+    push 0x202              ; EFLAGS (IF=1, IOPL=0)
+    push 0x1B               ; CS  (user code, RPL3)
+    push edx                ; EIP
+    iret
+
+user_return_to_kernel:
+    cli
+    cld
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov esp, [user_kernel_esp_save]
+    pop edi
+    pop esi
+    pop ebx
+    pop ebp
+    sti
+    ret
 
 ; ---------------------------------------------------------------------------
 ; Ignore stub: silently dismiss unexpected vectors (0x30-0xFF).

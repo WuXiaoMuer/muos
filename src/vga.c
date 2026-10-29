@@ -5,6 +5,8 @@ static uint16_t* const VGA_BUFFER = (uint16_t*)0xB8000;
 static uint8_t    vga_color;
 static volatile uint16_t   vga_row;
 static volatile uint16_t   vga_col;
+static uint8_t    cursor_scan_start = 0x0E;
+static uint8_t    cursor_scan_end   = 0x0F;
 
 uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg) {
     return (bg << 4) | fg;
@@ -18,7 +20,25 @@ void vga_init(void) {
     vga_row = 0;
     vga_col = 0;
     vga_color = vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK);
+
+    /* Remember the BIOS cursor shape so GUI/editor can hide it and
+     * restore the text-mode cursor afterwards. */
+    outb(0x3D4, 0x0A); cursor_scan_start = inb(0x3D5);
+    outb(0x3D4, 0x0B); cursor_scan_end   = inb(0x3D5);
+
     vga_clear();
+}
+
+void vga_hide_cursor(void) {
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, 0x20);   /* bit5 = cursor disable */
+}
+
+void vga_show_cursor(void) {
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, cursor_scan_start);
+    outb(0x3D4, 0x0B);
+    outb(0x3D5, cursor_scan_end);
 }
 
 void vga_setcolor(uint8_t color) {

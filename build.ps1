@@ -32,9 +32,10 @@ function Find-Tool {
     return $null
 }
 
-$NASM = Find-Tool "nasm"
-$GCC  = Find-Tool "i686-elf-gcc"
-$QEMU = Find-Tool "qemu-system-i386"
+$NASM    = Find-Tool "nasm"
+$GCC     = Find-Tool "i686-elf-gcc"
+$OBJCOPY = Find-Tool "i686-elf-objcopy"
+$QEMU    = Find-Tool "qemu-system-i386"
 
 # ======================== Clean ========================
 if ($Clean) {
@@ -50,8 +51,9 @@ if ($Clean) {
 
 # ======================== Check tools ========================
 $missing = @()
-if (-not $NASM) { $missing += "nasm" }
-if (-not $GCC)  { $missing += "i686-elf-gcc" }
+if (-not $NASM)    { $missing += "nasm" }
+if (-not $GCC)     { $missing += "i686-elf-gcc" }
+if (-not $OBJCOPY) { $missing += "i686-elf-objcopy" }
 
 if ($missing.Count -gt 0) {
     Write-Host ""
@@ -104,7 +106,8 @@ $step++
 $CFiles = @(
     "kernel", "vga", "serial", "gdt", "idt", "isr", "pic",
     "pit", "keyboard", "mouse", "mm", "kheap", "string", "fs", "editor",
-    "win7", "task", "shell", "irq", "test"
+    "win7", "task", "shell", "irq", "test", "elf", "tss", "user", "syscall",
+    "rtc"
 )
 
 $ObjFiles = @()
@@ -119,9 +122,46 @@ foreach ($name in $CFiles) {
     $step++
 }
 
+# ======================== Ring3 user program ========================
+# The user ELF is built with the same cross compiler but linked at
+# 0x08048000 against the Linux-style stack/syscall ABI, then embedded in
+# the kernel image as a raw blob (symbols _binary_hello_elf_*).
+$UserDir    = "$PSScriptRoot\user"
+$UserCFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
+                "-fno-stack-protector", "-fno-pic", "-fno-pie",
+                "-fno-tree-loop-distribute-patterns", "-nostdinc", "-nostdlib")
+
+Write-Host ">>> [$step] Compiling user runtime + hello.c ..." -ForegroundColor Cyan
+& $GCC @UserCFlags -c "$UserDir\runtime.c" -o "$BuildDir\user_runtime.o"
+if ($LASTEXITCODE -ne 0) { throw "GCC user runtime.c failed" }
+& $GCC @UserCFlags -c "$UserDir\hello.c" -o "$BuildDir\user_hello.o"
+if ($LASTEXITCODE -ne 0) { throw "GCC user hello.c failed" }
+Write-Host "      OK -> build\user_runtime.o, build\user_hello.o" -ForegroundColor Green
+$step++
+
+Write-Host ">>> [$step] Linking hello.elf (0x08048000) ..." -ForegroundColor Cyan
+& $NASM -f elf32 "$UserDir\start.s" -o "$BuildDir\user_start.o"
+if ($LASTEXITCODE -ne 0) { throw "NASM user start.s failed" }
+& $GCC -m32 -nostdlib -no-pie -T "$UserDir\linker.ld" `
+       "$BuildDir\user_start.o" "$BuildDir\user_runtime.o" "$BuildDir\user_hello.o" `
+       -o "$BuildDir\hello.elf" "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
+if ($LASTEXITCODE -ne 0) { throw "Link hello.elf failed" }
+Write-Host "      OK -> build\hello.elf" -ForegroundColor Green
+$step++
+
+Write-Host ">>> [$step] Embedding hello.elf as a kernel blob ..." -ForegroundColor Cyan
+Push-Location $BuildDir
+& $OBJCOPY -I binary -O elf32-i386 -B i386 "hello.elf" "hello_elf.o"
+$blobRc = $LASTEXITCODE
+Pop-Location
+if ($blobRc -ne 0) { throw "objcopy hello.elf failed" }
+Write-Host "      OK -> build\hello_elf.o" -ForegroundColor Green
+$step++
+
 # Link (via GCC driver so standard flags are handled consistently)
 Write-Host ">>> [$step] Linking kernel.elf ..." -ForegroundColor Cyan
-$AllObj = @("$BuildDir\boot.o", "$BuildDir\isr_stubs.o") + $ObjFiles
+$AllObj = @("$BuildDir\boot.o", "$BuildDir\isr_stubs.o",
+            "$BuildDir\hello_elf.o") + $ObjFiles
 $LdArgs = @("-nostdlib", "-T", "$PSScriptRoot\linker.ld",
             "-Wl,--no-warn-rwx-segments") + $AllObj + @("-o", "$BuildDir\kernel.elf")
 & $GCC @LdArgs

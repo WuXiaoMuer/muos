@@ -45,6 +45,16 @@ bool_t mm_map_page(uint32_t phys, uint32_t virt, uint32_t flags);
 void mm_unmap_page(uint32_t virt);
 uint32_t mm_virt_to_phys(uint32_t virt);
 
+/* Reserve a physical range (page-rounded) so the allocator never hands
+ * it out. Fails if any page in the range is already in use. Used by the
+ * user-mode sandbox, whose virtual addresses are identity-mapped.
+ * Returns true on success. */
+bool_t mm_reserve_range(uint32_t start, uint32_t end);
+
+/* Mark an already identity-mapped range as user-accessible (U/S bit on
+ * both the PDE and every PTE). Reloads CR3. */
+bool_t mm_user_map_range(uint32_t start, uint32_t end);
+
 /* Get page directory physical address */
 uint32_t mm_get_page_directory(void);
 

@@ -20,7 +20,12 @@ struct gdt_ptr {
 #define GDT_KERNEL_DATA 0x10
 #define GDT_USER_CODE   0x18
 #define GDT_USER_DATA   0x20
+#define GDT_TSS         0x28
 
 void gdt_init(void);
+
+/* Install/refresh the TSS descriptor in slot 5 (after the GDT is loaded;
+ * the descriptor table itself lives in memory and stays live). */
+void gdt_set_tss(uint32_t base, uint32_t limit);
 
 #endif

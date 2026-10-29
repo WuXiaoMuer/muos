@@ -7,16 +7,21 @@
 
 #define EDIT_COLS 79
 #define EDIT_ROWS 22
+#define EDIT_MAX_LINES 128
+#define EDIT_IO_MAX (EDIT_MAX_LINES * (EDIT_COLS + 1) + 1)
 
-static char lines[128][EDIT_COLS+1];  /* 128 lines × 79 chars each */
+static char lines[EDIT_MAX_LINES][EDIT_COLS+1];  /* 128 lines × 79 chars each */
+static char io_buf[EDIT_IO_MAX];                 /* full save/load buffer */
 static int  line_count, cursor_x, cursor_y, scroll_top;
 static char filename[32];
 static int  modified;
 
 static void drow(int y, const char* s, uint8_t c) {
     int i;
-    for(i = 0; s[i]; i++) ((volatile uint16_t*)0xB8000)[y*80+i] = vga_entry((unsigned char)s[i], c);
-    for(; i < 79; i++) ((volatile uint16_t*)0xB8000)[y*80+i] = vga_entry(' ', c);
+    for(i = 0; s[i] && i < 80; i++)
+        ((volatile uint16_t*)0xB8000)[y*80+i] = vga_entry((unsigned char)s[i], c);
+    for(; i < 80; i++)
+        ((volatile uint16_t*)0xB8000)[y*80+i] = vga_entry(' ', c);
 }
 
 static void draw_status(void) {
@@ -30,7 +35,7 @@ static void draw_status(void) {
     buf[p++] = ' '; buf[p++] = 'C'; buf[p++] = ':';
     { int n = cursor_x+1; if(!n)buf[p++]='0'; else{int d[4],c=0;while(n){d[c++]=n%10;n/=10;}while(c)buf[p++]='0'+d[--c];} }
     buf[p++] = ' '; buf[p] = 0;
-    for(int i = 0; i < 79; i++) {
+    for(int i = 0; i < 80; i++) {
         if(i < p) ((volatile uint16_t*)0xB8000)[i] = vga_entry((unsigned char)buf[i], cs);
         else ((volatile uint16_t*)0xB8000)[i] = vga_entry(' ', cs);
     }
@@ -38,10 +43,15 @@ static void draw_status(void) {
 
 static void draw_help(void) {
     uint8_t ch = vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY);
-    const char* s = "^S:Save  ^R:Reload  ESC:Exit  Arrows:Move  Tab:Indent";
-    for(int i = 0; i < 79; i++) {
-        if(s[i]) ((volatile uint16_t*)0xB8000)[23*80+i] = vga_entry((unsigned char)s[i], ch);
-        else ((volatile uint16_t*)0xB8000)[23*80+i] = vga_entry(' ', ch);
+    const char* s = "^S:Save  ^R:Reload  ESC:Exit  Arrows:Move  Tab:Indent  PgUp/PgDn:Scroll";
+    uint32_t len = strlen(s);
+    /* Stop at the NUL: indexing s[i] past the terminator would copy the
+     * next .rodata string (visible as garbage on the help bar). */
+    for(int i = 0; i < 80; i++) {
+        if((uint32_t)i < len)
+            ((volatile uint16_t*)0xB8000)[23*80+i] = vga_entry((unsigned char)s[i], ch);
+        else
+            ((volatile uint16_t*)0xB8000)[23*80+i] = vga_entry(' ', ch);
     }
 }
 
@@ -116,37 +126,39 @@ static void save_file(void) {
     int fd = fs_open(filename);
     if(fd < 0) fd = fs_create(filename);
     if(fd < 0) return;
-    /* Build buffer (silently truncated at 1023 bytes; fs cap is 1KB) */
-    char buf[1024]; int bp = 0;
-    for(int i = 0; i < line_count && bp < 1023; i++) {
-        for(char* p = lines[i]; *p && bp < 1023; p++) buf[bp++] = *p;
-        if(bp < 1023) buf[bp++] = '\n';
+    /* 128 × 80 bytes fits comfortably in the editor's static buffer and
+     * in the 64KB RAM FS; no more silent 1KB truncation. */
+    int bp = 0;
+    for(int i = 0; i < line_count && bp < EDIT_IO_MAX - 1; i++) {
+        for(char* p = lines[i]; *p && bp < EDIT_IO_MAX - 1; p++)
+            io_buf[bp++] = *p;
+        if(bp < EDIT_IO_MAX - 1) io_buf[bp++] = '\n';
     }
-    buf[bp] = 0;
-    fs_write(fd, buf, bp);
+    io_buf[bp] = 0;
+    fs_write(fd, io_buf, bp);
     modified = 0;
 }
 
 static void load_file(const char* fn) {
     int fd = fs_open(fn);
     if(fd < 0) return;
-    char buf[1024];
-    int len = fs_read(fd, buf, 1023);
-    buf[len] = '\0';
+    int len = fs_read(fd, io_buf, EDIT_IO_MAX - 1);
+    if(len < 0) len = 0;
+    io_buf[len] = '\0';
 
     /* Parse into lines */
-    line_count = 0; cursor_x = 0; cursor_y = 0;
+    line_count = 0; cursor_x = 0; cursor_y = 0; scroll_top = 0;
     int lx = 0;
-    for(int i = 0; i < len && line_count < 128; i++) {
-        if(buf[i] == '\n') {
+    for(int i = 0; i < len && line_count < EDIT_MAX_LINES; i++) {
+        if(io_buf[i] == '\n') {
             lines[line_count][lx] = '\0';
             line_count++;
             lx = 0;
         } else if(lx < EDIT_COLS) {
-            lines[line_count][lx++] = buf[i];
+            lines[line_count][lx++] = io_buf[i];
         }
     }
-    if(lx > 0 && line_count < 128) {
+    if(lx > 0 && line_count < EDIT_MAX_LINES) {
         lines[line_count][lx] = '\0';
         line_count++;
     }
@@ -169,6 +181,7 @@ void editor_run(const char* fn) {
     }
 
     vga_clear();
+    vga_hide_cursor();   /* the highlighted cell is the editor cursor */
     draw_status();
     draw_help();
     draw_content();
@@ -193,7 +206,7 @@ void editor_run(const char* fn) {
             draw_content(); draw_status(); continue; }
 
         switch((unsigned char)c) {
-        case KEY_ESC: vga_clear(); return;
+        case KEY_ESC: vga_show_cursor(); vga_clear(); return;
         case '\n': case '\r':
             if(line_count < 128) {
                 /* Split line at cursor */
@@ -217,6 +230,18 @@ void editor_run(const char* fn) {
         case KEY_RIGHT: if(lines[cursor_y][cursor_x]) cursor_x++; else if(cursor_y < line_count-1) { cursor_y++; cursor_x = 0; } break;
         case KEY_HOME: cursor_x = 0; break;
         case KEY_END:  { int ln = 0; while(lines[cursor_y][ln]) ln++; cursor_x = ln; } break;
+        case KEY_PAGEUP: {
+            cursor_y -= EDIT_ROWS;
+            if(cursor_y < 0) cursor_y = 0;
+            int ln = 0; while(lines[cursor_y][ln]) ln++;
+            if(cursor_x > ln) cursor_x = ln;
+        } break;
+        case KEY_PAGEDOWN: {
+            cursor_y += EDIT_ROWS;
+            if(cursor_y >= line_count) cursor_y = line_count - 1;
+            int ln = 0; while(lines[cursor_y][ln]) ln++;
+            if(cursor_x > ln) cursor_x = ln;
+        } break;
         case KEY_DELETE: del_at_cursor(); break;
         case '\t': for(int i = 0; i < 4; i++) ins_at_cursor(' '); break;
         default: if(c >= ' ' && c < 127) ins_at_cursor(c); break;

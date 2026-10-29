@@ -1,6 +1,7 @@
 #include "isr.h"
 #include "vga.h"
 #include "serial.h"
+#include "user.h"
 
 const char* exception_names[32] = {
     "Division By Zero",
@@ -50,6 +51,12 @@ static const char* hex32(uint32_t n, char* buf) {
 }
 
 void isr_handler(registers_t* regs) {
+    /* A fault raised by a Ring3 process kills the process, not the kernel.
+     * (Kernel-mode faults still take the fatal path below.) */
+    if ((regs->cs & 3) == 3 && user_is_active()) {
+        user_handle_fault(regs);   /* never returns */
+    }
+
     /* Exceptions are fatal: print state (VGA + serial) and halt.
      * Serial copy keeps the dump in a file for post-mortem analysis. */
     char head[80];
