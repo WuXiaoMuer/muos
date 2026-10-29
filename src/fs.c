@@ -1,5 +1,6 @@
 #include "fs.h"
 #include "string.h"
+#include "rtc.h"
 
 static fs_file_t files[FS_MAX_FILES];
 
@@ -8,6 +9,7 @@ void fs_init(void) {
         files[i].used = 0;
         files[i].size = 0;
         files[i].name[0] = '\0';
+        files[i].atime = files[i].mtime = files[i].ctime = 0;
     }
 }
 
@@ -24,6 +26,7 @@ int fs_create(const char* name) {
             files[i].name[FS_MAX_NAME - 1] = '\0';
             files[i].size = 0;
             files[i].used = 1;
+            files[i].atime = files[i].mtime = files[i].ctime = rtc_now();
             return i;
         }
     }
@@ -35,6 +38,7 @@ int fs_write(int fd, const char* data, uint32_t len) {
     if (len > FS_MAX_SIZE) len = FS_MAX_SIZE;
     memcpy(files[fd].data, data, len);
     files[fd].size = len;
+    files[fd].mtime = files[fd].ctime = rtc_now();
     return (int)len;
 }
 
@@ -43,6 +47,7 @@ int fs_read(int fd, char* buf, uint32_t maxlen) {
     uint32_t n = files[fd].size;
     if (n > maxlen) n = maxlen;
     memcpy(buf, files[fd].data, n);
+    files[fd].atime = rtc_now();
     return (int)n;
 }
 
@@ -52,6 +57,7 @@ int fs_delete(const char* name) {
             files[i].used = 0;
             files[i].size = 0;
             files[i].name[0] = '\0';
+            files[i].atime = files[i].mtime = files[i].ctime = 0;
             return 0;
         }
     }
@@ -74,6 +80,7 @@ int fs_rename(int slot, const char* new_name) {
     }
     strncpy(files[slot].name, new_name, FS_MAX_NAME - 1);
     files[slot].name[FS_MAX_NAME - 1] = '\0';
+    files[slot].ctime = rtc_now();
     return 0;
 }
 
@@ -121,7 +128,30 @@ uint32_t fs_fd_size(int fd) {
 int fs_fd_truncate(int fd) {
     if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return -1;
     files[fd].size = 0;
+    files[fd].mtime = files[fd].ctime = rtc_now();
     return 0;
+}
+
+uint32_t fs_fd_atime(int fd) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return 0;
+    return files[fd].atime;
+}
+
+uint32_t fs_fd_mtime(int fd) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return 0;
+    return files[fd].mtime;
+}
+
+uint32_t fs_fd_ctime(int fd) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return 0;
+    return files[fd].ctime;
+}
+
+void fs_set_times(int fd, uint32_t atime, uint32_t mtime) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return;
+    files[fd].atime = atime;
+    files[fd].mtime = mtime;
+    files[fd].ctime = rtc_now();
 }
 
 int fs_read_at(int fd, uint32_t offset, char* buf, uint32_t len) {
@@ -130,6 +160,7 @@ int fs_read_at(int fd, uint32_t offset, char* buf, uint32_t len) {
     uint32_t n = files[fd].size - offset;
     if (n > len) n = len;
     memcpy(buf, files[fd].data + offset, n);
+    files[fd].atime = rtc_now();
     return (int)n;
 }
 
@@ -139,5 +170,6 @@ int fs_write_at(int fd, uint32_t offset, const char* data, uint32_t len) {
     if (len > FS_MAX_SIZE - offset) len = FS_MAX_SIZE - offset;
     if (len) memcpy(files[fd].data + offset, data, len);
     if (offset + len > files[fd].size) files[fd].size = offset + len;
+    files[fd].mtime = files[fd].ctime = rtc_now();
     return (int)len;
 }

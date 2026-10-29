@@ -9,6 +9,7 @@
 #include "mm.h"
 #include "pit.h"
 #include "task.h"
+#include "rtc.h"
 
 /* Linux i386 syscall numbers (the ABI MuOS targets). This is the starter
  * set needed by freestanding user programs; anything else is rejected
@@ -591,7 +592,8 @@ static void put_u64(char* b, uint32_t off, uint64_t v) { memcpy(b + off, &v, 8);
 
 /* Fill the i386 struct stat64 layout (96 bytes). */
 static void fill_stat64(char* st, uint32_t ino, uint32_t mode,
-                        uint32_t nlink, uint32_t size) {
+                        uint32_t nlink, uint32_t size,
+                        uint32_t atime, uint32_t mtime, uint32_t ctime) {
     memset(st, 0, STAT64_SIZE);
     put_u64(st, 0, 1);                 /* st_dev */
     put_u32(st, 12, ino);              /* legacy 32-bit inode */
@@ -603,12 +605,16 @@ static void fill_stat64(char* st, uint32_t ino, uint32_t mode,
     put_u64(st, 44, (uint64_t)size);   /* st_size */
     put_u32(st, 52, 4096);             /* st_blksize */
     put_u64(st, 56, ((uint64_t)size + 511) / 512);
+    put_u32(st, 64, atime);            /* atime */
+    put_u32(st, 72, mtime);            /* mtime */
+    put_u32(st, 80, ctime);            /* ctime */
     put_u64(st, 88, (uint64_t)ino);    /* st_ino */
 }
 
 /* Fill the legacy i386 struct stat layout (64 bytes). */
 static void fill_stat_old(char* st, uint32_t ino, uint32_t mode,
-                          uint32_t nlink, uint32_t size) {
+                          uint32_t nlink, uint32_t size,
+                          uint32_t atime, uint32_t mtime, uint32_t ctime) {
     memset(st, 0, STAT_OLD_SIZE);
     put_u16(st, 0, 1);                 /* st_dev */
     put_u32(st, 4, ino);
@@ -619,16 +625,24 @@ static void fill_stat_old(char* st, uint32_t ino, uint32_t mode,
     put_u32(st, 20, size);
     put_u32(st, 24, 4096);
     put_u32(st, 28, (size + 511) / 512);
+    put_u32(st, 32, atime);
+    put_u32(st, 40, mtime);
+    put_u32(st, 48, ctime);
 }
 
 static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
-                             uint32_t* mode, uint32_t* nlink, uint32_t* size) {
+                             uint32_t* mode, uint32_t* nlink, uint32_t* size,
+                             uint32_t* atime, uint32_t* mtime, uint32_t* ctime) {
+    uint32_t now = rtc_now();
     switch (e->type) {
         case VFS_T_FILE:
             *ino = (uint32_t)(e->slot + 3);
             *mode = S_IFREG | 0644;
             *nlink = 1;
             *size = fs_fd_size(e->slot);
+            *atime = fs_fd_atime(e->slot);
+            *mtime = fs_fd_mtime(e->slot);
+            *ctime = fs_fd_ctime(e->slot);
             return true;
         case VFS_T_DIR: {
             uint32_t base = 1;
@@ -639,6 +653,7 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
             *mode = S_IFDIR | 0755;
             *nlink = 2;
             *size = 0;
+            *atime = *mtime = *ctime = now;
             return true;
         }
         case VFS_T_DEV:
@@ -646,12 +661,14 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
             *mode = S_IFCHR | 0666;
             *nlink = 1;
             *size = 0;
+            *atime = *mtime = *ctime = now;
             return true;
         case VFS_T_VFILE:
             *ino = 300 + (uint32_t)e->id;
             *mode = S_IFREG | 0444;
             *nlink = 1;
             *size = vfs_vfile_size(e->id);
+            *atime = *mtime = *ctime = now;
             return true;
         default:
             return false;
@@ -659,8 +676,10 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
 }
 
 static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
-                            uint32_t* nlink, uint32_t* size) {
+                            uint32_t* nlink, uint32_t* size,
+                            uint32_t* atime, uint32_t* mtime, uint32_t* ctime) {
     int kind = user_fd_kind(fd);
+    uint32_t now = rtc_now();
     switch (kind) {
         case USER_FD_STDIN:
         case USER_FD_STDOUT:
@@ -669,6 +688,7 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
             *mode = S_IFCHR | 0666;
             *nlink = 1;
             *size = 0;
+            *atime = *mtime = *ctime = now;
             return true;
         case USER_FD_FILE: {
             int slot = user_fd_slot(fd);
@@ -677,6 +697,9 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
             *mode = S_IFREG | 0644;
             *nlink = 1;
             *size = fs_fd_size(slot);
+            *atime = fs_fd_atime(slot);
+            *mtime = fs_fd_mtime(slot);
+            *ctime = fs_fd_ctime(slot);
             return true;
         }
         case USER_FD_DIR: {
@@ -685,7 +708,7 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
             e.type = VFS_T_DIR;
             e.id = vfs_dir_id(user_fd_dir_path(fd));
             if (!e.id) return false;
-            return vfs_ent_fields(&e, ino, mode, nlink, size);
+            return vfs_ent_fields(&e, ino, mode, nlink, size, atime, mtime, ctime);
         }
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
@@ -694,12 +717,14 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
             *mode = S_IFCHR | 0666;
             *nlink = 1;
             *size = 0;
+            *atime = *mtime = *ctime = now;
             return true;
         case USER_FD_VFILE:
             *ino = 300;
             *mode = S_IFREG | 0444;
             *nlink = 1;
             *size = user_fd_vfile(fd, NULL);
+            *atime = *mtime = *ctime = now;
             return true;
         default:
             return false;
@@ -716,12 +741,13 @@ static uint32_t do_stat(uint32_t path_ptr, uint32_t st_ptr, bool_t is64) {
     uint32_t rc = vfs_lookup(buf, &e);
     if ((int32_t)rc < 0) return rc;
 
-    uint32_t ino, mode, nlink, size;
-    if (!vfs_ent_fields(&e, &ino, &mode, &nlink, &size)) return err(ERR_ENOENT);
+    uint32_t ino, mode, nlink, size, at, mt, ct;
+    if (!vfs_ent_fields(&e, &ino, &mode, &nlink, &size, &at, &mt, &ct))
+        return err(ERR_ENOENT);
 
     char st[STAT64_SIZE];
-    if (is64) fill_stat64(st, ino, mode, nlink, size);
-    else      fill_stat_old(st, ino, mode, nlink, size);
+    if (is64) fill_stat64(st, ino, mode, nlink, size, at, mt, ct);
+    else      fill_stat_old(st, ino, mode, nlink, size, at, mt, ct);
     memcpy((void*)st_ptr, st, is64 ? STAT64_SIZE : STAT_OLD_SIZE);
     return 0;
 }
@@ -730,19 +756,21 @@ static uint32_t do_fstat(uint32_t fd, uint32_t st_ptr, bool_t is64) {
     if (!user_ptr_ok(st_ptr, is64 ? STAT64_SIZE : STAT_OLD_SIZE))
         return err(ERR_EFAULT);
 
-    uint32_t ino, mode, nlink, size;
-    if (!vfs_fd_fields((int)fd, &ino, &mode, &nlink, &size)) return err(ERR_EBADF);
+    uint32_t ino, mode, nlink, size, at, mt, ct;
+    if (!vfs_fd_fields((int)fd, &ino, &mode, &nlink, &size, &at, &mt, &ct))
+        return err(ERR_EBADF);
 
     char st[STAT64_SIZE];
-    if (is64) fill_stat64(st, ino, mode, nlink, size);
-    else      fill_stat_old(st, ino, mode, nlink, size);
+    if (is64) fill_stat64(st, ino, mode, nlink, size, at, mt, ct);
+    else      fill_stat_old(st, ino, mode, nlink, size, at, mt, ct);
     memcpy((void*)st_ptr, st, is64 ? STAT64_SIZE : STAT_OLD_SIZE);
     return 0;
 }
 
 /* Fill the i386 struct statx (256 bytes) with basic stats. */
 static void fill_statx(char* st, uint32_t ino, uint32_t mode,
-                       uint32_t nlink, uint32_t size) {
+                       uint32_t nlink, uint32_t size,
+                       uint32_t atime, uint32_t mtime, uint32_t ctime) {
     memset(st, 0, STATX_SIZE);
     put_u32(st, 0, STATX_BASIC_STATS);   /* stx_mask */
     put_u32(st, 4, 4096);                /* stx_blksize */
@@ -753,6 +781,9 @@ static void fill_statx(char* st, uint32_t ino, uint32_t mode,
     put_u64(st, 32, (uint64_t)ino);
     put_u64(st, 40, (uint64_t)size);
     put_u64(st, 48, ((uint64_t)size + 511) / 512);
+    put_u64(st, 64, (uint64_t)atime);    /* stx_atime.sec */
+    put_u64(st, 96, (uint64_t)ctime);    /* stx_ctime.sec */
+    put_u64(st, 112, (uint64_t)mtime);   /* stx_mtime.sec */
 }
 
 /* statx(383): modern musl tries this before the stat64 family. An empty
@@ -763,20 +794,22 @@ static uint32_t do_statx(uint32_t dirfd, uint32_t path_ptr, uint32_t buf) {
     char path[128];
     if (!copy_user_string(path_ptr, path, sizeof(path))) return err(ERR_EFAULT);
 
-    uint32_t ino, mode, nlink, size;
+    uint32_t ino, mode, nlink, size, at, mt, ct;
     if (path[0] == '\0') {
         int fd = (int32_t)dirfd;
         if (fd < 0) return err(ERR_ENOENT);
-        if (!vfs_fd_fields(fd, &ino, &mode, &nlink, &size)) return err(ERR_EBADF);
+        if (!vfs_fd_fields(fd, &ino, &mode, &nlink, &size, &at, &mt, &ct))
+            return err(ERR_EBADF);
     } else {
         vfs_ent_t e;
         uint32_t rc = vfs_lookup(path, &e);
         if ((int32_t)rc < 0) return rc;
-        if (!vfs_ent_fields(&e, &ino, &mode, &nlink, &size)) return err(ERR_ENOENT);
+        if (!vfs_ent_fields(&e, &ino, &mode, &nlink, &size, &at, &mt, &ct))
+            return err(ERR_ENOENT);
     }
 
     char st[STATX_SIZE];
-    fill_statx(st, ino, mode, nlink, size);
+    fill_statx(st, ino, mode, nlink, size, at, mt, ct);
     memcpy((void*)buf, st, STATX_SIZE);
     return 0;
 }
@@ -1096,19 +1129,52 @@ static uint32_t do_rename(uint32_t old_ptr, uint32_t new_ptr) {
     return fs_rename(oe.slot, nname) == 0 ? 0 : err(ERR_EINVAL);
 }
 
-/* utimes/futimesat/utimensat: the RAM FS stores no timestamps, but the
- * path must exist so tools behave like they do on Linux. */
-static uint32_t do_utime_path(uint32_t path_ptr, int fd) {
+/* utimes/futimesat/utimensat update the RAM FS timestamps. The time array
+ * is either 2x timeval (usec) or 2x timespec (nsec, with UTIME_NOW/OMIT). */
+#define UTIME_NOW  0x3FFFFFFFu
+#define UTIME_OMIT 0x3FFFFFFEu
+
+static uint32_t do_utime_path(uint32_t path_ptr, int fd, uint32_t times_ptr,
+                              bool_t ns) {
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
 
+    int slot = -1;
     if (buf[0] == '\0') {
         if (fd < 0) return err(ERR_ENOENT);
-        return user_fd_kind(fd) >= 0 ? 0 : err(ERR_EBADF);
+        if (user_fd_kind(fd) < 0) return err(ERR_EBADF);
+        slot = user_fd_slot(fd);            /* -1 for dirs/devices/vfiles */
+    } else {
+        vfs_ent_t e;
+        uint32_t rc = vfs_lookup(buf, &e);
+        if ((int32_t)rc < 0) return rc;
+        if (e.type == VFS_T_FILE) slot = e.slot;
     }
 
-    vfs_ent_t e;
-    return vfs_lookup(buf, &e);
+    uint32_t now = rtc_now();
+    if (!times_ptr) {
+        if (slot >= 0) fs_set_times(slot, now, now);
+        return 0;
+    }
+    if (!user_ptr_ok(times_ptr, 16)) return err(ERR_EFAULT);
+
+    uint32_t asec, ans, msec, mns;
+    memcpy(&asec, (const void*)times_ptr, 4);
+    memcpy(&ans, (const void*)(times_ptr + 4), 4);
+    memcpy(&msec, (const void*)(times_ptr + 8), 4);
+    memcpy(&mns, (const void*)(times_ptr + 12), 4);
+
+    if (slot < 0) return 0;                 /* timestamps ignored for non-files */
+
+    uint32_t atime = asec, mtime = msec;
+    if (ns) {
+        if (ans == UTIME_NOW) atime = now;
+        else if (ans == UTIME_OMIT) atime = fs_fd_atime(slot);
+        if (mns == UTIME_NOW) mtime = now;
+        else if (mns == UTIME_OMIT) mtime = fs_fd_mtime(slot);
+    }
+    fs_set_times(slot, atime, mtime);
+    return 0;
 }
 
 static uint32_t do_getcwd(uint32_t buf, uint32_t size) {
@@ -1163,12 +1229,14 @@ static uint32_t do_readv(uint32_t fd, uint32_t iov_ptr, uint32_t count) {
     return total;
 }
 
-/* No RTC-backed wall clock yet: report the epoch (1970) deterministically.
- * clk_id is ignored; all clocks read the same counter. */
+/* Wall clock comes from CMOS; sub-second detail is derived from PIT ticks
+ * (100Hz -> 10ms granularity). CLOCK_MONOTONIC* uses uptime instead. */
 static uint32_t do_gettimeofday(uint32_t tv, uint32_t tz) {
+    uint32_t ticks = pit_get_ticks();
     if (tv) {
         if (!user_ptr_ok(tv, 8)) return err(ERR_EFAULT);
-        memset((void*)tv, 0, 8);
+        put_u32((char*)tv, 0, rtc_now());
+        put_u32((char*)tv, 4, (ticks % 100) * 10000u);
     }
     if (tz) {
         if (!user_ptr_ok(tz, 8)) return err(ERR_EFAULT);
@@ -1177,10 +1245,26 @@ static uint32_t do_gettimeofday(uint32_t tv, uint32_t tz) {
     return 0;
 }
 
-static uint32_t do_clock_gettime(uint32_t ts, uint32_t struct_size) {
+static uint32_t do_clock_gettime(uint32_t clockid, uint32_t ts,
+                                 uint32_t struct_size) {
     if (!ts) return err(ERR_EFAULT);
     if (!user_ptr_ok(ts, struct_size)) return err(ERR_EFAULT);
-    memset((void*)ts, 0, struct_size);
+
+    uint32_t ticks = pit_get_ticks();
+    uint32_t sec, nsec = (ticks % 100) * 10000000u;
+    if (clockid == 1 || clockid == 4) {          /* MONOTONIC / MONOTONIC_RAW */
+        sec = ticks / 100;
+    } else {
+        sec = rtc_now();
+    }
+
+    if (struct_size == 16) {
+        put_u64((char*)ts, 0, (uint64_t)sec);
+        put_u64((char*)ts, 8, (uint64_t)nsec);
+    } else {
+        put_u32((char*)ts, 0, sec);
+        put_u32((char*)ts, 4, nsec);
+    }
     return 0;
 }
 
@@ -1305,11 +1389,13 @@ void syscall_handler(registers_t* regs) {
             ret = do_rename(regs->ebx, regs->ecx);
             break;
         case SYS_utimes:
-            ret = do_utime_path(regs->ebx, -1);
+            ret = do_utime_path(regs->ebx, -1, regs->ecx, false);
             break;
         case SYS_futimesat:
+            ret = do_utime_path(regs->ecx, (int)regs->ebx, regs->edx, false);
+            break;
         case SYS_utimensat:
-            ret = do_utime_path(regs->ecx, (int)regs->ebx);
+            ret = do_utime_path(regs->ecx, (int)regs->ebx, regs->edx, true);
             break;
         case SYS_lseek:
             ret = do_lseek(regs->ebx, regs->ecx, regs->edx);
@@ -1384,16 +1470,16 @@ void syscall_handler(registers_t* regs) {
             ret = do_writev(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_time:
-            ret = 0;
+            ret = rtc_now();
             break;
         case SYS_gettimeofday:
             ret = do_gettimeofday(regs->ebx, regs->ecx);
             break;
         case SYS_clock_gettime:
-            ret = do_clock_gettime(regs->ecx, 8);
+            ret = do_clock_gettime(regs->ebx, regs->ecx, 8);
             break;
         case SYS_clock_gettime64:
-            ret = do_clock_gettime(regs->ecx, 16);
+            ret = do_clock_gettime(regs->ebx, regs->ecx, 16);
             break;
         case SYS_sendfile:
         case SYS_sendfile64:

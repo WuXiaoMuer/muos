@@ -1,6 +1,6 @@
 # MuOS 代码逻辑(v1.2)
 
-本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、66 项自检。演进计划见 ROADMAP.md。
+本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、72 项自检。演进计划见 ROADMAP.md。
 
 ## 一、总体结构
 
@@ -51,7 +51,7 @@ serial → vga → GDT → IDT(256 项)→ PIC(重映射+全屏蔽)
 → tss_init()                      [TSS + 8KB Ring0 入口栈 + ltr]
 → PIT 100Hz + IRQ0 → keyboard → mouse(8042 aux / IRQ12)
 → task_init + task_register("kernel")
-→ tests_run()                     [66 项自检,失败打印 SELF-TEST FAILED]
+→ tests_run()                     [72 项自检,失败打印 SELF-TEST FAILED]
 → 启动动画 → shell_run()(内核栈上)
 ```
 
@@ -151,13 +151,14 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 - 路径解析 `vfs_normalize`:以进程 cwd(`user_cwd_get/set`,启动时 `/`)为基准处理绝对/相对路径、`.`、`..`(越界停在 `/`),输出规范绝对路径。命名空间:`/` 是 RAM FS(仅单段文件名),另有虚拟 `/dev`、`/proc`、`/etc`。
 - 虚拟文件:`/dev/null` 读 EOF/写丢弃,`/dev/zero` 读零/写丢弃,`/dev/console` 接键盘与 VGA+串口;`/proc/{meminfo,uptime,version,cpuinfo,mounts}` 与 `/etc/mtab` 在 `open` 时由内核生成快照存入 fd,`/proc/meminfo` 取 mm 页统计,`uptime` 取 PIT 100Hz。
 - `getdents/getdents64` 按目录 fd 的绝对路径枚举 `.`、`..`、RAM FS 文件以及 `dev/proc/etc` 虚拟子目录,分别按 i386 `linux_dirent`(10 字节头)与 `linux_dirent64`(19 字节头)打包;`d_off` 写下一项序号,缓冲区不足时保留偏移。
-- `stat` 族:`stat64` 写 96 字节 i386 布局,旧 `stat` 写 64 字节布局;目录 `S_IFDIR|0755`/nlink 2,文件 `S_IFREG|0644`,设备 `S_IFCHR|0666`,`/proc` 快照 `S_IFREG|0444`,`st_dev=1`。`statx(383)` 写 256 字节 `struct statx`(mask=STATX_BASIC_STATS),空路径且 `AT_EMPTY_PATH` 时改为 stat dirfd。
+- `stat` 族:`stat64` 写 96 字节 i386 布局,旧 `stat` 写 64 字节布局;目录 `S_IFDIR|0755`/nlink 2,文件 `S_IFREG|0644`,设备 `S_IFCHR|0666`,`/proc` 快照 `S_IFREG|0444`,`st_dev=1`;三类时间来自 RAM FS 的 atime/mtime/ctime。`statx(383)` 写 256 字节 `struct statx`(mask=STATX_BASIC_STATS),空路径且 `AT_EMPTY_PATH` 时改为 stat dirfd。
 - `statfs/fstatfs(99/100)` 与 `statfs64/fstatfs64(268/269)` 按 16×64KB 容量与空闲槽位填充,`df`/`stat -f` 可用;`sysinfo(116)` 回报 uptime/内存/任务数。`/proc/mounts` 输出 `/dev/root / ext2` 等真实设备行,BusyBox `df` 会跳过 `rootfs` 伪设备。
 - `write/read` 按 fd 类型分发:`STDIN`/`DEV_CONSOLE` 读复用 `keyboard_getchar`(内部 `sti; hlt; cli`),`STDOUT/STDERR/DEV_CONSOLE` 写 VGA+串口,`FILE` 走 `fs_read_at/fs_write_at`,`VFILE` 读内核快照、写返回 EACCES,`DEV_NULL/DEV_ZERO` 分别 EOF/零填充与丢弃写入。所有用户缓冲区先用 `user_ptr_ok` 校验。
 - `writev/readv` 按 iovec 顺序复用 `do_write/do_read`,部分成功时返回已处理字节数。musl 的 stdio 缓冲正是用 `writev` 刷出——这是 BusyBox `ls` 能打印的关键。
 - `sendfile64(239)` 从 in_fd(可选用户 offset 指针)读入内核缓冲并写 out_fd,更新偏移;BusyBox 的 fd 拷贝优先用它,失败再退回 read/write。
 - `brk` 与匿名 `mmap` 共用沙箱 bump 指针:brk 只改 `brk_current`(页早已映射),mmap 按页对齐分配并清零;文件映射、`MAP_FIXED` 拒绝。`munmap/mprotect` 是空操作(平坦沙箱)。
-- `uname` 按 Linux i386 的 6×65 字节 utsname 填充 MuOS/muos/1.2.0/i386;`unlink/rename` 真正修改 RAM FS,`utimes` 族只校验路径后返回成功(FS 不存时间戳)。
+- `uname` 按 Linux i386 的 6×65 字节 utsname 填充 MuOS/muos/1.2.0/i386;`unlink/rename` 真正修改 RAM FS;`utimes/futimesat/utimensat` 会写入 atime/mtime(支持 `UTIME_NOW/OMIT`),`fs_set_times` 同时刷新 ctime。
+- 时钟:CMOS RTC 读出完整年月日(处理 BCD/12h/世纪寄存器),`rtc_datetime_to_epoch` 用 civil-days 算法换算 UTC 秒;`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)` 返回真实 epoch,monotonic 时钟用 PIT ticks,亚秒精度 10ms。
 
 ### 7.4 ELF32 加载器(elf.c)
 
@@ -225,7 +226,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 2. 系统调用仍缺进程/并发原语:`fork/clone/waitpid/signals/pipe/execve/mkdir` 与文件 mmap 均未实现;`/proc` 只有静态文件,没有 `/proc/<pid>`,因此 `ps` 不可用(ROADMAP 阶段 2/4)
 3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;BusyBox 的 `ls/cat/free/df/dd` 已跑通,但还不能 fork+execve 运行子进程,也没有管道/多级目录/磁盘
 4. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
-5. fs 无句柄保护、无目录层级/时间戳/持久化;write 截断不告警;`/dev`、`/proc`、`/etc` 为只读虚拟层
+5. fs 无句柄保护、无目录层级/持久化;时间戳仅存于 RAM FS,重启丢失;write 截断不告警;`/dev`、`/proc`、`/etc` 为只读虚拟层
 6. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
 7. 桌面仍是 80×25 文本模式,无图形帧缓冲、字体渲染与动画;窗口内容除 Calculator 外主要是状态展示
 8. 单处理器(PIC,非 APIC);内核仍是协作式单任务

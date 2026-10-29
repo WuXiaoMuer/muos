@@ -17,7 +17,7 @@
 - [x] 内核堆 kmalloc/kfree/kcalloc
 - [x] 调度器死代码清理,task_t 入堆;IDT 256 项全覆盖(0x80 现为系统调用门)
 - [x] 公共字符串库(标准名,防 freestanding 隐式调用链接失败)
-- [x] 键盘/中断 EFLAGS 纪律;自检套件扩到 46 项(含 >4MB 分页、堆、mmap;当前 66 项)
+- [x] 键盘/中断 EFLAGS 纪律;自检套件扩到 46 项(含 >4MB 分页、堆、mmap;当前 72 项)
 - [x] ISO 启动路径修复(入口=镜像首字节);构建脚本零硬编码路径
 
 ## 阶段 1:内核与用户态隔离(基本完成)
@@ -76,8 +76,8 @@
 - [x] errno 起步对齐(EBADF/EFAULT/EINVAL/ENOENT/ENOTDIR/EISDIR/ENOMEM/ENOSYS 等);`uname` 已回报 MuOS/muos/i386
 - [x] `stat` 族返回 MuOS 假 identity:根目录 `S_IFDIR|0755`、文件 `S_IFREG|0644`、`st_dev=1`、块大小/块数按 64KB 文件计算
 - [ ] errno 与 Linux 做一次全量审计(尤其 `statx` flags/mask 与 `sendfile` 边界)
-- [x] RTC 读取(CMOS,桌面任务栏时钟)与 `time(13)`/`gettimeofday(78)`/`clock_gettime(265/403)` 系统调用(统一返回 epoch,布局正确)
-- [ ] RTC → epoch 换算,让 `time/gettimeofday/clock_gettime` 返回真实秒数(需 CMOS 年月日 + 闰年换算)
+- [x] RTC 读取(CMOS,桌面任务栏时钟);`time(13)`/`gettimeofday(78)`/`clock_gettime(265/403)` 返回真实 UTC epoch
+- [x] RTC → epoch 换算(CMOS 年月日 + 世纪寄存器 + 闰年 civil-days 算法),RAM FS 记录 atime/mtime/ctime,`date/ls -l/stat/touch` 显示真实时间
 - [ ] a.out/ELF 的零页(empty bad-address page,0x08048000 之前不可映射)与地址布局兼容
 - [x] 方法学落地:每个真实二进制暴露的缺失 syscall 即刻补齐,串口只记录一次未知号;本轮 BusyBox 已驱动出完整 VFS 元数据面与 `/dev`/`/proc` 基础
 - 验收:`echo/ls/cat/free/df/dd` 已通过;下一步以 `sh -c`、管道、`ps` 暴露的 `fork/pipe/proc` 需求作为清单

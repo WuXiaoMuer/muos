@@ -10,7 +10,7 @@
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`
 - **RAM 文件系统**:16 槽 × 64KB(足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
-- **66 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
+- **72 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
 
 演进目标见 **[ROADMAP.md](ROADMAP.md)**:以 Linux ABI 兼容(int 0x80 + ELF32,运行静态 i386 Linux 二进制)为主线;NT/Win32 兼容为长期远景。
 
@@ -168,7 +168,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 注意:
 - BusyBox 静态包约 1MB,OS 模块只接受外部 `-initrd`,不放进 64KB RAM FS。
 - RAM FS 仍无子目录;虚拟 `/dev`、`/proc`、`/etc` 是只读最小实现:`/proc` 没有 `/<pid>` 目录,所以 `ps` 仍不可用;`mkdir/rmdir`、`pipe`、`fork/execve` 未实现,管道与交互式 `sh` 尚不可用。
-- 文件时间戳未持久化,`ls -l`/`stat` 显示 1970-01-01;`touch`/`utimensat` 只校验路径后返回成功。
+- 时间戳来自 CMOS RTC 并保存在 RAM FS 内,重启后随 RAM FS 一起丢失;`date`/`ls -l`/`stat` 显示真实时间,`touch`/`utimensat` 会实际修改 atime/mtime。
 - 首次运行会分配 257 页连续内存做模块副本;256MB 内存下正常。
 
 ## 自检套件
@@ -182,6 +182,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 - fs / vga / keyboard / pit / task
 - RAM FS 偏移 API:write_at 追加、fd size、read_at 偏移校验、truncate
 - RAM FS 重命名:改名后旧名消失、新名指向同槽、重名被拒绝、内容保留
+- 时间:1970-01-01 / 2000-03-01(闰年)/ 2026-10-29 的 epoch 换算,以及 FS atime/mtime/ctime
 - 内嵌 ELF:存在性、ELF32/i386/ET_EXEC 头校验、入口点位于用户沙箱
 
 ## 踩坑备忘
@@ -219,9 +220,9 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 当前 **v1.2**:在 v1.1(mmap 解析、全 RAM 恒等映射、内核堆、寄存器布局修复)基础上加入 Ring3 用户态、TSS、Linux i386 `int 0x80` 调用、ELF32 加载器与 RAM FS 16×64KB,支持 `run`(内嵌 ELF)/`exec hello.elf`(FS ELF)、文件 fd(open/close/lseek/read/write)、`uname` 与匿名 `mmap`。首个用户 C 程序 `user/hello.c` 可由 `run` 或 `exec hello.elf` 启动。
 
-桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 66 项)。
+桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 72 项)。
 
-**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过。下一步:`fork/execve/pipe`、`/proc/<pid>`(ps)、多级目录与 RTC 时间戳。
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间。下一步:`fork/execve/pipe`、`/proc/<pid>`(ps)、多级目录。
 
 ## 参考资源
 

@@ -11,6 +11,7 @@
 #include "string.h"
 #include "elf.h"
 #include "user.h"
+#include "rtc.h"
 
 /* ANSI-ish helpers */
 #define OK  "[PASS] "
@@ -283,6 +284,31 @@ static void test_fs_rename(void) {
     CHECK(fs_count() == n0, "rename cleanup restores file count");
 }
 
+/* ---------- RTC epoch and FS timestamps ---------- */
+static void test_time(void) {
+    rtc_datetime_t dt;
+
+    dt.year = 1970; dt.month = 1; dt.day = 1;
+    dt.hour = 0; dt.minute = 0; dt.second = 0;
+    CHECK(rtc_datetime_to_epoch(&dt) == 0, "epoch 1970-01-01 is 0");
+
+    dt.year = 2000; dt.month = 3; dt.day = 1;
+    CHECK(rtc_datetime_to_epoch(&dt) == 951868800u, "epoch handles leap years");
+
+    dt.year = 2026; dt.month = 10; dt.day = 29;
+    CHECK(rtc_datetime_to_epoch(&dt) == 1793232000u, "epoch matches 2026-10-29");
+
+    int fd = fs_create("__test_time");
+    CHECK(fd >= 0, "fs_create for timestamp test");
+    if (fd < 0) return;
+
+    fs_set_times(fd, 123456789u, 987654321u);
+    CHECK(fs_fd_atime(fd) == 123456789u && fs_fd_mtime(fd) == 987654321u,
+          "fs stores explicit atime/mtime");
+    CHECK(fs_fd_ctime(fd) > 0, "fs_set_times bumps ctime");
+    fs_delete("__test_time");
+}
+
 /* ---------- Embedded Ring3 image ---------- */
 static void test_user_image(void) {
     uint32_t size = 0;
@@ -324,6 +350,7 @@ int tests_run(void) {
     test_fs();
     test_fs_offsets();
     test_fs_rename();
+    test_time();
     test_vga();
     test_keyboard();
     test_pit();
