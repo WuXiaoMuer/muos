@@ -12,6 +12,7 @@
 #include "elf.h"
 #include "user.h"
 #include "rtc.h"
+#include "proc.h"
 
 /* ANSI-ish helpers */
 #define OK  "[PASS] "
@@ -309,6 +310,23 @@ static void test_time(void) {
     fs_delete("__test_time");
 }
 
+/* ---------- Process table ---------- */
+static void test_proc(void) {
+    int n0 = proc_count();
+
+    proc_t* a = proc_alloc("__p1", 1);
+    CHECK(a && a->pid > 1, "proc_alloc assigns a user pid");
+    if (!a) return;
+
+    proc_t* b = proc_alloc("__p2", a->pid);
+    CHECK(b && b->ppid == a->pid, "proc child records ppid");
+    CHECK(proc_find(a->pid) == a, "proc_find locates pid");
+
+    proc_reap(b);
+    proc_reap(a);
+    CHECK(proc_count() == n0, "proc_reap frees process slots");
+}
+
 /* ---------- Embedded Ring3 image ---------- */
 static void test_user_image(void) {
     uint32_t size = 0;
@@ -329,6 +347,11 @@ static void test_user_image(void) {
 
     CHECK(eh.e_entry >= USER_BASE && eh.e_entry < USER_END,
           "user entry point inside sandbox");
+
+    uint32_t v_entry = 0, v_end = 0;
+    CHECK(elf32_validate(img, size, USER_BASE, USER_END - USER_STACK_RESERVE,
+                         &v_entry, &v_end) == 0,
+          "elf32_validate accepts embedded image");
 }
 
 int tests_run(void) {
@@ -351,6 +374,7 @@ int tests_run(void) {
     test_fs_offsets();
     test_fs_rename();
     test_time();
+    test_proc();
     test_vga();
     test_keyboard();
     test_pit();

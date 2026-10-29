@@ -65,6 +65,31 @@ void     user_fd_close(int fd);
 const char* user_cwd_get(void);
 bool_t   user_cwd_set(const char* path);
 
+/* ---- process state save/restore (sequential fork model) ---- */
+uint32_t user_fd_state_bytes(void);
+void     user_fd_state_save(void* dst);
+void     user_fd_state_restore(const void* src);
+void     user_get_brk_state(uint32_t* base, uint32_t* cur);
+bool_t   user_restore_brk_state(uint32_t base, uint32_t cur);
+int      user_last_exit_code(void);
+bool_t   user_last_faulted(void);
+void     user_clear_exit_state(void);
+void     user_set_active(bool_t v);
+
+/* Load/replace the current process image (execve). Keeps fds and cwd. */
+int      user_exec_image(const void* image, uint32_t size, int argc,
+                         const char* const* argv,
+                         uint32_t* entry_out, uint32_t* sp_out);
+
+/* Saved kernel ESP of the outer user_enter(); nested entries save/restore
+ * it around user_enter_regs. */
+extern uint32_t user_kernel_esp_save;
+
+/* Enter Ring3 with a full register set (child after fork). */
+void user_enter_regs(uint32_t entry, uint32_t user_sp, uint32_t eax,
+                     uint32_t ebx, uint32_t ecx, uint32_t edx,
+                     uint32_t esi, uint32_t edi, uint32_t ebp);
+
 /* Anonymous mmap arena: page-granular bump inside the sandbox.
  * Returns 0 when the request does not fit. */
 uint32_t user_mmap_anon(uint32_t len);

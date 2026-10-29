@@ -49,4 +49,9 @@ int elf32_load(const void* image, uint32_t image_size,
                uint32_t load_base, uint32_t load_limit,
                uint32_t* entry_out, uint32_t* end_out);
 
+/* Header/segment range validation without writing memory (execve precheck). */
+int elf32_validate(const void* image, uint32_t image_size,
+                   uint32_t load_base, uint32_t load_limit,
+                   uint32_t* entry_out, uint32_t* end_out);
+
 #endif

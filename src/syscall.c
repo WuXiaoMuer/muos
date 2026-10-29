@@ -10,17 +10,23 @@
 #include "pit.h"
 #include "task.h"
 #include "rtc.h"
+#include "proc.h"
+#include "tss.h"
+#include "elf.h"
 
 /* Linux i386 syscall numbers (the ABI MuOS targets). This is the starter
  * set needed by freestanding user programs; anything else is rejected
  * with -ENOSYS and logged to serial so real binaries can drive the TODO
  * list (see ROADMAP stage 4). */
 #define SYS_exit       1
+#define SYS_fork       2
 #define SYS_read       3
 #define SYS_write      4
 #define SYS_open       5
 #define SYS_close      6
+#define SYS_waitpid    7
 #define SYS_unlink    10
+#define SYS_execve    11
 #define SYS_chdir     12
 #define SYS_time      13
 #define SYS_lseek     19
@@ -43,6 +49,7 @@
 #define SYS_sysinfo  116
 #define SYS_getgroups 80
 #define SYS_gettimeofday 78
+#define SYS_wait4    114
 #define SYS_stat     106
 #define SYS_lstat    107
 #define SYS_fstat    108
@@ -87,7 +94,10 @@
 
 #define ERR_EPERM      1
 #define ERR_ENOENT     2
+#define ERR_ENOEXEC    8
 #define ERR_EBADF      9
+#define ERR_ECHILD    10
+#define ERR_EAGAIN    11
 #define ERR_EACCES    13
 #define ERR_ENOMEM    12
 #define ERR_EFAULT    14
@@ -246,6 +256,7 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
 #define VFS_DIR_DEV  2
 #define VFS_DIR_PROC 3
 #define VFS_DIR_ETC  4
+#define VFS_DIR_PID  5
 
 #define VFS_DEV_NULL    1
 #define VFS_DEV_ZERO    2
@@ -257,11 +268,16 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
 #define VFS_VF_CPUINFO 4
 #define VFS_VF_MOUNTS  5
 #define VFS_VF_MTAB    6
+#define VFS_VF_PID_STAT    7
+#define VFS_VF_PID_STATUS  8
+#define VFS_VF_PID_CMDLINE 9
+#define VFS_VF_PID_COMM    10
 
 typedef struct {
     int  type;
     int  slot;       /* VFS_T_FILE */
     int  id;         /* directory / device / proc-file id */
+    uint32_t pid;    /* VFS_DIR_PID / VFS_VF_PID_* */
     char path[USER_FD_PATH_MAX];
 } vfs_ent_t;
 
@@ -332,6 +348,33 @@ static int vfs_proc_file_id(const char* name) {
     return 0;
 }
 
+static int vfs_proc_pid_file_id(const char* name) {
+    if (strcmp(name, "stat") == 0) return VFS_VF_PID_STAT;
+    if (strcmp(name, "status") == 0) return VFS_VF_PID_STATUS;
+    if (strcmp(name, "cmdline") == 0) return VFS_VF_PID_CMDLINE;
+    if (strcmp(name, "comm") == 0) return VFS_VF_PID_COMM;
+    return 0;
+}
+
+/* "/proc/self" resolves to the running process; other names must be digits. */
+static bool_t vfs_parse_pid_token(const char* s, uint32_t* out) {
+    if (strcmp(s, "self") == 0) {
+        proc_t* p = proc_current();
+        if (!p) return false;
+        *out = p->pid;
+        return true;
+    }
+    if (!*s) return false;
+    uint32_t v = 0;
+    for (const char* p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        v = v * 10u + (uint32_t)(*p - '0');
+    }
+    if (v == 0) return false;
+    *out = v;
+    return true;
+}
+
 static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
     memset(e, 0, sizeof(*e));
     uint32_t rc = vfs_normalize(in, e->path, USER_FD_PATH_MAX);
@@ -352,11 +395,42 @@ static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
     }
     if (strncmp(e->path, "/proc/", 6) == 0) {
         const char* n = e->path + 6;
-        if (has_slash(n)) return err(ERR_ENOENT);
-        int id = vfs_proc_file_id(n);
-        if (!id) return err(ERR_ENOENT);
+        if (!has_slash(n)) {
+            int id = vfs_proc_file_id(n);
+            if (id) {
+                e->type = VFS_T_VFILE;
+                e->id = id;
+                return 0;
+            }
+            uint32_t pid = 0;
+            if (vfs_parse_pid_token(n, &pid) && proc_find(pid)) {
+                e->type = VFS_T_DIR;
+                e->id = VFS_DIR_PID;
+                e->pid = pid;
+                return 0;
+            }
+            return err(ERR_ENOENT);
+        }
+
+        const char* slash = n;
+        while (*slash && *slash != '/') slash++;
+        uint32_t tok_len = (uint32_t)(slash - n);
+        if (tok_len == 0 || tok_len >= 16) return err(ERR_ENOENT);
+        char token[16];
+        memcpy(token, n, tok_len);
+        token[tok_len] = '\0';
+
+        uint32_t pid = 0;
+        if (!vfs_parse_pid_token(token, &pid) || !proc_find(pid))
+            return err(ERR_ENOENT);
+
+        const char* fname = slash + 1;
+        if (has_slash(fname)) return err(ERR_ENOENT);
+        int fid = vfs_proc_pid_file_id(fname);
+        if (!fid) return err(ERR_ENOENT);
         e->type = VFS_T_VFILE;
-        e->id = id;
+        e->id = fid;
+        e->pid = pid;
         return 0;
     }
     if (strncmp(e->path, "/etc/", 5) == 0) {
@@ -397,7 +471,7 @@ static uint32_t sb_dec02(char* b, uint32_t pos, uint32_t max, uint32_t v) {
     return sb_dec(b, pos, max, v);
 }
 
-static uint32_t vfs_vfile_text(int id, char* out, uint32_t max) {
+static uint32_t vfs_vfile_text(int id, uint32_t pid, char* out, uint32_t max) {
     uint32_t pos = 0;
     out[0] = '\0';
 
@@ -441,15 +515,70 @@ static uint32_t vfs_vfile_text(int id, char* out, uint32_t max) {
                          "proc /proc proc rw 0 0\n"
                          "devtmpfs /dev devtmpfs rw 0 0\n");
             break;
+        case VFS_VF_PID_STAT: {
+            proc_t* p = proc_find(pid);
+            if (!p) break;
+            char st[2] = { proc_state_char(p), '\0' };
+            pos = sb_dec(out, pos, max, p->pid);
+            pos = sb_add(out, pos, max, " (");
+            pos = sb_add(out, pos, max, p->name);
+            pos = sb_add(out, pos, max, ") ");
+            pos = sb_add(out, pos, max, st);
+            pos = sb_add(out, pos, max, " ");
+            pos = sb_dec(out, pos, max, p->ppid);
+            pos = sb_add(out, pos, max,
+                         " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ");
+            pos = sb_dec(out, pos, max, p->start_ticks);
+            pos = sb_add(out, pos, max, " ");
+            pos = sb_dec(out, pos, max, USER_SIZE);
+            /* Linux /proc/<pid>/stat has 52 fields; BusyBox walks to a fixed
+             * field index and needs a space terminator after the last one. */
+            for (int i = 0; i < 29; i++) pos = sb_add(out, pos, max, " 0");
+            pos = sb_add(out, pos, max, " \n");
+            break;
+        }
+        case VFS_VF_PID_STATUS: {
+            proc_t* p = proc_find(pid);
+            if (!p) break;
+            pos = sb_add(out, pos, max, "Name:\t");
+            pos = sb_add(out, pos, max, p->name);
+            pos = sb_add(out, pos, max, "\nState:\t");
+            if (p->state == PROC_RUNNING) pos = sb_add(out, pos, max, "R (running)");
+            else if (p->state == PROC_ZOMBIE) pos = sb_add(out, pos, max, "Z (zombie)");
+            else pos = sb_add(out, pos, max, "S (sleeping)");
+            pos = sb_add(out, pos, max, "\nPid:\t");
+            pos = sb_dec(out, pos, max, p->pid);
+            pos = sb_add(out, pos, max, "\nPPid:\t");
+            pos = sb_dec(out, pos, max, p->ppid);
+            pos = sb_add(out, pos, max,
+                         "\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmSize:\t");
+            pos = sb_dec(out, pos, max, USER_SIZE / 1024);
+            pos = sb_add(out, pos, max, " kB\nThreads:\t1\n");
+            break;
+        }
+        case VFS_VF_PID_COMM: {
+            proc_t* p = proc_find(pid);
+            if (!p) break;
+            pos = sb_add(out, pos, max, p->name);
+            pos = sb_add(out, pos, max, "\n");
+            break;
+        }
+        case VFS_VF_PID_CMDLINE: {
+            proc_t* p = proc_find(pid);
+            if (!p) break;
+            pos = sb_add(out, pos, max, p->cmdline);
+            pos = sb_add(out, pos, max, "\n");
+            break;
+        }
         default:
             break;
     }
     return pos;
 }
 
-static uint32_t vfs_vfile_size(int id) {
+static uint32_t vfs_vfile_size(int id, uint32_t pid) {
     char tmp[USER_FD_VBUF_MAX];
-    return vfs_vfile_text(id, tmp, sizeof(tmp));
+    return vfs_vfile_text(id, pid, tmp, sizeof(tmp));
 }
 
 /* ---- directory enumeration ---- */
@@ -462,10 +591,31 @@ static int vfs_dir_id(const char* path) {
     return 0;
 }
 
+static bool_t vfs_proc_pid_dir(const char* path, uint32_t* pid) {
+    if (strncmp(path, "/proc/", 6) != 0) return false;
+    const char* n = path + 6;
+    if (*n == '\0' || has_slash(n)) return false;
+    uint32_t v = 0;
+    if (!vfs_parse_pid_token(n, &v) || !proc_find(v)) return false;
+    *pid = v;
+    return true;
+}
+
+static bool_t vfs_dir_meta(const char* path, int* id, uint32_t* pid) {
+    int d = vfs_dir_id(path);
+    if (d) { *id = d; *pid = 0; return true; }
+    uint32_t v = 0;
+    if (!vfs_proc_pid_dir(path, &v)) return false;
+    *id = VFS_DIR_PID;
+    *pid = v;
+    return true;
+}
+
 static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
                             uint32_t* ino, uint8_t* type) {
-    int dir = vfs_dir_id(path);
-    if (!dir) return false;
+    int dir = 0;
+    uint32_t dir_pid = 0;
+    if (!vfs_dir_meta(path, &dir, &dir_pid)) return false;
 
     if (idx == 0) { strncpy(name, ".", USER_FD_PATH_MAX); *ino = 1; *type = 4; return true; }
     if (idx == 1) { strncpy(name, "..", USER_FD_PATH_MAX); *ino = 1; *type = 4; return true; }
@@ -508,6 +658,26 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
         if (idx < 5) {
             strncpy(name, files[idx], USER_FD_PATH_MAX);
             *ino = 300 + idx;
+            *type = 8;
+            return true;
+        }
+        idx -= 5;
+        int n = proc_count();
+        if ((int)idx < n) {
+            proc_t* p = proc_get_index((int)idx);
+            if (!p) return false;
+            u32_to_dec(name, p->pid);
+            *ino = 500 + p->pid * 8;
+            *type = 4;
+            return true;
+        }
+        return false;
+    }
+    if (dir == VFS_DIR_PID) {
+        const char* files[4] = { "stat", "status", "comm", "cmdline" };
+        if (idx < 4) {
+            strncpy(name, files[idx], USER_FD_PATH_MAX);
+            *ino = 600 + dir_pid * 8 + idx;
             *type = 8;
             return true;
         }
@@ -561,7 +731,7 @@ static uint32_t do_open(uint32_t path, uint32_t flags, uint32_t mode) {
         case VFS_T_VFILE: {
             if ((flags & O_ACCMODE) != 0) return err(ERR_EACCES);
             char tmp[USER_FD_VBUF_MAX];
-            uint32_t len = vfs_vfile_text(e.id, tmp, sizeof(tmp));
+            uint32_t len = vfs_vfile_text(e.id, e.pid, tmp, sizeof(tmp));
             int fd = user_fd_alloc_vfile(tmp, len);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
@@ -649,6 +819,7 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
             if (e->id == VFS_DIR_DEV) base = 100;
             else if (e->id == VFS_DIR_PROC) base = 101;
             else if (e->id == VFS_DIR_ETC) base = 102;
+            else if (e->id == VFS_DIR_PID) base = 500 + e->pid * 8;
             *ino = base;
             *mode = S_IFDIR | 0755;
             *nlink = 2;
@@ -664,10 +835,12 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
             *atime = *mtime = *ctime = now;
             return true;
         case VFS_T_VFILE:
-            *ino = 300 + (uint32_t)e->id;
+            *ino = (e->id >= VFS_VF_PID_STAT)
+                   ? 600 + e->pid * 8 + (uint32_t)(e->id - VFS_VF_PID_STAT)
+                   : 300 + (uint32_t)e->id;
             *mode = S_IFREG | 0444;
             *nlink = 1;
-            *size = vfs_vfile_size(e->id);
+            *size = vfs_vfile_size(e->id, e->pid);
             *atime = *mtime = *ctime = now;
             return true;
         default:
@@ -706,8 +879,7 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
             vfs_ent_t e;
             memset(&e, 0, sizeof(e));
             e.type = VFS_T_DIR;
-            e.id = vfs_dir_id(user_fd_dir_path(fd));
-            if (!e.id) return false;
+            if (!vfs_dir_meta(user_fd_dir_path(fd), &e.id, &e.pid)) return false;
             return vfs_ent_fields(&e, ino, mode, nlink, size, atime, mtime, ctime);
         }
         case USER_FD_DEV_NULL:
@@ -1193,6 +1365,196 @@ static uint32_t do_dup(uint32_t fd) {
     return (uint32_t)nfd;
 }
 
+/* ---- sequential fork/wait model ----
+ * Only one address space is live. fork() copies the 8MB sandbox plus fd,
+ * cwd and brk state into a child snapshot; when the parent calls waitpid,
+ * the child is loaded into the sandbox and run to exit, then the parent
+ * image is restored and waitpid returns. Each process owns a separate
+ * kernel stack for its Ring3->Ring0 entries. */
+
+static proc_t* find_child(int32_t want_pid) {
+    proc_t* parent = proc_current();
+    if (!parent) return NULL;
+    int n = proc_count();
+    for (int i = 0; i < n; i++) {
+        proc_t* p = proc_get_index(i);
+        if (!p->used || p->ppid != parent->pid) continue;
+        if (want_pid > 0 && p->pid != (uint32_t)want_pid) continue;
+        return p;
+    }
+    return NULL;
+}
+
+static uint32_t do_fork(registers_t* regs) {
+    proc_t* parent = proc_current();
+    if (!parent || parent->pid == 1) return err(ERR_EPERM);
+
+    proc_t* child = proc_alloc(parent->name, parent->pid);
+    if (!child) return err(ERR_EAGAIN);
+
+    if (!proc_snapshot_alloc(child) || !proc_fdstate_alloc(child)) {
+        proc_reap(child);
+        return err(ERR_ENOMEM);
+    }
+    memcpy(child->mem, (void*)USER_BASE, USER_SIZE);
+    user_fd_state_save(child->fd_state);
+
+    strncpy(child->cwd, user_cwd_get(), USER_FD_PATH_MAX - 1);
+    child->cwd[USER_FD_PATH_MAX - 1] = '\0';
+    user_get_brk_state(&child->brk_base, &child->brk_cur);
+
+    child->eip = regs->eip;
+    child->esp = regs->useresp;
+    child->eflags = regs->eflags;
+    child->eax = 0;
+    child->ebx = regs->ebx;
+    child->ecx = regs->ecx;
+    child->edx = regs->edx;
+    child->esi = regs->esi;
+    child->edi = regs->edi;
+    child->ebp = regs->ebp;
+    child->has_ctx = true;
+
+    return child->pid;
+}
+
+/* Run one child snapshot inside the live sandbox, then restore the parent. */
+static bool_t proc_run_child(proc_t* parent, proc_t* child) {
+    if (!proc_snapshot_alloc(parent) || !proc_fdstate_alloc(parent)) return false;
+
+    memcpy(parent->mem, (void*)USER_BASE, USER_SIZE);
+    user_fd_state_save(parent->fd_state);
+    strncpy(parent->cwd, user_cwd_get(), USER_FD_PATH_MAX - 1);
+    parent->cwd[USER_FD_PATH_MAX - 1] = '\0';
+    user_get_brk_state(&parent->brk_base, &parent->brk_cur);
+
+    uint32_t saved_esp0 = tss_get_esp0();
+    uint32_t saved_root_esp = user_kernel_esp_save;
+
+    memcpy((void*)USER_BASE, child->mem, USER_SIZE);
+    user_fd_state_restore(child->fd_state);
+    user_cwd_set(child->cwd);
+    user_restore_brk_state(child->brk_base, child->brk_cur);
+
+    child->state = PROC_RUNNING;
+    proc_set_current(child);
+    user_set_active(true);
+    user_clear_exit_state();
+    tss_set_esp0(child->kstack_top);
+
+    user_enter_regs(child->eip, child->esp, 0,
+                    child->ebx, child->ecx, child->edx,
+                    child->esi, child->edi, child->ebp);
+
+    int code = user_last_exit_code();
+    bool_t faulted = user_last_faulted();
+    child->state = PROC_ZOMBIE;
+    child->exit_code = faulted ? 139 : code;
+    child->has_ctx = false;
+    proc_snapshot_free(child);
+
+    memcpy((void*)USER_BASE, parent->mem, USER_SIZE);
+    user_fd_state_restore(parent->fd_state);
+    user_cwd_set(parent->cwd);
+    user_restore_brk_state(parent->brk_base, parent->brk_cur);
+
+    tss_set_esp0(saved_esp0);
+    user_kernel_esp_save = saved_root_esp;
+    proc_set_current(parent);
+    parent->state = PROC_RUNNING;
+    user_set_active(true);
+    return true;
+}
+
+static uint32_t do_wait4(uint32_t pid_arg, uint32_t status_ptr, uint32_t options) {
+    proc_t* parent = proc_current();
+    if (!parent || parent->pid == 1) return err(ERR_ECHILD);
+    if (status_ptr && !user_ptr_ok(status_ptr, 4)) return err(ERR_EFAULT);
+
+    int32_t want = (int32_t)pid_arg;
+    for (;;) {
+        proc_t* child = find_child(want);
+        if (!child) return err(ERR_ECHILD);
+
+        if (child->state == PROC_ZOMBIE) {
+            uint32_t cpid = child->pid;
+            int code = child->exit_code;
+            if (status_ptr) *(uint32_t*)status_ptr = (uint32_t)(code & 0xFF) << 8;
+            proc_reap(child);
+            return cpid;
+        }
+        if (!child->has_ctx) return err(ERR_ECHILD);
+        if (options & 1) return 0;                 /* WNOHANG */
+        if (!proc_run_child(parent, child)) return err(ERR_ENOMEM);
+    }
+}
+
+static uint32_t do_execve(registers_t* regs, uint32_t path_ptr, uint32_t argv_ptr) {
+    char path[128];
+    if (!copy_user_string(path_ptr, path, sizeof(path))) return err(ERR_EFAULT);
+
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(path, &e);
+    if ((int32_t)rc < 0) return rc;
+    if (e.type != VFS_T_FILE) return err(ERR_ENOEXEC);
+
+    const char* img = fs_fd_data(e.slot);
+    uint32_t img_size = fs_fd_size(e.slot);
+    if (!img || img_size == 0) return err(ERR_ENOEXEC);
+
+    char args[16][64];
+    int argc = 0;
+    if (argv_ptr) {
+        for (int i = 0; i < 16; i++) {
+            uint32_t p = 0;
+            if (!user_ptr_ok(argv_ptr + (uint32_t)i * 4, 4)) return err(ERR_EFAULT);
+            memcpy(&p, (const void*)(argv_ptr + (uint32_t)i * 4), 4);
+            if (!p) break;
+            if (!copy_user_string(p, args[argc], sizeof(args[argc])))
+                return err(ERR_EFAULT);
+            argc++;
+        }
+    }
+    if (argc == 0) {
+        const char* base = path;
+        for (const char* s = path; *s; s++) if (*s == '/') base = s + 1;
+        strncpy(args[0], base, sizeof(args[0]) - 1);
+        args[0][sizeof(args[0]) - 1] = '\0';
+        argc = 1;
+    }
+
+    uint32_t entry = 0, end = 0;
+    if (elf32_validate(img, img_size, USER_BASE, USER_END - USER_STACK_RESERVE,
+                       &entry, &end) != 0) return err(ERR_ENOEXEC);
+
+    const char* cargv[16];
+    for (int i = 0; i < argc && i < 16; i++) cargv[i] = args[i];
+
+    uint32_t sp = 0;
+    rc = (uint32_t)user_exec_image(img, img_size, argc, cargv, &entry, &sp);
+    if ((int32_t)rc < 0) return err(ERR_ENOEXEC);
+
+    proc_t* p = proc_current();
+    if (p) {
+        strncpy(p->name, args[0], PROC_NAME_MAX - 1);
+        p->name[PROC_NAME_MAX - 1] = '\0';
+        p->cmdline[0] = '\0';
+        uint32_t pos = 0;
+        for (int i = 0; i < argc; i++) {
+            if (i && pos + 1 < PROC_CMDLINE_MAX) p->cmdline[pos++] = ' ';
+            for (const char* s = args[i]; *s && pos + 1 < PROC_CMDLINE_MAX; s++)
+                p->cmdline[pos++] = *s;
+        }
+        p->cmdline[pos] = '\0';
+    }
+
+    regs->eip = entry;
+    regs->useresp = sp;
+    regs->ebx = regs->ecx = regs->edx = 0;
+    regs->esi = regs->edi = regs->ebp = 0;
+    return 0;
+}
+
 /* musl flushes buffered stdio with writev, so a working writev is required
  * for BusyBox applets that print through stdio (ls, ps, ...). */
 typedef struct {
@@ -1369,6 +1731,16 @@ void syscall_handler(registers_t* regs) {
         case SYS_exit:
             user_exit((int)regs->ebx);   /* never returns */
             ret = 0;
+            break;
+        case SYS_fork:
+            ret = do_fork(regs);
+            break;
+        case SYS_waitpid:
+        case SYS_wait4:
+            ret = do_wait4(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_execve:
+            ret = do_execve(regs, regs->ebx, regs->ecx);
             break;
         case SYS_read:
             ret = do_read(regs->ebx, regs->ecx, regs->edx);

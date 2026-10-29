@@ -10,8 +10,42 @@ static unsigned read_cs(void) {
     return cs & 0xFFFF;
 }
 
+static int arg_is(const char* s, const char* t) {
+    if (!s) return 0;
+    while (*s && *t && *s == *t) { s++; t++; }
+    return *s == '\0' && *t == '\0';
+}
+
 int main(int argc, char** argv) {
     unsigned cs = read_cs();
+
+    if (argc > 1 && arg_is(argv[1], "exec-child")) {
+        muos_puts("USER-EXEC-OK\n");
+        return 42;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "fork")) {
+        muos_puts("fork-test: parent before fork\n");
+        int pid = muos_fork();
+        if (pid == 0) {
+            char* args[3];
+            args[0] = "hello.elf";
+            args[1] = "exec-child";
+            args[2] = 0;
+            muos_puts("fork-test: child execve /hello.elf\n");
+            int r = muos_execve("/hello.elf", args, 0);
+            muos_puts("fork-test: execve failed "); muos_putdec(r); muos_puts("\n");
+            muos_exit(99);
+        }
+        muos_puts("fork-test: parent child pid="); muos_putdec(pid); muos_puts("\n");
+        int status = 0;
+        int w = muos_waitpid(pid, &status, 0);
+        muos_puts("fork-test: wait="); muos_putdec(w);
+        muos_puts(" status="); muos_putdec((status >> 8) & 0xFF);
+        muos_puts(w == pid && ((status >> 8) & 0xFF) == 42
+                  ? " USER-FORK-OK\n" : " USER-FORK-BAD\n");
+        return 0;
+    }
 
     muos_puts("======================================\n");
     muos_puts("  Hello from C in Ring3 (MuOS user mode)\n");

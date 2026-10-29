@@ -28,6 +28,10 @@ void tss_set_esp0(uint32_t esp0) {
     tss.esp0 = esp0;
 }
 
+uint32_t tss_get_esp0(void) {
+    return tss.esp0;
+}
+
 uint32_t tss_get_kernel_stack_top(void) {
     return kernel_stack_top;
 }

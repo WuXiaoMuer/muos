@@ -120,7 +120,40 @@ syscall_common:
 ;   resumes the kernel caller saved by user_enter. Never returns.
 ; ---------------------------------------------------------------------------
 global user_enter
+global user_enter_regs
 global user_return_to_kernel
+
+; user_enter_regs(entry, user_sp, eax, ebx, ecx, edx, esi, edi, ebp)
+; Same kernel-context save as user_enter, but restores all GP registers
+; before iret so a forked child resumes exactly after int 0x80 with eax=0.
+user_enter_regs:
+    cli
+    push ebp
+    push ebx
+    push esi
+    push edi
+    mov [user_kernel_esp_save], esp
+
+    push 0x23               ; SS
+    push dword [esp + 28]   ; user ESP (arg slot shifted by SS push)
+    push 0x202              ; EFLAGS
+    push 0x1B               ; CS
+    push dword [esp + 36]   ; EIP (arg slot shifted by 4 pushes)
+
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    mov eax, [esp + 48]
+    mov ebx, [esp + 52]
+    mov ecx, [esp + 56]
+    mov edx, [esp + 60]
+    mov esi, [esp + 64]
+    mov edi, [esp + 68]
+    mov ebp, [esp + 72]
+    iret
 
 user_enter:
     cli

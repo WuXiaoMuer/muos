@@ -1,6 +1,6 @@
 # MuOS 代码逻辑(v1.2)
 
-本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、72 项自检。演进计划见 ROADMAP.md。
+本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、顺序快照进程模型、77 项自检。演进计划见 ROADMAP.md。
 
 ## 一、总体结构
 
@@ -51,7 +51,7 @@ serial → vga → GDT → IDT(256 项)→ PIC(重映射+全屏蔽)
 → tss_init()                      [TSS + 8KB Ring0 入口栈 + ltr]
 → PIT 100Hz + IRQ0 → keyboard → mouse(8042 aux / IRQ12)
 → task_init + task_register("kernel")
-→ tests_run()                     [72 项自检,失败打印 SELF-TEST FAILED]
+→ tests_run()                     [77 项自检,失败打印 SELF-TEST FAILED]
 → 启动动画 → shell_run()(内核栈上)
 ```
 
@@ -149,7 +149,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
   - 未知号返回 `-ENOSYS(-38)` 并在串口打印一次编号,作为 ROADMAP 阶段 4 的待办清单。
 - fd 表在 user.c 统一管理 0..10:启动时 0/1/2 是 `USER_FD_STDIN/STDOUT/STDERR`,其余条目可为 RAM FS 文件、目录、`/dev` 节点、`/proc` 快照或已关闭(FREE)。新 fd 从 3 起分配;`dup(41)` 复制任意条目,`dup2(63)` 可把文件/设备重定向到 0..2(或反向),`dd` 的 `dup2(if_fd,0)` 由此可用。
 - 路径解析 `vfs_normalize`:以进程 cwd(`user_cwd_get/set`,启动时 `/`)为基准处理绝对/相对路径、`.`、`..`(越界停在 `/`),输出规范绝对路径。命名空间:`/` 是 RAM FS(仅单段文件名),另有虚拟 `/dev`、`/proc`、`/etc`。
-- 虚拟文件:`/dev/null` 读 EOF/写丢弃,`/dev/zero` 读零/写丢弃,`/dev/console` 接键盘与 VGA+串口;`/proc/{meminfo,uptime,version,cpuinfo,mounts}` 与 `/etc/mtab` 在 `open` 时由内核生成快照存入 fd,`/proc/meminfo` 取 mm 页统计,`uptime` 取 PIT 100Hz。
+- 虚拟文件:`/dev/null` 读 EOF/写丢弃,`/dev/zero` 读零/写丢弃,`/dev/console` 接键盘与 VGA+串口;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/proc/<pid>/{stat,status,comm,cmdline}` 与 `/etc/mtab` 在 `open` 时由内核生成快照存入 fd,`/proc/meminfo` 取 mm 页统计,`uptime` 取 PIT 100Hz;`/proc/<pid>/stat` 输出 Linux 的 52 字段(尾部保留空格),BusyBox `ps` 可解析。
 - `getdents/getdents64` 按目录 fd 的绝对路径枚举 `.`、`..`、RAM FS 文件以及 `dev/proc/etc` 虚拟子目录,分别按 i386 `linux_dirent`(10 字节头)与 `linux_dirent64`(19 字节头)打包;`d_off` 写下一项序号,缓冲区不足时保留偏移。
 - `stat` 族:`stat64` 写 96 字节 i386 布局,旧 `stat` 写 64 字节布局;目录 `S_IFDIR|0755`/nlink 2,文件 `S_IFREG|0644`,设备 `S_IFCHR|0666`,`/proc` 快照 `S_IFREG|0444`,`st_dev=1`;三类时间来自 RAM FS 的 atime/mtime/ctime。`statx(383)` 写 256 字节 `struct statx`(mask=STATX_BASIC_STATS),空路径且 `AT_EMPTY_PATH` 时改为 stat dirfd。
 - `statfs/fstatfs(99/100)` 与 `statfs64/fstatfs64(268/269)` 按 16×64KB 容量与空闲槽位填充,`df`/`stat -f` 可用;`sysinfo(116)` 回报 uptime/内存/任务数。`/proc/mounts` 输出 `/dev/root / ext2` 等真实设备行,BusyBox `df` 会跳过 `rootfs` 伪设备。
@@ -180,8 +180,17 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 
 - GDT 槽 6 是 DPL3 的 TLS 数据段(`gdt_set_user_tls`);`set_thread_area(243)` 读用户 `user_desc`(16 字节),接受 entry -1/6,写入 base/limit/flags,回填 `entry_number=6`。用户代码随后 `mov %gs,0x33`。
 - 描述符:access 0xF2(可写数据)/0xF0(只读),gran 0x40(字节)或 0xC0(4KB);limit 取 20 位。
-- `get_thread_area(244)` 回读;`exit_group(252)` 走 exit;`set_tid_address(258)` 返回 1;`getuid32/...` 返回 0;`ioctl` 返回 `-ENOTTY`;`dup2` 只接受同 fd。
+- `get_thread_area(244)` 回读;`exit_group(252)` 走 exit;`set_tid_address(258)` 返回 1;`getuid32/...` 返回 0;`ioctl` 返回 `-ENOTTY`;`dup/dup2` 复制 fd 表条目并可重定向 stdio。
 - **验收**:Alpine static i386 BusyBox 1.36.1(musl)作为 `-initrd` 模块进入 Ring3;`echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a` 及 20+ applet(含 `wc/grep/sed/od/stat/cp/rm/mv/touch`)实测通过,不存在的路径返回 ENOENT。
+
+### 7.7 顺序进程模型(proc.c + user_enter_regs)
+
+- `proc_t`(proc.c)固定 8 槽:pid/ppid/state/exit_code/name/cmdline、8MB 内存快照、8KB 独立内核栈、fd 表快照、cwd/brk、以及子进程恢复用的完整寄存器组。
+- `fork(2)`:分配子进程 → 复制当前 8MB 沙箱与 fd/cwd/brk 快照 → 记录父进程 `int 0x80` 后的 eip/esp/eflags 和 GP 寄存器,子进程 eax=0;父进程正常返回 child pid。
+- `waitpid(7)/wait4(114)`:找到子进程;若未运行,先把父进程现场写回父快照,再把子快照装入沙箱、恢复 fd/cwd/brk,把 TSS.esp0 指向子进程的内核栈,调用 `user_enter_regs` 从子进程的 eip/esp 进入 Ring3。子进程 exit/故障时 `user_return_to_kernel` 回到 waitpid 内部;标记 ZOMBIE、记录状态、释放子快照、恢复父进程并返回。
+- `execve(11)`:先把 path/argv 拷到内核,`vfs_lookup` 找到 RAM FS 文件,`elf32_validate` 预校验;`user_exec_image` 清空沙箱、重载段、重建初始栈(保留 fd/cwd),再把 syscall 的 iret 帧改成新 entry/esp——同一个 pid 原地替换。
+- `user_enter_regs`(isr_stubs.s):与 `user_enter` 相同的内核上下文保存,但在 iret 前恢复 eax/ebx/ecx/edx/esi/edi/ebp;用户内核栈互不覆盖是子进程能安全执行的关键。
+- `/proc` 目录由 proc 表动态生成 PID 子目录;`/proc/self` 解析为当前进程。`ps` 读取 `/proc/<pid>/stat` 与 `cmdline`。
 
 ## 八、Shell / FS / 桌面
 
@@ -222,9 +231,9 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 
 ## 十一、已知局限(真实清单)
 
-1. 用户态是**单进程、固定 8MB 沙箱**:无 higher-half、无每进程页目录、无 fork/调度;一次只跑一个用户程序(ROADMAP 阶段 1 剩余项)
-2. 系统调用仍缺进程/并发原语:`fork/clone/waitpid/signals/pipe/execve/mkdir` 与文件 mmap 均未实现;`/proc` 只有静态文件,没有 `/proc/<pid>`,因此 `ps` 不可用(ROADMAP 阶段 2/4)
-3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;BusyBox 的 `ls/cat/free/df/dd` 已跑通,但还不能 fork+execve 运行子进程,也没有管道/多级目录/磁盘
+1. 用户态是**固定 8MB 单地址空间 + 顺序快照进程模型**:无 higher-half、无每进程页目录、无抢占调度;子进程只在父 `waitpid` 时运行,不是真正并发(ROADMAP 阶段 1 剩余项)
+2. 系统调用仍缺并发原语:`clone`、`pipe/pipe2`、`signals/kill`、`mkdir` 与文件 mmap;`/proc` 有 pid 目录,但 `top/vmstat` 需要的 `/proc/stat` 等仍缺(ROADMAP 阶段 2/4)
+3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;`fork+execve+waitpid` 已由 `run fork` 验证,但 BusyBox `sh` 外部 applet 还缺 `/bin/<applet>` → busybox 模块的 PATH 映射,也没有管道/多级目录/磁盘
 4. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 5. fs 无句柄保护、无目录层级/持久化;时间戳仅存于 RAM FS,重启丢失;write 截断不告警;`/dev`、`/proc`、`/etc` 为只读虚拟层
 6. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化

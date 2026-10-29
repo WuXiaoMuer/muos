@@ -2,6 +2,15 @@
 
 /* Linux i386 syscall ABI: number in eax, args in ebx/ecx/edx,
  * result in eax, invoked with `int 0x80`. */
+static int syscall0(int nr) {
+    int ret;
+    __asm__ volatile ("int $0x80"
+                      : "=a"(ret)
+                      : "a"(nr)
+                      : "memory");
+    return ret;
+}
+
 static int syscall1(int nr, int a) {
     int ret;
     __asm__ volatile ("int $0x80"
@@ -43,6 +52,18 @@ int muos_open(const char* path, int flags) {
 
 int muos_close(int fd) {
     return syscall1(6, fd);
+}
+
+int muos_fork(void) {
+    return syscall0(2);
+}
+
+int muos_waitpid(int pid, int* status, int options) {
+    return syscall3(7, pid, (int)status, options);
+}
+
+int muos_execve(const char* path, char* const argv[], char* const envp[]) {
+    return syscall3(11, (int)path, (int)argv, (int)envp);
 }
 
 int muos_lseek(int fd, int offset, int whence) {

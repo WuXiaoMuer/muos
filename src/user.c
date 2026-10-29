@@ -5,6 +5,7 @@
 #include "vga.h"
 #include "serial.h"
 #include "string.h"
+#include "proc.h"
 
 /* Embedded user image: built by build.ps1 into build/hello.elf and linked
  * into the kernel as a raw binary blob (see the objcopy step). */
@@ -188,6 +189,47 @@ bool_t user_cwd_set(const char* path) {
     return true;
 }
 
+uint32_t user_fd_state_bytes(void) {
+    return (uint32_t)sizeof(user_fds);
+}
+
+void user_fd_state_save(void* dst) {
+    if (dst) memcpy(dst, user_fds, sizeof(user_fds));
+}
+
+void user_fd_state_restore(const void* src) {
+    if (src) memcpy(user_fds, src, sizeof(user_fds));
+}
+
+void user_get_brk_state(uint32_t* base, uint32_t* cur) {
+    if (base) *base = brk_base;
+    if (cur) *cur = brk_current;
+}
+
+bool_t user_restore_brk_state(uint32_t base, uint32_t cur) {
+    if (base < USER_BASE || cur < base || cur > USER_END) return false;
+    brk_base = base;
+    brk_current = cur;
+    return true;
+}
+
+int user_last_exit_code(void) {
+    return exit_code;
+}
+
+bool_t user_last_faulted(void) {
+    return faulted;
+}
+
+void user_clear_exit_state(void) {
+    exit_code = 0;
+    faulted = false;
+}
+
+void user_set_active(bool_t v) {
+    active = v;
+}
+
 uint32_t user_mmap_anon(uint32_t len) {
     if (len == 0) return 0;
     uint32_t rounded = (len + PAGE_SIZE - 1) & PAGE_MASK;
@@ -319,6 +361,35 @@ static uint32_t build_user_stack(int argc, const char* const* argv) {
     return sp;
 }
 
+/* Replace the live sandbox with a new image (execve). Fds/cwd persist. */
+int user_exec_image(const void* img, uint32_t img_size, int argc,
+                    const char* const* argv,
+                    uint32_t* entry_out, uint32_t* sp_out) {
+    if (!img || img_size == 0) return -1;
+
+    memset((void*)USER_BASE, 0, USER_SIZE);
+
+    uint32_t entry = 0, image_end = 0;
+    int rc = elf32_load(img, img_size, USER_BASE,
+                        USER_END - USER_STACK_RESERVE, &entry, &image_end);
+    if (rc != 0) return rc;
+
+    brk_base = align_up_page(image_end);
+    if (brk_base < USER_BASE + PAGE_SIZE) brk_base = USER_BASE + PAGE_SIZE;
+    brk_current = brk_base;
+
+    uint32_t sp = build_user_stack(argc, argv);
+    if (sp <= brk_current + PAGE_SIZE) return -2;
+    if (!mm_user_map_range(USER_BASE, USER_END)) return -3;
+
+    exit_code = 0;
+    faulted = false;
+    active = true;
+    if (entry_out) *entry_out = entry;
+    if (sp_out) *sp_out = sp;
+    return 0;
+}
+
 int user_run_embedded(const char* arg0, const char* arg1) {
     uint32_t img_size = 0;
     const void* img = user_get_image(&img_size);
@@ -404,6 +475,22 @@ int user_run_image_argv(const void* img, uint32_t img_size,
     active = true;
     tss_set_esp0(tss_get_kernel_stack_top());
 
+    /* Register this Ring3 run as a process (pid 1 is the kernel). */
+    proc_t* self = proc_alloc(argc > 0 && argv[0] ? argv[0] : "app", 1);
+    if (self) {
+        self->state = PROC_RUNNING;
+        self->cmdline[0] = '\0';
+        for (int i = 0; i < argc && i < 16; i++) {
+            uint32_t pos = strlen(self->cmdline);
+            if (pos + 1 >= PROC_CMDLINE_MAX) break;
+            if (i) self->cmdline[pos++] = ' ';
+            const char* a = argv[i] ? argv[i] : "";
+            while (*a && pos + 1 < PROC_CMDLINE_MAX) self->cmdline[pos++] = *a++;
+            self->cmdline[pos] = '\0';
+        }
+        proc_set_current(self);
+    }
+
     vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
     vga_print("[user] entering Ring3 at ");
     vga_print_hex(entry);
@@ -435,6 +522,12 @@ int user_run_image_argv(const void* img, uint32_t img_size,
         serial_write("\n");
     }
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+
+    if (self) {
+        proc_cleanup_children(self->pid);
+        proc_reap(self);
+        proc_set_current(proc_find(1));
+    }
 
     return faulted ? -1 : exit_code;
 }

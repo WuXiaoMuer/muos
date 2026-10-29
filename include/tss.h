@@ -24,6 +24,7 @@ typedef struct {
  * descriptor and executes `ltr`. Requires mm_init + paging first. */
 bool_t   tss_init(void);
 void     tss_set_esp0(uint32_t esp0);
+uint32_t tss_get_esp0(void);
 uint32_t tss_get_kernel_stack_top(void);
 
 #endif

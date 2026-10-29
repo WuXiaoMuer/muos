@@ -18,6 +18,7 @@
 #include "kheap.h"
 #include "tss.h"
 #include "module.h"
+#include "proc.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
@@ -147,6 +148,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     /* 9c. Built-in self-test suite (runs before entering shell).
      * Register the kernel as a task first so the task tests pass. */
     task_register("kernel");
+    proc_init();
     tests_run();
 
     /* Boot animation */
