@@ -161,8 +161,8 @@ static uint32_t do_uname(uint32_t ptr) {
     memset(buf, 0, sizeof(buf));
     strncpy(buf + UTS_FIELD * 0, "MuOS",     UTS_FIELD - 1);
     strncpy(buf + UTS_FIELD * 1, "muos",     UTS_FIELD - 1);
-    strncpy(buf + UTS_FIELD * 2, "0.4.0",    UTS_FIELD - 1);
-    strncpy(buf + UTS_FIELD * 3, "MuOS v0.4", UTS_FIELD - 1);
+    strncpy(buf + UTS_FIELD * 2, "1.2.0",    UTS_FIELD - 1);
+    strncpy(buf + UTS_FIELD * 3, "MuOS v1.2", UTS_FIELD - 1);
     strncpy(buf + UTS_FIELD * 4, "i386",     UTS_FIELD - 1);
     memcpy((void*)ptr, buf, UTS_SIZE);
     return 0;

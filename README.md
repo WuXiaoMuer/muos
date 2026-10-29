@@ -152,9 +152,9 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 
 ## 版本
 
-当前 **v0.4**:在 v0.3(启动/中断/内存/单任务 Shell)基础上加入 Ring3 用户态、TSS、Linux i386 `int 0x80` 调用与 ELF32 加载器;随后扩展到 RAM FS 16×64KB、`exec hello.elf`(从 FS 加载 ELF)、文件 fd(open/close/lseek/read/write)、`uname` 与匿名 `mmap`。首个用户 C 程序 `user/hello.c` 可由 `run` 或 `exec hello.elf` 启动。
+当前 **v1.2**:在 v1.1(mmap 解析、全 RAM 恒等映射、内核堆、寄存器布局修复)基础上加入 Ring3 用户态、TSS、Linux i386 `int 0x80` 调用、ELF32 加载器与 RAM FS 16×64KB,支持 `run`(内嵌 ELF)/`exec hello.elf`(FS ELF)、文件 fd(open/close/lseek/read/write)、`uname` 与匿名 `mmap`。首个用户 C 程序 `user/hello.c` 可由 `run` 或 `exec hello.elf` 启动。
 
-桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断并支持 PgUp/PgDn;自检 57 项。
+桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;自检 57 项。
 
 ## 参考资源
 

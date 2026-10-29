@@ -1,4 +1,4 @@
-# MuOS 代码逻辑(v0.4)
+# MuOS 代码逻辑(v1.2)
 
 本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、57 项自检。演进计划见 ROADMAP.md。
 
@@ -143,7 +143,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 - fd 表在 user.c:`0/1/2` 是 stdio,文件 fd 从 3 起,内部映射 RAM FS 槽位并维护字节偏移;`open` 支持 `O_CREAT/O_TRUNC`,`lseek` 支持 SEEK_SET/CUR/END。
 - `write` 对 fd 1/2 逐字节输出到 VGA+串口,对文件 fd 调 `fs_write_at`;所有用户缓冲区先用 `user_ptr_ok` 校验完全落在沙箱内。`read` 对 fd 0 复用 `keyboard_getchar`(内部 `sti; hlt; cli`,解决中断门 IF=0 的等待问题),对文件 fd 调 `fs_read_at`。
 - `brk` 与匿名 `mmap` 共用沙箱 bump 指针:brk 只改 `brk_current`(页早已映射),mmap 按页对齐分配并清零;文件映射、`MAP_FIXED` 明确拒绝。`munmap/mprotect` 是空操作(平坦沙箱)。
-- `uname` 按 Linux i386 的 6×65 字节 utsname 填充 MuOS/muos/0.4.0/i386。
+- `uname` 按 Linux i386 的 6×65 字节 utsname 填充 MuOS/muos/1.2.0/i386。
 
 ### 7.4 ELF32 加载器(elf.c)
 

@@ -139,7 +139,7 @@ static void cmd_logo(void){
     vga_print("\n");
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
 }
-static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS v0.4 (Ring3 + Linux ABI)\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
+static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS v1.2 (Ring3 + Linux ABI)\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
 static void cmd_reboot(void){
     vga_print("Reboot...\n");
     serial_write("[shell] reboot requested (8042 reset line)\n");
