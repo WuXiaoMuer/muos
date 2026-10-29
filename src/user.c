@@ -27,6 +27,7 @@ typedef struct {
     int      kind;      /* user_fd_kind_t; FREE = slot unused */
     int      fs_slot;   /* RAM FS slot for FILE */
     uint32_t offset;
+    int      pipe_id;
     char     path[USER_FD_PATH_MAX];   /* DIR: absolute directory */
     char     vbuf[USER_FD_VBUF_MAX];   /* VFILE: generated /proc text */
     uint32_t vlen;
@@ -105,6 +106,21 @@ int user_fd_alloc_vfile(const char* data, uint32_t len) {
     if (data && len) memcpy(user_fds[fd].vbuf, data, len);
     user_fds[fd].vlen = len;
     return fd;
+}
+
+int user_fd_alloc_pipe(int pipe_id, bool_t write_end) {
+    int fd = fd_alloc_kind(write_end ? USER_FD_PIPE_WRITE : USER_FD_PIPE_READ);
+    if (fd < 0) return -1;
+    user_fds[fd].pipe_id = pipe_id;
+    return fd;
+}
+
+int user_fd_pipe_id(int fd) {
+    int i = fd_index(fd);
+    if (i < 0) return -1;
+    if (user_fds[i].kind != USER_FD_PIPE_READ &&
+        user_fds[i].kind != USER_FD_PIPE_WRITE) return -1;
+    return user_fds[i].pipe_id;
 }
 
 int user_fd_kind(int fd) {

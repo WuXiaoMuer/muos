@@ -93,7 +93,32 @@ static void readline(void){
     default:if(c>=' '&&c<127)isrt(c);break;
     }}
 }
-static int tokenize(char*b,char**a,int max_args){int n=0;char*p=b;while(*p){while(*p==' ')p++;if(!*p)break;if(n>=max_args-1)break;a[n++]=p;while(*p&&*p!=' ')p++;if(*p)*p++=0;}a[n]=NULL;return n;}
+/* Split the command line into argv, honouring single/double quotes.
+ * Quotes are removed; spaces inside quotes are preserved. */
+static int tokenize(char*b,char**a,int max_args){
+    int n=0; char*p=b;
+    while(*p){
+        while(*p==' ')p++;
+        if(!*p)break;
+        if(n>=max_args-1)break;
+        char*out=p; a[n++]=out; char quote=0;
+        while(*p){
+            if(quote){
+                if(*p==quote){quote=0;p++;continue;}
+                *out++=*p++;
+            } else if(*p=='"'||*p=='\''){
+                quote=*p++;
+            } else if(*p==' '){
+                break;
+            } else {
+                *out++=*p++;
+            }
+        }
+        if(*p==' ')p++;
+        *out='\0';
+    }
+    a[n]=NULL; return n;
+}
 
 /* ═══════════════════ Commands ═══════════════════ */
 static void cmd_help(void){

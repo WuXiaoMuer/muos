@@ -123,9 +123,10 @@ global user_enter
 global user_enter_regs
 global user_return_to_kernel
 
-; user_enter_regs(entry, user_sp, eax, ebx, ecx, edx, esi, edi, ebp)
-; Same kernel-context save as user_enter, but restores all GP registers
-; before iret so a forked child resumes exactly after int 0x80 with eax=0.
+; user_enter_regs(entry, sp, eax, ebx, ecx, edx, esi, edi, ebp, fs, gs)
+; Same kernel-context save as user_enter, but restores all GP registers and
+; the FS/GS selectors (GS carries the i386 TLS selector 0x33) so a forked
+; child resumes exactly after int 0x80 with eax=0.
 user_enter_regs:
     cli
     push ebp
@@ -143,7 +144,9 @@ user_enter_regs:
     mov ax, 0x23
     mov ds, ax
     mov es, ax
+    mov ax, [esp + 76]      ; FS selector
     mov fs, ax
+    mov ax, [esp + 80]      ; GS selector (0x33 = TLS)
     mov gs, ax
 
     mov eax, [esp + 48]

@@ -18,6 +18,7 @@ int  muos_lseek(int fd, int offset, int whence);
 int  muos_fork(void);
 int  muos_waitpid(int pid, int* status, int options);
 int  muos_execve(const char* path, char* const argv[], char* const envp[]);
+int  muos_pipe(int fds[2]);
 void muos_exit(int code) __attribute__((noreturn));
 unsigned muos_brk(unsigned addr);
 int  muos_getpid(void);

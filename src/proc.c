@@ -70,6 +70,8 @@ proc_t* proc_alloc(const char* name, uint32_t ppid) {
         procs[i].state = PROC_READY;
         procs[i].start_ticks = pit_get_ticks();
         procs[i].mem_pages = USER_SIZE / PAGE_SIZE;
+        procs[i].fs_sel = 0x23;
+        procs[i].gs_sel = 0x23;
         strncpy(procs[i].name, name ? name : "app", PROC_NAME_MAX - 1);
         strncpy(procs[i].cmdline, name ? name : "app", PROC_CMDLINE_MAX - 1);
 

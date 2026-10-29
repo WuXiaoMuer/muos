@@ -24,6 +24,63 @@ int main(int argc, char** argv) {
         return 42;
     }
 
+    if (argc > 1 && arg_is(argv[1], "pipe")) {
+        int fds[2] = { -1, -1 };
+        int rc = muos_pipe(fds);
+        muos_puts("pipe-test: rc="); muos_putdec(rc);
+        muos_puts(" fds="); muos_putdec(fds[0]); muos_puts("/"); muos_putdec(fds[1]);
+        muos_puts("\n");
+        if (rc == 0) {
+            const char msg[] = "PIPE-OK";
+            muos_write(fds[1], msg, sizeof(msg) - 1);
+            char rb[16];
+            int n = muos_read(fds[0], rb, sizeof(rb) - 1);
+            rb[n > 0 ? n : 0] = '\0';
+            muos_puts("pipe-test: read="); muos_puts(rb); muos_puts("\n");
+            muos_close(fds[0]); muos_close(fds[1]);
+        }
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "execbin")) {
+        int pid = muos_fork();
+        if (pid == 0) {
+            char* args[3];
+            args[0] = "echo";
+            args[1] = "CHILD-EXEC-BIN-OK";
+            args[2] = 0;
+            muos_execve("/bin/echo", args, 0);
+            muos_exit(99);
+        }
+        int status = 0;
+        muos_waitpid(pid, &status, 0);
+        muos_puts("execbin: status="); muos_putdec((status >> 8) & 0xFF);
+        muos_puts("\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "pipefork")) {
+        int fds[2] = { -1, -1 };
+        if (muos_pipe(fds) != 0) { muos_puts("PIPE-FORK-BAD\n"); return 0; }
+        int pid = muos_fork();
+        if (pid == 0) {
+            muos_close(fds[0]);
+            const char msg[] = "PIPE-FORK-OK";
+            muos_write(fds[1], msg, sizeof(msg) - 1);
+            muos_close(fds[1]);
+            muos_exit(0);
+        }
+        muos_close(fds[1]);
+        int status = 0;
+        muos_waitpid(pid, &status, 0);
+        char rb[24];
+        int n = muos_read(fds[0], rb, sizeof(rb) - 1);
+        rb[n > 0 ? n : 0] = '\0';
+        muos_puts("pipe-fork: read="); muos_puts(rb); muos_puts("\n");
+        muos_close(fds[0]);
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "fork")) {
         muos_puts("fork-test: parent before fork\n");
         int pid = muos_fork();

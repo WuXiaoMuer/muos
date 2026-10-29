@@ -42,7 +42,9 @@ typedef enum {
     USER_FD_DEV_NULL,
     USER_FD_DEV_ZERO,
     USER_FD_DEV_CONSOLE,
-    USER_FD_VFILE
+    USER_FD_VFILE,
+    USER_FD_PIPE_READ,
+    USER_FD_PIPE_WRITE
 } user_fd_kind_t;
 
 void     user_fds_reset(void);
@@ -50,6 +52,8 @@ int      user_fd_alloc(int fs_slot);
 int      user_fd_alloc_dir(const char* path);
 int      user_fd_alloc_dev(int kind);
 int      user_fd_alloc_vfile(const char* data, uint32_t len);
+int      user_fd_alloc_pipe(int pipe_id, bool_t write_end);
+int      user_fd_pipe_id(int fd);
 int      user_fd_kind(int fd);
 bool_t   user_fd_is_dir(int fd);
 const char* user_fd_dir_path(int fd);
@@ -88,7 +92,8 @@ extern uint32_t user_kernel_esp_save;
 /* Enter Ring3 with a full register set (child after fork). */
 void user_enter_regs(uint32_t entry, uint32_t user_sp, uint32_t eax,
                      uint32_t ebx, uint32_t ecx, uint32_t edx,
-                     uint32_t esi, uint32_t edi, uint32_t ebp);
+                     uint32_t esi, uint32_t edi, uint32_t ebp,
+                     uint32_t fs_sel, uint32_t gs_sel);
 
 /* Anonymous mmap arena: page-granular bump inside the sandbox.
  * Returns 0 when the request does not fit. */

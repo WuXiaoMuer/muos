@@ -39,10 +39,12 @@ typedef struct {
     void*    fd_state;
     char     cwd[USER_FD_PATH_MAX];
     uint32_t brk_base, brk_cur;
+    uint32_t tls_base, tls_limit, tls_flags;   /* GDT slot 6 per process */
 
     /* Registers to resume at (children start after the parent's fork) */
     uint32_t eip, esp, eflags;
     uint32_t eax, ebx, ecx, edx, esi, edi, ebp;
+    uint32_t fs_sel, gs_sel;
     bool_t   has_ctx;
 } proc_t;
 

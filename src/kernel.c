@@ -19,6 +19,7 @@
 #include "tss.h"
 #include "module.h"
 #include "proc.h"
+#include "pipe.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
@@ -149,6 +150,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
      * Register the kernel as a task first so the task tests pass. */
     task_register("kernel");
     proc_init();
+    pipe_init();
     tests_run();
 
     /* Boot animation */

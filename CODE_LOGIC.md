@@ -1,6 +1,6 @@
 # MuOS 代码逻辑(v1.2)
 
-本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、顺序快照进程模型、77 项自检。演进计划见 ROADMAP.md。
+本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、顺序快照进程模型、81 项自检。演进计划见 ROADMAP.md。
 
 ## 一、总体结构
 
@@ -51,7 +51,7 @@ serial → vga → GDT → IDT(256 项)→ PIC(重映射+全屏蔽)
 → tss_init()                      [TSS + 8KB Ring0 入口栈 + ltr]
 → PIT 100Hz + IRQ0 → keyboard → mouse(8042 aux / IRQ12)
 → task_init + task_register("kernel")
-→ tests_run()                     [77 项自检,失败打印 SELF-TEST FAILED]
+→ tests_run()                     [81 项自检,失败打印 SELF-TEST FAILED]
 → 启动动画 → shell_run()(内核栈上)
 ```
 
@@ -190,11 +190,14 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 - `waitpid(7)/wait4(114)`:找到子进程;若未运行,先把父进程现场写回父快照,再把子快照装入沙箱、恢复 fd/cwd/brk,把 TSS.esp0 指向子进程的内核栈,调用 `user_enter_regs` 从子进程的 eip/esp 进入 Ring3。子进程 exit/故障时 `user_return_to_kernel` 回到 waitpid 内部;标记 ZOMBIE、记录状态、释放子快照、恢复父进程并返回。
 - `execve(11)`:先把 path/argv 拷到内核,`vfs_lookup` 找到 RAM FS 文件,`elf32_validate` 预校验;`user_exec_image` 清空沙箱、重载段、重建初始栈(保留 fd/cwd),再把 syscall 的 iret 帧改成新 entry/esp——同一个 pid 原地替换。
 - `user_enter_regs`(isr_stubs.s):与 `user_enter` 相同的内核上下文保存,但在 iret 前恢复 eax/ebx/ecx/edx/esi/edi/ebp;用户内核栈互不覆盖是子进程能安全执行的关键。
-- `/proc` 目录由 proc 表动态生成 PID 子目录;`/proc/self` 解析为当前进程。`ps` 读取 `/proc/<pid>/stat` 与 `cmdline`。
+- `/proc` 目录由 proc 表动态生成 PID 子目录;`/proc/self` 解析为当前进程。`ps` 读取 `/proc/<pid>/stat` 与 `cmdline`;另有 `/proc/loadavg`、`/proc/stat`、`/proc/self/maps`。
+- 虚拟 `/bin`、`/usr/bin`、`/sbin` 下的任意名字(以及 `/bin/busybox`)映射到 Multiboot module 0;`execve` 支持 `VFS_T_MODULE`,BusyBox shell 因此能按 PATH 重新执行自身 applet。
+- `pipe(42)/pipe2(331)`:8 个 4KB 环形缓冲 pipe.c;fd 表新增 `PIPE_READ/PIPE_WRITE` 类型,`read/write/dup/dup2/close/fstat` 均支持;shell 的 `echo hi | cat`、`ls | wc -l` 已跑通。
+- `clone(120)` 仅接受非 CLONE_VM 且无自定义栈的 fork 语义,`vfork(190)` 等同 fork;`kill(37)` 校验 pid 但不投递信号;进程组调用返回 pid。
 
 ## 八、Shell / FS / 桌面
 
-- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 有 MAX_ARGS=16 硬边界(曾有 17+ token 栈溢出漏洞);29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault]` 运行内嵌 ELF,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
+- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault]` 运行内嵌 ELF,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
 - **fs.c**:RAM 文件系统,16 槽 × 64KB(能存放静态 i386 ELF),fd 即槽位下标(无句柄/引用保护——`fs_open` 后文件可被删,这是已知局限)。除 shell 用的整文件 write/read 外,`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 支持同目录改名/覆盖(重名校验、内容保留)。架构级改造见 ROADMAP。
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
 - **win7.c**:文本模式 Win7 风格桌面——行 0 标题、1..23 桌面、24 任务栏;窗口按 z-order 绘制(活动窗口最后),鼠标点击/标题栏拖拽/最小化/最大化/关闭,开始菜单鼠标/键盘双操作,桌面图标可见;任务栏显示实时内存与 CMOS RTC `HH:MM:SS`。`gui`/`win7`/`desktop` 命令共用此实现;`run` 之外的 Text Editor/Calculator 可从菜单或图标启动(Calculator 聚焦时直接吃数字/运算符)。
@@ -232,8 +235,8 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 ## 十一、已知局限(真实清单)
 
 1. 用户态是**固定 8MB 单地址空间 + 顺序快照进程模型**:无 higher-half、无每进程页目录、无抢占调度;子进程只在父 `waitpid` 时运行,不是真正并发(ROADMAP 阶段 1 剩余项)
-2. 系统调用仍缺并发原语:`clone`、`pipe/pipe2`、`signals/kill`、`mkdir` 与文件 mmap;`/proc` 有 pid 目录,但 `top/vmstat` 需要的 `/proc/stat` 等仍缺(ROADMAP 阶段 2/4)
-3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;`fork+execve+waitpid` 已由 `run fork` 验证,但 BusyBox `sh` 外部 applet 还缺 `/bin/<applet>` → busybox 模块的 PATH 映射,也没有管道/多级目录/磁盘
+2. 系统调用仍缺真正并发:`clone` 只支持非线程 fork,`kill` 不投递信号,无抢占调度/线程;`mkdir/rmdir` 与文件 mmap、`/proc/stat` 全量字段仍缺(ROADMAP 阶段 2/4)
+3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;`fork+execve+waitpid`、虚拟 `/bin/*`、`pipe2` 与 shell 管道已跑通,但仍无多级目录/磁盘/网络/图形
 4. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 5. fs 无句柄保护、无目录层级/持久化;时间戳仅存于 RAM FS,重启丢失;write 截断不告警;`/dev`、`/proc`、`/etc` 为只读虚拟层
 6. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化

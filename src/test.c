@@ -13,6 +13,7 @@
 #include "user.h"
 #include "rtc.h"
 #include "proc.h"
+#include "pipe.h"
 
 /* ANSI-ish helpers */
 #define OK  "[PASS] "
@@ -327,6 +328,20 @@ static void test_proc(void) {
     CHECK(proc_count() == n0, "proc_reap frees process slots");
 }
 
+/* ---------- Pipe ring buffer ---------- */
+static void test_pipe(void) {
+    int id = pipe_create();
+    CHECK(id >= 0, "pipe_create allocates an id");
+    if (id < 0) return;
+
+    char out[8];
+    CHECK(pipe_write(id, "abcde", 5) == 5 && pipe_fill(id) == 5,
+          "pipe_write fills the ring buffer");
+    CHECK(pipe_read(id, out, 5) == 5 && out[0] == 'a' && out[4] == 'e',
+          "pipe_read returns FIFO bytes");
+    CHECK(pipe_fill(id) == 0, "pipe_fill drops after read");
+}
+
 /* ---------- Embedded Ring3 image ---------- */
 static void test_user_image(void) {
     uint32_t size = 0;
@@ -375,6 +390,7 @@ int tests_run(void) {
     test_fs_rename();
     test_time();
     test_proc();
+    test_pipe();
     test_vga();
     test_keyboard();
     test_pit();

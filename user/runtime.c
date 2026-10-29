@@ -66,6 +66,10 @@ int muos_execve(const char* path, char* const argv[], char* const envp[]) {
     return syscall3(11, (int)path, (int)argv, (int)envp);
 }
 
+int muos_pipe(int fds[2]) {
+    return syscall1(42, (int)fds);
+}
+
 int muos_lseek(int fd, int offset, int whence) {
     return syscall3(19, fd, offset, whence);
 }
