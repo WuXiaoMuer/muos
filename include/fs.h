@@ -52,6 +52,7 @@ uint32_t fs_size(int idx);   /* size of the idx-th *existing* file (ls) */
 const char* fs_fd_data(int fd);
 uint32_t    fs_fd_size(int fd);
 int         fs_fd_truncate(int fd);
+int         fs_truncate(int fd, uint32_t len);   /* resize: grow zero-fills */
 uint32_t    fs_fd_atime(int fd);
 uint32_t    fs_fd_mtime(int fd);
 uint32_t    fs_fd_ctime(int fd);

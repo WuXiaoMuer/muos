@@ -11,6 +11,13 @@
 #define MUOS_O_TRUNC  0x200
 #define MUOS_O_DIRECTORY 0x10000
 
+/* mmap(2) prot/flags and rlimit resources */
+#define MUOS_PROT_READ  0x1
+#define MUOS_MAP_PRIVATE 0x2
+#define MUOS_MAP_FIXED  0x10
+#define MUOS_MAP_ANONYMOUS 0x20
+#define MUOS_RLIMIT_NOFILE 7
+
 /* *at resolver flags (Linux i386 values) */
 #define MUOS_AT_FDCWD     (-100)
 #define MUOS_AT_REMOVEDIR 0x200
@@ -41,6 +48,13 @@ int  muos_getpid(void);
 int  muos_uname(char* out /* 390 bytes */);
 unsigned muos_mmap(unsigned len);
 int  muos_munmap(unsigned addr, unsigned len);
+unsigned muos_mmap_file(int fd, unsigned len, int prot, int flags, unsigned offset);
+int  muos_chmod(const char* path, int mode);
+int  muos_truncate(const char* path, unsigned len);
+int  muos_ftruncate(int fd, unsigned len);
+int  muos_fsync(int fd);
+int  muos_getrlimit(int resource, unsigned* out /* 2 words */);
+int  muos_prlimit64(int resource, unsigned* out /* 4 words: cur/max u64 */);
 
 void muos_puts(const char* s);
 void muos_putdec(int value);

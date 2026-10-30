@@ -41,7 +41,7 @@
 
 - [x] int 0x80 分发器:eax=调用号,ebx/ecx/edx 传参,返回值 eax;错误约定 `-errno`;未知号返回 `-ENOSYS` 并串口记录
 - [x] 第一批中的 `exit(1) read(3) write(4) open(5) close(6) getpid(20) getuid(24) brk(45)`;`fork(2)`、`waitpid(7)/wait4(114)`、`execve(11)` 已实现(顺序快照模型)
-- [x] 用户态堆:brk 与匿名 mmap 在沙箱内 bump(页级 vmm 分配待做)
+- [x] 用户态堆:brk 与匿名 mmap 在沙箱内 bump(页级 vmm 分配待做);文件 mmap 已支持(见阶段 4)
 - [x] 用户 fd 表:stdio 0/1/2 + 文件 fd 从 3 起,映射 RAM FS 槽位并维护偏移;尚未挂进 task_t
 - [ ] fs 句柄引用计数(open 计数/close 释放),防止文件被删除后 fd 悬空
 - [ ] 基本信号占位(SIGKILL/SIGTERM 直接生效即可)
@@ -64,10 +64,12 @@
 
 目标:运行真实 Linux 静态二进制(如 busybox i386 静态构建)。
 
-- [x] 起步:`old_mmap/munmap(90/91)`(仅匿名)、`uname(122)`、`lseek(19)`、uid/gid
+- [x] 起步:`old_mmap/munmap(90/91)`(匿名 + 文件映射)、`uname(122)`、`lseek(19)`、uid/gid
 - [x] 真实静态 i386 BusyBox 1.36.1 进入 Ring3 并运行 `echo`(i386 TLS、exit_group、uid32、ioctl、dup2、envp/auxv 栈)
 - [x] BusyBox `ls/cat` 需求集:根目录 fd + `getdents(141)/getdents64(220)`、`stat/lstat/fstat(64)`、`statx(383)`、`access(33)`、`getcwd(183)`、`writev/readv(145/146)`、`rt_sigaction(174)`、`fcntl(64)`、`llseek(140)`、`sendfile(64)`、可关闭的 stdio fd
 - [x] 扁平 VFS 文件变更:`unlink(10)`、`rename(38)`、`fs_rename`;`utimes/futimesat/utimensat` 校验路径后成功(时间戳不持久化)
+- [x] 元数据/截断/同步:`chmod(15)/fchmod(94)`、`truncate(92/193)/ftruncate(93/194)`(增长零填充、缩小改 size)、`fsync(118)/fdatasync(144)/sync(36)`;`getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340)`,`ulimit -n` 实测返回 11
+- [x] 文件 mmap:RAM FS 槽位与 `/proc` 快照按页拷入沙箱并零填充,`old_mmap` 字节偏移、`mmap2` 页偏移,`MAP_FIXED` 在沙箱内允许;映射是副本,`MAP_SHARED` 写回待做
 - [x] 验收:`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a` 与 20+ applet(含 `ls -l`、`wc`、`grep`、`sed`、`od`、`cp/rm/mv/touch`)全部通过;`ENOENT`/`ENOTDIR`/`EBADF` 路径也符合 Linux 行为
 - [x] 设备与虚拟文件:`/dev/null` `/dev/zero` `/dev/console` 内核态字符设备;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/etc/mtab` 只读快照
 - [x] `statfs/fstatfs(99/100)`、`statfs64/fstatfs64(268/269)`、`sysinfo(116)`;统一 0..10 fd 表后 `dup/dup2` 支持 stdio 重定向,`free/df/dd/stat -f` 实测通过

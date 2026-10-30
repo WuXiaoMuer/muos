@@ -304,6 +304,19 @@ int fs_fd_truncate(int fd) {
     return 0;
 }
 
+/* Resize a file to an exact length. Growing zero-fills the new tail;
+ * shrinking only drops the size (stale bytes are never exposed because
+ * every reader stops at size). */
+int fs_truncate(int fd, uint32_t len) {
+    if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return -1;
+    if (len > FS_MAX_SIZE) return -1;
+    if (len > files[fd].size)
+        memset(files[fd].data + files[fd].size, 0, len - files[fd].size);
+    files[fd].size = len;
+    files[fd].mtime = files[fd].ctime = rtc_now();
+    return 0;
+}
+
 uint32_t fs_fd_atime(int fd) {
     if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return 0;
     return files[fd].atime;

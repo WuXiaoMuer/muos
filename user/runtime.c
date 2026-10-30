@@ -133,6 +133,41 @@ unsigned muos_mmap(unsigned len) {
     return (unsigned)syscall1(90, (int)args);
 }
 
+unsigned muos_mmap_file(int fd, unsigned len, int prot, int flags, unsigned offset) {
+    unsigned args[6];
+    args[0] = 0;
+    args[1] = len;
+    args[2] = (unsigned)prot;
+    args[3] = (unsigned)flags;
+    args[4] = (unsigned)fd;
+    args[5] = offset;
+    return (unsigned)syscall1(90, (int)args);
+}
+
+int muos_chmod(const char* path, int mode) {
+    return syscall2(15, (int)path, mode);
+}
+
+int muos_truncate(const char* path, unsigned len) {
+    return syscall2(92, (int)path, (int)len);
+}
+
+int muos_ftruncate(int fd, unsigned len) {
+    return syscall2(93, fd, (int)len);
+}
+
+int muos_fsync(int fd) {
+    return syscall1(118, fd);
+}
+
+int muos_getrlimit(int resource, unsigned* out) {
+    return syscall2(76, resource, (int)out);
+}
+
+int muos_prlimit64(int resource, unsigned* out) {
+    return syscall4(340, 0, resource, 0, (int)out);
+}
+
 int muos_munmap(unsigned addr, unsigned len) {
     return syscall2(91, (int)addr, (int)len);
 }

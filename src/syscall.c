@@ -120,6 +120,34 @@
 #define AT_EMPTY_PATH       0x1000
 #define AT_REMOVEDIR        0x200
 
+/* Metadata, truncation, sync and rlimit calls. */
+#define SYS_chmod           15
+#define SYS_sync            36
+#define SYS_setrlimit       75
+#define SYS_getrlimit       76
+#define SYS_truncate        92
+#define SYS_ftruncate       93
+#define SYS_fchmod          94
+#define SYS_fsync          118
+#define SYS_fdatasync      144
+#define SYS_ugetrlimit     191
+#define SYS_truncate64     193
+#define SYS_ftruncate64    194
+#define SYS_prlimit64      340
+
+#define RLIMIT_CPU      0
+#define RLIMIT_FSIZE    1
+#define RLIMIT_DATA     2
+#define RLIMIT_STACK    3
+#define RLIMIT_CORE     4
+#define RLIMIT_RSS      5
+#define RLIMIT_NPROC    6
+#define RLIMIT_NOFILE   7
+#define RLIMIT_MEMLOCK  8
+#define RLIMIT_AS       9
+#define RLIM_INFINITY   0xFFFFFFFFu
+#define RLIMIT64_SIZE   16
+
 #define ERR_EPERM      1
 #define ERR_ENOENT     2
 #define ERR_ESRCH      3
@@ -137,6 +165,7 @@
 #define ERR_EINVAL    22
 #define ERR_EMFILE    24
 #define ERR_ENOSPC    28
+#define ERR_EFBIG     27
 #define ERR_ENOTTY    25
 #define ERR_ERANGE    34
 #define ERR_ENAMETOOLONG 36
@@ -163,6 +192,7 @@
 #define S_IFDIR 0040000u
 #define S_IFCHR 0020000u
 #define S_IFIFO 0010000u
+#define MAP_SHARED    0x01
 #define MAP_PRIVATE   0x02
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
@@ -1437,6 +1467,110 @@ static uint32_t do_chmod_buf(const char* buf) {
     return err(ERR_EPERM);
 }
 
+static uint32_t do_chmod(uint32_t path_ptr, uint32_t mode) {
+    (void)mode;
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+    return do_chmod_buf(buf);
+}
+
+static uint32_t do_fchmod(uint32_t fd, uint32_t mode) {
+    (void)mode;
+    int kind = user_fd_kind((int)fd);
+    if (kind < 0) return err(ERR_EBADF);
+    if (kind == USER_FD_FILE || kind == USER_FD_DIR) return 0;
+    return err(ERR_EPERM);
+}
+
+static uint32_t do_ftruncate(uint32_t fd, uint32_t len) {
+    int kind = user_fd_kind((int)fd);
+    if (kind < 0) return err(ERR_EBADF);
+    if (kind != USER_FD_FILE) return err(ERR_EINVAL);
+    int slot = user_fd_slot((int)fd);
+    if (slot < 0) return err(ERR_EBADF);
+    return fs_truncate(slot, len) == 0 ? 0 : err(ERR_EINVAL);
+}
+
+static uint32_t do_truncate(uint32_t path_ptr, uint32_t len) {
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+    if (e.type == VFS_T_DIR) return err(ERR_EISDIR);
+    if (e.type != VFS_T_FILE) return err(ERR_EINVAL);
+    return fs_truncate(e.slot, len) == 0 ? 0 : err(ERR_EINVAL);
+}
+
+static uint32_t do_truncate64(uint32_t path_ptr, uint32_t lo, uint32_t hi) {
+    if (hi) return err(ERR_EFBIG);          /* RAM FS files are <= 64KB */
+    return do_truncate(path_ptr, lo);
+}
+
+static uint32_t do_ftruncate64(uint32_t fd, uint32_t lo, uint32_t hi) {
+    if (hi) return err(ERR_EFBIG);
+    return do_ftruncate(fd, lo);
+}
+
+/* RAM FS writes are already in memory; sync is a successful no-op. */
+static uint32_t do_fsync(uint32_t fd) {
+    return user_fd_kind((int)fd) < 0 ? err(ERR_EBADF) : 0;
+}
+
+/* ---- rlimits ---- */
+
+static bool_t rlimit_values(uint32_t resource, uint32_t* cur, uint32_t* max) {
+    if (resource > 15) return false;
+    switch (resource) {
+        case RLIMIT_NOFILE: *cur = *max = USER_FD_MAX; break;
+        case RLIMIT_STACK:
+        case RLIMIT_DATA:
+        case RLIMIT_AS:     *cur = *max = USER_SIZE; break;
+        case RLIMIT_CORE:   *cur = *max = 0; break;
+        default:            *cur = *max = RLIM_INFINITY; break;
+    }
+    return true;
+}
+
+static uint32_t do_getrlimit(uint32_t resource, uint32_t ptr) {
+    if (!user_ptr_ok(ptr, 8)) return err(ERR_EFAULT);
+    uint32_t cur, max;
+    if (!rlimit_values(resource, &cur, &max)) return err(ERR_EINVAL);
+    put_u32((char*)ptr, 0, cur);
+    put_u32((char*)ptr, 4, max);
+    return 0;
+}
+
+static uint32_t do_setrlimit(uint32_t resource, uint32_t ptr) {
+    if (!user_ptr_ok(ptr, 8)) return err(ERR_EFAULT);
+    if (resource > 15) return err(ERR_EINVAL);
+    return 0;   /* limits are advisory in this single-user kernel */
+}
+
+/* prlimit64(340): modern musl asks for limits through this call. */
+static uint32_t do_prlimit64(uint32_t pid, uint32_t resource,
+                             uint32_t new_ptr, uint32_t old_ptr) {
+    if (new_ptr && !user_ptr_ok(new_ptr, RLIMIT64_SIZE)) return err(ERR_EFAULT);
+    if (old_ptr && !user_ptr_ok(old_ptr, RLIMIT64_SIZE)) return err(ERR_EFAULT);
+
+    uint32_t cur, max;
+    if (!rlimit_values(resource, &cur, &max)) return err(ERR_EINVAL);
+
+    proc_t* self = proc_current();
+    uint32_t self_pid = self ? self->pid : 1;
+    if (pid != 0 && pid != self_pid) {
+        if (!proc_find(pid)) return err(ERR_ESRCH);
+        return err(ERR_EPERM);
+    }
+
+    if (old_ptr) {
+        put_u64((char*)old_ptr, 0, (uint64_t)cur);
+        put_u64((char*)old_ptr, 8, (uint64_t)max);
+    }
+    return 0;
+}
+
 static uint32_t do_chdir(uint32_t path_ptr) {
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
@@ -2047,16 +2181,66 @@ static uint32_t do_uname(uint32_t ptr) {
     return 0;
 }
 
-/* Anonymous mappings only: the sandbox is pre-mapped, so this is a bump
- * allocator. File-backed mmap is rejected until a real VFS exists. */
+/* The sandbox is pre-mapped, so mappings are simulated inside it: anonymous
+ * ones come from the bump arena, file-backed ones copy the file contents in
+ * and zero-fill the remainder. MAP_FIXED is allowed inside the sandbox; the
+ * caller (e.g. a future dynamic loader) is responsible for what it covers. */
 static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
                         uint32_t flags, int fd, uint32_t offset) {
-    (void)addr; (void)prot; (void)offset;
-    if (!(flags & MAP_ANONYMOUS) || (flags & MAP_FIXED)) return err(ERR_EINVAL);
-    if (fd != -1) return err(ERR_ENODEV);
-    uint32_t p = user_mmap_anon(len);
-    if (!p) return err(ERR_ENOMEM);
-    return p;
+    (void)prot;
+    if (len == 0) return err(ERR_EINVAL);
+
+    uint32_t rounded = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1u);
+    if (rounded < len || rounded > USER_SIZE) return err(ERR_ENOMEM);
+
+    uint32_t at;
+    if (flags & MAP_FIXED) {
+        if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+        if (addr < USER_BASE || rounded > USER_END - USER_STACK_RESERVE - addr)
+            return err(ERR_ENOMEM);
+        at = addr;
+    } else {
+        at = user_mmap_anon(len);
+        if (!at) return err(ERR_ENOMEM);
+    }
+
+    if (flags & MAP_ANONYMOUS) {
+        if (fd != -1) return err(ERR_EINVAL);
+        if (flags & MAP_FIXED) memset((void*)at, 0, rounded);
+        return at;                  /* the bump arena is already zeroed */
+    }
+
+    if (fd < 0) return err(ERR_EBADF);
+    if (offset & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+
+    const char* data = NULL;
+    uint32_t fsize = 0;
+    int kind = user_fd_kind(fd);
+    if (kind == USER_FD_FILE) {
+        int slot = user_fd_slot(fd);
+        if (slot < 0) return err(ERR_EBADF);
+        data = fs_fd_data(slot);
+        fsize = fs_fd_size(slot);
+    } else if (kind == USER_FD_VFILE) {
+        fsize = user_fd_vfile(fd, &data);   /* read-only kernel snapshot */
+    } else {
+        return err(ERR_ENODEV);
+    }
+
+    memset((void*)at, 0, rounded);
+    if (data && offset < fsize) {
+        uint32_t avail = fsize - offset;
+        uint32_t n = avail < rounded ? avail : rounded;
+        memcpy((void*)at, data + offset, n);
+    }
+    return at;
+}
+
+/* mmap2 takes the offset in 4096-byte pages (i386 Linux ABI). */
+static uint32_t do_mmap2(uint32_t addr, uint32_t len, uint32_t prot,
+                         uint32_t flags, int fd, uint32_t pgoff) {
+    if (pgoff > 0xFFFFFFFFu / PAGE_SIZE) return err(ERR_EINVAL);
+    return do_mmap(addr, len, prot, flags, fd, pgoff * PAGE_SIZE);
 }
 
 static uint32_t do_old_mmap(uint32_t args_ptr) {
@@ -2220,6 +2404,41 @@ void syscall_handler(registers_t* regs) {
         case SYS_access:
             ret = do_access(regs->ebx, regs->ecx);
             break;
+        case SYS_chmod:
+            ret = do_chmod(regs->ebx, regs->ecx);
+            break;
+        case SYS_fchmod:
+            ret = do_fchmod(regs->ebx, regs->ecx);
+            break;
+        case SYS_truncate:
+            ret = do_truncate(regs->ebx, regs->ecx);
+            break;
+        case SYS_ftruncate:
+            ret = do_ftruncate(regs->ebx, regs->ecx);
+            break;
+        case SYS_truncate64:
+            ret = do_truncate64(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_ftruncate64:
+            ret = do_ftruncate64(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_fsync:
+        case SYS_fdatasync:
+            ret = do_fsync(regs->ebx);
+            break;
+        case SYS_sync:
+            ret = 0;   /* every write already lives in memory */
+            break;
+        case SYS_getrlimit:
+        case SYS_ugetrlimit:
+            ret = do_getrlimit(regs->ebx, regs->ecx);
+            break;
+        case SYS_setrlimit:
+            ret = do_setrlimit(regs->ebx, regs->ecx);
+            break;
+        case SYS_prlimit64:
+            ret = do_prlimit64(regs->ebx, regs->ecx, regs->edx, regs->esi);
+            break;
         case SYS_getcwd:
             ret = do_getcwd(regs->ebx, regs->ecx);
             break;
@@ -2351,8 +2570,9 @@ void syscall_handler(registers_t* regs) {
             ret = do_old_mmap(regs->ebx);
             break;
         case SYS_mmap2:
-            /* pgoffset (ebp) must be 0 for anonymous mappings */
-            ret = do_mmap(regs->ebx, regs->ecx, regs->edx, regs->esi, (int)regs->edi, regs->ebp);
+            /* ebp carries the file offset in 4096-byte pages */
+            ret = do_mmap2(regs->ebx, regs->ecx, regs->edx, regs->esi,
+                           (int)regs->edi, regs->ebp);
             break;
         case SYS_munmap:
         case SYS_mprotect:

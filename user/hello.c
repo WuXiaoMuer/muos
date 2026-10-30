@@ -81,6 +81,105 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "mmapfile")) {
+        /* File-backed mmap, truncate (shrink/grow), chmod, fsync and rlimits. */
+        int ok = 1;
+        int rc;
+        const char msg[] = "FILE-MMAP-CONTENT";
+        const unsigned mlen = sizeof(msg) - 1;
+        union {
+            char raw[MUOS_STAT64_SIZE];
+            unsigned word[MUOS_STAT64_SIZE / 4];
+        } st;
+
+        int wfd = muos_open("mmap.txt", MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        muos_puts("mfile: create="); muos_putdec(wfd); muos_puts("\n");
+        ok = ok && wfd >= 0;
+        if (wfd >= 0) {
+            muos_write(wfd, msg, mlen);
+            muos_close(wfd);
+        }
+
+        int fd = muos_open("mmap.txt", 0);
+        muos_puts("mfile: open="); muos_putdec(fd); muos_puts("\n");
+        ok = ok && fd >= 0;
+
+        if (fd >= 0) {
+            char* p = (char*)muos_mmap_file(fd, 4096, MUOS_PROT_READ,
+                                            MUOS_MAP_PRIVATE, 0);
+            int same = (p && (unsigned)p >= 0x08048000u) ? 1 : 0;
+            for (unsigned i = 0; same && i < mlen; i++)
+                if (p[i] != msg[i]) same = 0;
+            if (same && p[mlen] != 0) same = 0;      /* zero-filled tail */
+            muos_puts("mfile: mmap="); muos_puthex((unsigned)p);
+            muos_puts(same ? " content-ok\n" : " content-bad\n");
+            ok = ok && same;
+            if (p) muos_munmap((unsigned)p, 4096);
+
+            rc = muos_ftruncate(fd, 8);
+            muos_puts("mfile: ftruncate-shrink="); muos_putdec(rc); muos_puts("\n");
+            ok = ok && rc == 0;
+
+            char* p2 = (char*)muos_mmap_file(fd, 4096, MUOS_PROT_READ,
+                                             MUOS_MAP_PRIVATE, 0);
+            int shrunk = (p2 && p2[0] == 'F' && p2[7] == 'A' && p2[8] == 0) ? 1 : 0;
+            muos_puts(shrunk ? "mfile: shrink-ok\n" : "mfile: shrink-bad\n");
+            ok = ok && shrunk;
+            if (p2) muos_munmap((unsigned)p2, 4096);
+
+            rc = muos_ftruncate(fd, 64);
+            muos_puts("mfile: ftruncate-grow="); muos_putdec(rc); muos_puts("\n");
+            ok = ok && rc == 0;
+
+            char* p3 = (char*)muos_mmap_file(fd, 4096, MUOS_PROT_READ,
+                                             MUOS_MAP_PRIVATE, 0);
+            int grown = (p3 && p3[8] == 0 && p3[20] == 0 && p3[63] == 0) ? 1 : 0;
+            muos_puts(grown ? "mfile: grow-zeros-ok\n" : "mfile: grow-zeros-bad\n");
+            ok = ok && grown;
+            if (p3) muos_munmap((unsigned)p3, 4096);
+
+            rc = muos_fsync(fd);
+            muos_puts("mfile: fsync="); muos_putdec(rc); muos_puts("\n");
+            ok = ok && rc == 0;
+            muos_close(fd);
+        }
+
+        rc = muos_chmod("mmap.txt", 0644);
+        muos_puts("mfile: chmod="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        rc = muos_truncate("mmap.txt", 32);
+        muos_puts("mfile: truncate="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        rc = muos_fstatat64(MUOS_AT_FDCWD, "mmap.txt", st.raw, 0);
+        muos_puts("mfile: stat-size="); muos_putdec((int)st.word[11]); muos_puts("\n");
+        ok = ok && rc == 0 && st.word[11] == 32;
+
+        rc = muos_truncate("/no-such.txt", 8);
+        muos_puts("mfile: truncate-ENOENT="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == -2;
+
+        rc = muos_ftruncate(0, 8);
+        muos_puts("mfile: ftruncate-stdin="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == -22;
+
+        unsigned lim[2];
+        rc = muos_getrlimit(MUOS_RLIMIT_NOFILE, lim);
+        muos_puts("mfile: getrlimit="); muos_putdec(rc);
+        muos_puts(" nofile="); muos_putdec((int)lim[0]); muos_puts("\n");
+        ok = ok && rc == 0 && lim[0] == 11;
+
+        unsigned lim64[4];
+        rc = muos_prlimit64(MUOS_RLIMIT_NOFILE, lim64);
+        muos_puts("mfile: prlimit64="); muos_putdec(rc);
+        muos_puts(" nofile="); muos_putdec((int)lim64[0]); muos_puts("\n");
+        ok = ok && rc == 0 && lim64[0] == 11u;
+
+        muos_puts(ok ? "FILE-MMAP-OK\n" : "FILE-MMAP-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "at")) {
         /* Exercised entirely through the i386 *at syscalls: mkdirat,
          * openat with a directory fd, fstatat64, fchmodat, readlinkat,
