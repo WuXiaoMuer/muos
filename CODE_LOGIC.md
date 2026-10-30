@@ -256,6 +256,13 @@ USER_SIGTRAMP = 0x08847000
 - `fb.c` 额外导出 `fb_pixel/fb_get_pixel/fb_fill_rect/fb_text/fb_palette`,按 bpp 读写任意像素;`mouse_get_pixels` 暴露 640×400 的原始鼠标坐标(文本桌面用的是 8×16 单元坐标)。
 - `pixel` 命令:进入前用 `vga_get_cell` 保存 80×25 影子网格;画 4 行一格的渐变桌面、顶部提示条、两个带标题栏/关闭按钮/阴影的窗口、底部任务栏;文字用 8×8 字模原尺寸绘制。鼠标箭头以 10×14 掩码绘制,移动前用保存的像素恢复旧位置;ESC/q 退出后恢复影子网格并 `vga_repaint()`。仅 VBE 路径可用,`-kernel` 下提示需要 ISO。无窗口管理/控件/事件分发,属于视觉原型。
 
+### 7.11 分区表与只读 FAT32 / ext2(part.c / fat.c / ext2.c)
+
+- `part.c`:读 LBA0;无 `0xAA55` 签名即“整盘卷”(MuFS 或裸 FAT),有签名则视为分区表。若某项类型为 `0xEE`(保护性 MBR),读 LBA1 的 GPT 头(`EFI PART`),用 header 的 entries LBA/数量/项大小遍历条目,只保留 Basic Data GUID(`A2A0D0EB-E5B9-3344-87C0-68B6B72699C7`,按磁盘小端字节比较),名字按 UTF-16LE 低字节转 ASCII;否则解析 MBR 4 个 16 字节条目。`part_is_partitioned()` 供 `fs.c` 判断“不要格式化这块盘”。
+- `fat.c`:取第一个能通过 BPB 校验的分区(或整盘)。校验 512B/扇区、`fat_size16==0`、固定根目录项为 0、合法 spc(1..32 且 2 的幂)、FAT 数 1–2;计算 `fat_start = 分区起点 + reserved`、`data_start = fat_start + nfats*fsz32`。簇链读取:按 `cluster*4` 定位 FAT 扇区,取低 28 位。目录遍历把整个目录簇读入 16KB 缓冲;`0x00` 结束、`0xE5` 删除;`attr&0x3F==0x0F` 为 LFN 项,按序号把 UTF-16 字符写回 `(seq-1)*13` 位置,遇到短项时优先用 LFN 比较(否则 8.3 名),比较不区分大小写。`fat_read_file` 按 size 逐簇拷贝。`fat_list` 输出 `D/F size name` 行。
+- `ext2.c`:`ext2_init` 只接受 0x83/GPT 分区(或整盘),读分区 +1024 的超级块校验 `0xEF53`,取 `1K<<log_block_size`、组大小/inode 大小(rev0 固定 128);组描述符表位于 `first_data_block+1`,按 `group*32` 字节偏移取 inode table 块号。`read_inode` 按 `(ino-1)/ipg` 与 `%ipg` 定位 128 字节 inode;目录项是 `{inode, rec_len, name_len, name}` 线性表。文件块支持 12 个直接块 + 一级间接(间接块内索引)。`ext2_list/read_file` 与 FAT 版本接口对称。
+- 集成:内核在 `ata_init` 后依次调用 `part_init/fat_init/ext2_init`;`fs_persist_mount` 看到分区表就保持内存模式,避免把 FAT/ext2 盘格式化成 MuFS。Shell 增加 `part/fatls/fatcat/ext2ls/ext2cat`;`tools/make_fs_images.py` 生成带 MBR 或保护性 MBR+GPT 的 FAT32 镜像与一个 4MB ext2 镜像,`tools/test_fs_read.py` 三次启动验证 MBR FAT32、GPT FAT32 与 ext2 的目录/长名/子目录读取。
+
 ## 八、Shell / FS / 桌面
 
 - **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;30 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault|pie|dyn|net]` 运行内嵌 ELF(其中 `dyn` 先写 `/lib` 再跑动态程序;`net` 走 socket 自测),`pixel` 进入像素桌面原型,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
@@ -307,6 +314,9 @@ USER_SIGTRAMP = 0x08847000
 | `entry_phys / _kernel_end` | linker.ld | ELF 入口物理地址、内核虚拟结束地址 |
 | `persist_active / persist_gen` | fs.c | MuFS 挂载状态与 generation |
 | `meta_buf / dmeta_buf` | fs.c | 写穿的元数据暂存表 |
+| `parts[] / nparts / partitioned` | part.c | MBR/GPT 分区表与“不要格式化”标志 |
+| `vol / dirbuf` | fat.c | FAT32 卷参数与 16KB 目录簇缓冲 |
+| `vol / blkbuf` | ext2.c | ext2 卷参数与块缓冲 |
 | `io_base / present / mac_addr` | net.c | RTL8139 I/O 基址、探测结果与 MAC |
 | `rx_buffer / tx_buffer` | net.c | 32K 接收环与发送 DMA 缓冲(物理地址交给网卡) |
 | `socks[] / arp_cache[]` | net.c | 8 个 socket 槽与 4 项 ARP 缓存 |
@@ -318,7 +328,7 @@ USER_SIGTRAMP = 0x08847000
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
 3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE` 与静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)已支持;符号版本化(`.gnu.version`)未实现,也未用真实 glibc/musl 的 `.so` 验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回
-4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(单段在途重传/RTO 退避/慢开始+拥塞避免;无发送队列、无乱序重排、无窗口缩放,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);FAT32/ext2 仅只读、未接入 `open/read` 的 VFS、不支持 FAT32 写入/ext2 二级间接、FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(单段在途重传/RTO 退避/慢开始+拥塞避免;无发送队列、无乱序重排、无窗口缩放,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化

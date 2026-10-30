@@ -21,6 +21,9 @@
 #include "proc.h"
 #include "pipe.h"
 #include "ata.h"
+#include "part.h"
+#include "fat.h"
+#include "ext2.h"
 #include "net.h"
 #include "fb.h"
 #include "task.h"
@@ -155,6 +158,21 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
         vga_print_dec(ata_sector_count() / 2);
         vga_print(" KB)\n");
         serial_write("[OK] ATA disk present\n");
+
+        /* Partition table, then read-only FAT32 / ext2 volumes. */
+        part_init();
+        if (fat_init()) {
+            vga_print("[OK] FAT32: ");
+            vga_print(fat_label());
+            vga_print("\n");
+            serial_write("[OK] FAT32 mounted\n");
+        }
+        if (ext2_init()) {
+            vga_print("[OK] ext2: ");
+            vga_print(ext2_volume());
+            vga_print("\n");
+            serial_write("[OK] ext2 mounted\n");
+        }
     } else {
         vga_print("[WARN] No ATA disk on the primary bus\n");
         serial_write("[WARN] No ATA disk\n");

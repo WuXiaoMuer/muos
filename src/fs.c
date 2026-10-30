@@ -2,6 +2,7 @@
 #include "string.h"
 #include "rtc.h"
 #include "ata.h"
+#include "part.h"
 
 static fs_file_t files[FS_MAX_FILES];
 static fs_dir_t  dirs[FS_MAX_DIRS];
@@ -618,6 +619,10 @@ void fs_persist_mount(void) {
         persist_active = true;
         return;
     }
+
+    /* A partitioned disk belongs to FAT32/ext2, not to whole-disk MuFS:
+     * never format it, just stay memory-only. */
+    if (part_is_partitioned()) return;
 
     /* No valid image: format an empty namespace. */
     for (int i = 0; i < FS_MAX_FILES; i++) {

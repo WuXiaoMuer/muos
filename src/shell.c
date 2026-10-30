@@ -17,6 +17,9 @@
 #include "user.h"
 #include "module.h"
 #include "ata.h"
+#include "part.h"
+#include "fat.h"
+#include "ext2.h"
 
 /* ── Types ────────────────────────────── */
 #define CMD_MAX   128
@@ -50,7 +53,7 @@ static void isrt(char c){
 }
 
 /* ── Tab Completion ──────────────────── */
-static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod","pixel",NULL};
+static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod","pixel","disk","part","fatls","fatcat","ext2ls","ext2cat",NULL};
 static void tab(void){
     if(!cmd_pos)return;
     int ws=0;
@@ -130,6 +133,7 @@ static void cmd_help(void){
     vga_print("  mods / execmod <n>          - run a Multiboot -initrd module\n");
     vga_print("  help clear echo mem tasks time ps disk logo\n");
     vga_print("  version gui win7 desktop pixel test reboot halt crash\n");
+    vga_print("  part fatls [p] fatcat <f> ext2ls [p] ext2cat <f>\n");
 }
 static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
 static void slog_u32(uint32_t v);
@@ -148,6 +152,79 @@ static void cmd_disk(void){
     }
     serial_write("[disk] "); serial_write(ata_model()); serial_write("\n");
 }
+
+/* ---- partition table / FAT32 / ext2 (read-only) ---- */
+static char  fs_out[2048];
+static uint8_t fs_file[1024];
+
+static void cmd_part(void){
+    if(!ata_present()){ vga_print("No ATA disk\n"); return; }
+    if(!part_is_partitioned()){
+        vga_print("No partition table (whole-disk volume)\n");
+        serial_write("[part] none\n");
+        return;
+    }
+    vga_print(" partitions="); vga_print_dec(part_count()); vga_putchar('\n');
+    for(int i=0;i<part_count();i++){
+        part_t p;
+        if(!part_get(i,&p)) continue;
+        vga_print("  ["); vga_print_dec(i); vga_print("] start=");
+        vga_print_dec((uint32_t)p.start_lba);
+        vga_print(" sectors="); vga_print_dec((uint32_t)p.sectors);
+        vga_print(p.gpt?" GPT":" MBR");
+        vga_print(" type=0x"); vga_print_hex(p.type);
+        if(p.name[0]){ vga_print(" name="); vga_print(p.name); }
+        vga_putchar('\n');
+    }
+    serial_write("[part] table ok\n");
+}
+
+static void cmd_fatls(char**a,int n){
+    if(!fat_present()){ vga_print("No FAT32 volume\n"); serial_write("[fat] absent\n"); return; }
+    const char* p = (n>1)?a[1]:"/";
+    int r = fat_list(p, fs_out, sizeof(fs_out));
+    if(r < 0){ vga_print("FAT: cannot list path\n"); serial_write("[fat] ls fail\n"); return; }
+    vga_print(fs_out);
+    serial_write(fs_out);
+    serial_write("[fat] ls ok\n");
+}
+
+static void cmd_fatcat(char**a,int n){
+    if(!fat_present()){ vga_print("No FAT32 volume\n"); serial_write("[fat] absent\n"); return; }
+    if(n<2){ vga_print("usage: fatcat <file>\n"); return; }
+    int r = fat_read_file(a[1], fs_file, sizeof(fs_file)-1);
+    if(r < 0){ vga_print("FAT: cannot read file\n"); serial_write("[fat] cat fail\n"); return; }
+    fs_file[r] = 0;
+    vga_print("[fat] "); vga_print(a[1]); vga_print(": ");
+    vga_print_dec((uint32_t)r); vga_print(" bytes\n");
+    vga_print((const char*)fs_file);
+    serial_write((const char*)fs_file);
+    serial_write("[fat] cat ok\n");
+}
+
+static void cmd_ext2ls(char**a,int n){
+    if(!ext2_present()){ vga_print("No ext2 volume\n"); serial_write("[ext2] absent\n"); return; }
+    const char* p = (n>1)?a[1]:"/";
+    int r = ext2_list(p, fs_out, sizeof(fs_out));
+    if(r < 0){ vga_print("ext2: cannot list path\n"); serial_write("[ext2] ls fail\n"); return; }
+    vga_print(fs_out);
+    serial_write(fs_out);
+    serial_write("[ext2] ls ok\n");
+}
+
+static void cmd_ext2cat(char**a,int n){
+    if(!ext2_present()){ vga_print("No ext2 volume\n"); serial_write("[ext2] absent\n"); return; }
+    if(n<2){ vga_print("usage: ext2cat <file>\n"); return; }
+    int r = ext2_read_file(a[1], fs_file, sizeof(fs_file)-1);
+    if(r < 0){ vga_print("ext2: cannot read file\n"); serial_write("[ext2] cat fail\n"); return; }
+    fs_file[r] = 0;
+    vga_print("[ext2] "); vga_print(a[1]); vga_print(": ");
+    vga_print_dec((uint32_t)r); vga_print(" bytes\n");
+    vga_print((const char*)fs_file);
+    serial_write((const char*)fs_file);
+    serial_write("[ext2] cat ok\n");
+}
+
 static void cmd_run(char**a,int n){
     /* Runs the embedded ELF at Ring3; returns when the process exits or
      * faults. `run fault` asks hello.c to touch an unmapped address, which
@@ -352,6 +429,11 @@ static void execute(void){
     else if(streq(cmd,"exec"))cmd_exec(av,ac);
     else if(streq(cmd,"mods"))cmd_mods();
     else if(streq(cmd,"disk"))cmd_disk();
+    else if(streq(cmd,"part"))cmd_part();
+    else if(streq(cmd,"fatls"))cmd_fatls(av,ac);
+    else if(streq(cmd,"fatcat"))cmd_fatcat(av,ac);
+    else if(streq(cmd,"ext2ls"))cmd_ext2ls(av,ac);
+    else if(streq(cmd,"ext2cat"))cmd_ext2cat(av,ac);
     else if(streq(cmd,"execmod"))cmd_execmod(av,ac);
 }
 
