@@ -75,7 +75,7 @@
 - [x] 管道 ABI:`pipe(42)/pipe2(331)`、fd 表 PIPE_READ/WRITE、shell 管道 `echo hi | cat`
 - [ ] 真正并发:`clone` 线程、信号投递、抢占调度、每进程页目录
 - [x] 目录层级:`mkdir/rmdir`、子目录路径解析、直接子项枚举、跨目录文件 `rename`;`mkdir -p`/`cp`/`mv` 实测通过
-- [ ] `*at` 族(`openat/statat/unlinkat/renameat/mkdirat`)与目录 rename
+- [x] `*at` 族:`openat(295)`、`mkdirat(296)`、`fstatat64(300)`、`unlinkat(301,含 AT_REMOVEDIR)`、`renameat(302)`、`readlinkat(305)`、`fchmodat(306)`、`faccessat(307)`;绝对路径/`AT_FDCWD`/目录 fd 三种解析,`AT_EMPTY_PATH` 支持;`run at` 用例与 BusyBox `mkdir/touch/ls/rm` 回归通过。目录 rename 仍未支持
 - [x] `/proc/<pid>/{stat,status,comm,cmdline}` 与动态 PID 目录;`ps` 显示 kernel/busybox
 - [x] `/proc/loadavg`、`/proc/stat`、`/proc/self/maps` 最小实现
 - [ ] `vmstat/top` 所需的完整 CPU/内存统计字段

@@ -38,6 +38,15 @@ static int syscall3(int nr, int a, int b, int c) {
     return ret;
 }
 
+static int syscall4(int nr, int a, int b, int c, int d) {
+    int ret;
+    __asm__ volatile ("int $0x80"
+                      : "=a"(ret)
+                      : "a"(nr), "b"(a), "c"(b), "d"(c), "S"(d)
+                      : "memory");
+    return ret;
+}
+
 int muos_write(int fd, const void* buf, unsigned len) {
     return syscall3(4, fd, (int)buf, (int)len);
 }
@@ -52,6 +61,40 @@ int muos_open(const char* path, int flags) {
 
 int muos_close(int fd) {
     return syscall1(6, fd);
+}
+
+/* *at family (Linux i386 numbers 295/296/300/301/302/305/306/307). */
+int muos_openat(int dirfd, const char* path, int flags) {
+    return syscall4(295, dirfd, (int)path, flags, 0);
+}
+
+int muos_mkdirat(int dirfd, const char* path, int mode) {
+    return syscall3(296, dirfd, (int)path, mode);
+}
+
+int muos_fstatat64(int dirfd, const char* path, char* st, int flags) {
+    return syscall4(300, dirfd, (int)path, (int)st, flags);
+}
+
+int muos_unlinkat(int dirfd, const char* path, int flags) {
+    return syscall3(301, dirfd, (int)path, flags);
+}
+
+int muos_renameat(int olddirfd, const char* oldpath,
+                  int newdirfd, const char* newpath) {
+    return syscall4(302, olddirfd, (int)oldpath, newdirfd, (int)newpath);
+}
+
+int muos_faccessat(int dirfd, const char* path, int mode) {
+    return syscall3(307, dirfd, (int)path, mode);
+}
+
+int muos_fchmodat(int dirfd, const char* path, int mode) {
+    return syscall3(306, dirfd, (int)path, mode);
+}
+
+int muos_readlinkat(int dirfd, const char* path, char* buf, int size) {
+    return syscall4(305, dirfd, (int)path, (int)buf, size);
 }
 
 int muos_fork(void) {

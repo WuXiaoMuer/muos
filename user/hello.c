@@ -81,6 +81,82 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "at")) {
+        /* Exercised entirely through the i386 *at syscalls: mkdirat,
+         * openat with a directory fd, fstatat64, fchmodat, readlinkat,
+         * renameat, faccessat and unlinkat (file + AT_REMOVEDIR). */
+        union {
+            char raw[MUOS_STAT64_SIZE];
+            unsigned word[MUOS_STAT64_SIZE / 4];
+        } st;
+        int ok = 1;
+        int rc;
+
+        /* Make the test repeatable when the shell is used interactively. */
+        muos_unlinkat(MUOS_AT_FDCWD, "atdir/g.txt", 0);
+        muos_unlinkat(MUOS_AT_FDCWD, "atdir/f.txt", 0);
+        muos_unlinkat(MUOS_AT_FDCWD, "atdir", MUOS_AT_REMOVEDIR);
+
+        rc = muos_mkdirat(MUOS_AT_FDCWD, "atdir", 0755);
+        muos_puts("at: mkdirat="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        int dfd = muos_openat(MUOS_AT_FDCWD, "atdir", MUOS_O_DIRECTORY);
+        muos_puts("at: dirfd="); muos_putdec(dfd); muos_puts("\n");
+        ok = ok && dfd >= 0;
+
+        if (dfd >= 0) {
+            int fd = muos_openat(dfd, "f.txt", MUOS_O_CREAT | MUOS_O_WRONLY);
+            muos_puts("at: create="); muos_putdec(fd); muos_puts("\n");
+            ok = ok && fd >= 0;
+            if (fd >= 0) {
+                const char msg[] = "AT-FAMILY";
+                muos_write(fd, msg, sizeof(msg) - 1);
+                muos_close(fd);
+
+                rc = muos_fstatat64(dfd, "f.txt", st.raw, 0);
+                muos_puts("at: fstatat="); muos_putdec(rc);
+                muos_puts(" size="); muos_putdec((int)st.word[11]);
+                muos_puts("\n");
+                ok = ok && rc == 0 && st.word[11] == sizeof(msg) - 1;
+
+                rc = muos_fstatat64(dfd, "", st.raw, MUOS_AT_EMPTY_PATH);
+                muos_puts("at: fstatat-dir-fd="); muos_putdec(rc);
+                muos_puts(" mode="); muos_puthex(st.word[4]);
+                muos_puts("\n");
+                ok = ok && rc == 0 && (st.word[4] & 0xF000) == 0x4000;
+
+                rc = muos_fchmodat(dfd, "f.txt", 0644);
+                muos_puts("at: fchmodat="); muos_putdec(rc); muos_puts("\n");
+                ok = ok && rc == 0;
+
+                rc = muos_readlinkat(dfd, "f.txt", st.raw, 16);
+                muos_puts("at: readlinkat="); muos_putdec(rc); muos_puts("\n");
+                ok = ok && rc == -22;      /* not a symlink: EINVAL */
+
+                rc = muos_renameat(dfd, "f.txt", MUOS_AT_FDCWD, "atdir/g.txt");
+                muos_puts("at: renameat="); muos_putdec(rc); muos_puts("\n");
+                ok = ok && rc == 0;
+
+                rc = muos_faccessat(MUOS_AT_FDCWD, "atdir/g.txt", 0);
+                muos_puts("at: faccessat="); muos_putdec(rc); muos_puts("\n");
+                ok = ok && rc == 0;
+
+                rc = muos_unlinkat(MUOS_AT_FDCWD, "atdir/g.txt", 0);
+                muos_puts("at: unlinkat="); muos_putdec(rc); muos_puts("\n");
+                ok = ok && rc == 0;
+            }
+            muos_close(dfd);
+        }
+
+        rc = muos_unlinkat(MUOS_AT_FDCWD, "atdir", MUOS_AT_REMOVEDIR);
+        muos_puts("at: remove-dir="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        muos_puts(ok ? "AT-FAMILY-OK\n" : "AT-FAMILY-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "fork")) {
         muos_puts("fork-test: parent before fork\n");
         int pid = muos_fork();

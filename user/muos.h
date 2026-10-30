@@ -9,12 +9,28 @@
 #define MUOS_O_WRONLY 0x1
 #define MUOS_O_CREAT  0x40
 #define MUOS_O_TRUNC  0x200
+#define MUOS_O_DIRECTORY 0x10000
+
+/* *at resolver flags (Linux i386 values) */
+#define MUOS_AT_FDCWD     (-100)
+#define MUOS_AT_REMOVEDIR 0x200
+#define MUOS_AT_EMPTY_PATH 0x1000
+#define MUOS_STAT64_SIZE 96
 
 int  muos_write(int fd, const void* buf, unsigned len);
 int  muos_read(int fd, void* buf, unsigned len);
 int  muos_open(const char* path, int flags);
 int  muos_close(int fd);
 int  muos_lseek(int fd, int offset, int whence);
+int  muos_openat(int dirfd, const char* path, int flags);
+int  muos_mkdirat(int dirfd, const char* path, int mode);
+int  muos_fstatat64(int dirfd, const char* path, char* st, int flags);
+int  muos_unlinkat(int dirfd, const char* path, int flags);
+int  muos_renameat(int olddirfd, const char* oldpath,
+                   int newdirfd, const char* newpath);
+int  muos_faccessat(int dirfd, const char* path, int mode);
+int  muos_fchmodat(int dirfd, const char* path, int mode);
+int  muos_readlinkat(int dirfd, const char* path, char* buf, int size);
 int  muos_fork(void);
 int  muos_waitpid(int pid, int* status, int options);
 int  muos_execve(const char* path, char* const argv[], char* const envp[]);

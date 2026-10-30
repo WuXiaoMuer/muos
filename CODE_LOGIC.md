@@ -143,12 +143,13 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 - Linux i386 ABI:eax=调用号,ebx/ecx/edx(以及 esi/edi/ebp)传参;错误用 `-errno`。
 - 已实现(按用途分组):
   - 进程/stdio:`exit(1) exit_group(252) read(3) write(4) readv(145) writev(146) getpid(20) getppid(64) getuid/getgid/geteuid/getegid(24/47/49/50) 及其 32 位变体(199-202) getgroups(80/205)`;`rt_sigaction/rt_sigprocmask(174/175)` 空实现,`modify_ldt(123)` 返回 ENOSYS(由 set_thread_area 取代)
-  - 文件:`open(5) close(6) lseek(19) llseek(140) dup(41) dup2(63,含 stdio 重定向) fcntl(55/221) access(33) getcwd(183) chdir(12) unlink(10) rename(38) sendfile(187/239)`
+  - 文件:`open(5) close(6) lseek(19) llseek(140) dup(41) dup2(63,含 stdio 重定向) fcntl(55/221) access(33) getcwd(183) chdir(12) unlink(10) rename(38) sendfile(187/239)`;`*at` 族:`openat(295) mkdirat(296) fstatat64(300) unlinkat(301) renameat(302) readlinkat(305) fchmodat(306) faccessat(307)`
   - 目录/元数据:`getdents(141) getdents64(220) stat/lstat/fstat(106-108) stat64/lstat64/fstat64(195-197) statx(383) statfs/fstatfs(99/100) statfs64/fstatfs64(268/269) utimes(271) futimesat(299) utimensat(320)`
   - 内存/其他:`brk(45) old_mmap(90) mmap2(192) munmap(91) mprotect(125) uname(122) sysinfo(116) set/get_thread_area(243/244) time(13) gettimeofday(78) clock_gettime(265/403)`
   - 未知号返回 `-ENOSYS(-38)` 并在串口打印一次编号,作为 ROADMAP 阶段 4 的待办清单。
 - fd 表在 user.c 统一管理 0..10:启动时 0/1/2 是 `USER_FD_STDIN/STDOUT/STDERR`,其余条目可为 RAM FS 文件、目录、`/dev` 节点、`/proc` 快照或已关闭(FREE)。新 fd 从 3 起分配;`dup(41)` 复制任意条目,`dup2(63)` 可把文件/设备重定向到 0..2(或反向),`dd` 的 `dup2(if_fd,0)` 由此可用。
 - 路径解析 `vfs_normalize`:以进程 cwd(`user_cwd_get/set`,启动时 `/`)为基准处理绝对/相对路径、`.`、`..`(越界停在 `/`),输出规范绝对路径。命名空间:`/` 是 RAM FS(支持多级目录,路径去掉前导 `/` 后存于 fs.c),另有虚拟 `/dev`、`/proc`、`/etc`、`/bin`。
+- `*at` 族共用 `at_resolve_raw`:绝对路径直接透传;`AT_FDCWD(-100)` 保留相对路径交给 `vfs_normalize`;目录 fd 则把 `user_fd_dir_path(fd)` 与相对路径拼成绝对路径(非目录 fd 返回 ENOTDIR,坏 fd 返回 EBADF)。`at_path` 额外拒绝空路径(ENOENT)。`do_fstatat` 单独处理空路径 + `AT_EMPTY_PATH`(stat dirfd),`do_unlinkat` 的 `AT_REMOVEDIR` 转 rmdir;`do_readlinkat` 对已存在目标返回 EINVAL(无符号链接);`fchmodat` 对真实文件/目录返回成功(RAM FS 无 mode 位)。
 - 虚拟文件:`/dev/null` 读 EOF/写丢弃,`/dev/zero` 读零/写丢弃,`/dev/console` 接键盘与 VGA+串口;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/proc/<pid>/{stat,status,comm,cmdline}` 与 `/etc/mtab` 在 `open` 时由内核生成快照存入 fd,`/proc/meminfo` 取 mm 页统计,`uptime` 取 PIT 100Hz;`/proc/<pid>/stat` 输出 Linux 的 52 字段(尾部保留空格),BusyBox `ps` 可解析。
 - `getdents/getdents64` 按目录 fd 的绝对路径枚举 `.`、`..`、RAM FS 文件以及 `dev/proc/etc` 虚拟子目录,分别按 i386 `linux_dirent`(10 字节头)与 `linux_dirent64`(19 字节头)打包;`d_off` 写下一项序号,缓冲区不足时保留偏移。
 - `stat` 族:`stat64` 写 96 字节 i386 布局,旧 `stat` 写 64 字节布局;目录 `S_IFDIR|0755`/nlink 2,文件 `S_IFREG|0644`,设备 `S_IFCHR|0666`,`/proc` 快照 `S_IFREG|0444`,`st_dev=1`;三类时间来自 RAM FS 的 atime/mtime/ctime。`statx(383)` 写 256 字节 `struct statx`(mask=STATX_BASIC_STATS),空路径且 `AT_EMPTY_PATH` 时改为 stat dirfd。
@@ -235,7 +236,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 ## 十一、已知局限(真实清单)
 
 1. 用户态是**固定 8MB 单地址空间 + 顺序快照进程模型**:无 higher-half、无每进程页目录、无抢占调度;子进程只在父 `waitpid` 时运行,不是真正并发(ROADMAP 阶段 1 剩余项)
-2. 系统调用仍缺真正并发:`clone` 只支持非线程 fork,`kill` 不投递信号,无抢占调度/线程;文件 mmap、`/proc/stat` 全量字段与 `*at` 族仍缺(ROADMAP 阶段 2/4)
+2. 系统调用仍缺真正并发:`clone` 只支持非线程 fork,`kill` 不投递信号,无抢占调度/线程;`*at` 族已实现(dirfd 相对路径/`AT_EMPTY_PATH`/`AT_REMOVEDIR`),仍缺文件 mmap、`/proc/stat` 全量字段与目录 rename(ROADMAP 阶段 2/4)
 3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;`fork+execve+waitpid`、虚拟 `/bin/*`、`pipe2`、shell 管道与多级 RAM FS 已跑通,但仍无磁盘/网络/图形
 4. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 5. fs 无句柄保护、无持久化;有 16 级目录槽但路径/名称上限 64 字符;时间戳仅存于 RAM FS,重启丢失;write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层

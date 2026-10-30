@@ -107,6 +107,19 @@
 #define SYS_sendfile64      239
 #define SYS_statx           383
 
+/* *at family (Linux i386 numbers) and their resolver flags. */
+#define SYS_openat          295
+#define SYS_mkdirat         296
+#define SYS_fstatat64       300
+#define SYS_unlinkat        301
+#define SYS_renameat        302
+#define SYS_readlinkat      305
+#define SYS_fchmodat        306
+#define SYS_faccessat       307
+#define AT_FDCWD           (-100)
+#define AT_EMPTY_PATH       0x1000
+#define AT_REMOVEDIR        0x200
+
 #define ERR_EPERM      1
 #define ERR_ENOENT     2
 #define ERR_ESRCH      3
@@ -820,11 +833,8 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
     return false;
 }
 
-static uint32_t do_open(uint32_t path, uint32_t flags, uint32_t mode) {
+static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
     (void)mode;
-    char buf[128];
-    if (!copy_user_string(path, buf, sizeof(buf))) return err(ERR_EFAULT);
-
     vfs_ent_t e;
     uint32_t rc = vfs_lookup(buf, &e);
     if ((int32_t)rc < 0) {
@@ -875,6 +885,12 @@ static uint32_t do_open(uint32_t path, uint32_t flags, uint32_t mode) {
         default:
             return err(ERR_ENOENT);
     }
+}
+
+static uint32_t do_open(uint32_t path, uint32_t flags, uint32_t mode) {
+    char buf[128];
+    if (!copy_user_string(path, buf, sizeof(buf))) return err(ERR_EFAULT);
+    return do_open_buf(buf, flags, mode);
 }
 
 static uint32_t do_close(uint32_t fd) {
@@ -1051,9 +1067,7 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
     }
 }
 
-static uint32_t do_stat(uint32_t path_ptr, uint32_t st_ptr, bool_t is64) {
-    char buf[128];
-    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+static uint32_t do_stat_buf(const char* buf, uint32_t st_ptr, bool_t is64) {
     if (!user_ptr_ok(st_ptr, is64 ? STAT64_SIZE : STAT_OLD_SIZE))
         return err(ERR_EFAULT);
 
@@ -1070,6 +1084,12 @@ static uint32_t do_stat(uint32_t path_ptr, uint32_t st_ptr, bool_t is64) {
     else      fill_stat_old(st, ino, mode, nlink, size, at, mt, ct);
     memcpy((void*)st_ptr, st, is64 ? STAT64_SIZE : STAT_OLD_SIZE);
     return 0;
+}
+
+static uint32_t do_stat(uint32_t path_ptr, uint32_t st_ptr, bool_t is64) {
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+    return do_stat_buf(buf, st_ptr, is64);
 }
 
 static uint32_t do_fstat(uint32_t fd, uint32_t st_ptr, bool_t is64) {
@@ -1395,12 +1415,26 @@ static uint32_t do_llseek(uint32_t fd, uint32_t off_lo, uint32_t off_hi,
     return 0;
 }
 
-static uint32_t do_access(uint32_t path_ptr, uint32_t mode) {
+static uint32_t do_access_buf(const char* buf, uint32_t mode) {
     (void)mode;
-    char buf[128];
-    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
     vfs_ent_t e;
     return vfs_lookup(buf, &e);
+}
+
+static uint32_t do_access(uint32_t path_ptr, uint32_t mode) {
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+    return do_access_buf(buf, mode);
+}
+
+/* RAM FS modes are fixed; chmod on real files/directories is a no-op. */
+static uint32_t do_chmod_buf(const char* buf) {
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+    if (e.type == VFS_T_FILE) return 0;
+    if (e.type == VFS_T_DIR && e.id == VFS_DIR_REAL) return 0;
+    return err(ERR_EPERM);
 }
 
 static uint32_t do_chdir(uint32_t path_ptr) {
@@ -1413,10 +1447,7 @@ static uint32_t do_chdir(uint32_t path_ptr) {
     return user_cwd_set(e.path) ? 0 : err(ERR_ENAMETOOLONG);
 }
 
-static uint32_t do_mkdir(uint32_t path_ptr) {
-    char buf[128];
-    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
-
+static uint32_t do_mkdir_buf(const char* buf) {
     vfs_ent_t e;
     uint32_t rc = vfs_lookup(buf, &e);
     if ((int32_t)rc == 0) return err(ERR_EEXIST);
@@ -1429,10 +1460,13 @@ static uint32_t do_mkdir(uint32_t path_ptr) {
     return fs_mkdir(name) == 0 ? 0 : err(ERR_ENOSPC);
 }
 
-static uint32_t do_rmdir(uint32_t path_ptr) {
+static uint32_t do_mkdir(uint32_t path_ptr) {
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+    return do_mkdir_buf(buf);
+}
 
+static uint32_t do_rmdir_buf(const char* buf) {
     vfs_ent_t e;
     uint32_t rc = vfs_lookup(buf, &e);
     if ((int32_t)rc < 0) return rc;
@@ -1443,9 +1477,13 @@ static uint32_t do_rmdir(uint32_t path_ptr) {
     return fs_rmdir(name) == 0 ? 0 : err(ERR_ENOENT);
 }
 
-static uint32_t do_unlink(uint32_t path_ptr) {
+static uint32_t do_rmdir(uint32_t path_ptr) {
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+    return do_rmdir_buf(buf);
+}
+
+static uint32_t do_unlink_buf(const char* buf) {
     vfs_ent_t e;
     uint32_t rc = vfs_lookup(buf, &e);
     if ((int32_t)rc < 0) return rc;
@@ -1459,11 +1497,13 @@ static uint32_t do_unlink(uint32_t path_ptr) {
     }
 }
 
-static uint32_t do_rename(uint32_t old_ptr, uint32_t new_ptr) {
-    char obuf[128], nbuf[128];
-    if (!copy_user_string(old_ptr, obuf, sizeof(obuf))) return err(ERR_EFAULT);
-    if (!copy_user_string(new_ptr, nbuf, sizeof(nbuf))) return err(ERR_EFAULT);
+static uint32_t do_unlink(uint32_t path_ptr) {
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+    return do_unlink_buf(buf);
+}
 
+static uint32_t do_rename_bufs(const char* obuf, const char* nbuf) {
     vfs_ent_t oe, ne;
     uint32_t rc = vfs_lookup(obuf, &oe);
     if ((int32_t)rc < 0) return rc;
@@ -1485,6 +1525,124 @@ static uint32_t do_rename(uint32_t old_ptr, uint32_t new_ptr) {
     if (!fs_parent_is_dir(nname)) return err(ERR_ENOTDIR);
     if (fs_is_dir(nname)) return err(ERR_EISDIR);
     return fs_rename(oe.slot, nname) == 0 ? 0 : err(ERR_EINVAL);
+}
+
+static uint32_t do_rename(uint32_t old_ptr, uint32_t new_ptr) {
+    char obuf[128], nbuf[128];
+    if (!copy_user_string(old_ptr, obuf, sizeof(obuf))) return err(ERR_EFAULT);
+    if (!copy_user_string(new_ptr, nbuf, sizeof(nbuf))) return err(ERR_EFAULT);
+    return do_rename_bufs(obuf, nbuf);
+}
+
+/* ---- *at family ----
+ * Path arguments are resolved against the dirfd: absolute paths ignore it,
+ * AT_FDCWD means the process cwd, and a directory fd prefixes its absolute
+ * path. The composed string is then handed to the same vfs_lookup path. */
+
+static uint32_t at_resolve_raw(int32_t dirfd, const char* raw,
+                               char* out, uint32_t max) {
+    uint32_t n = strlen(raw);
+    if (raw[0] == '/' || dirfd == AT_FDCWD) {
+        if (n + 1 > max) return err(ERR_ENAMETOOLONG);
+        memcpy(out, raw, n + 1);       /* relative: vfs_normalize uses cwd */
+        return 0;
+    }
+    if (user_fd_kind(dirfd) < 0) return err(ERR_EBADF);
+    if (!user_fd_is_dir(dirfd)) return err(ERR_ENOTDIR);
+
+    const char* base = user_fd_dir_path(dirfd);
+    uint32_t bl = strlen(base);
+    uint32_t rl = n;
+    if (bl + 1 + rl + 1 > max) return err(ERR_ENAMETOOLONG);
+    memcpy(out, base, bl);
+    out[bl] = '/';
+    memcpy(out + bl + 1, raw, rl + 1);
+    return 0;
+}
+
+/* Copy and resolve a non-empty *at path argument. */
+static uint32_t at_path(int32_t dirfd, uint32_t path_ptr, char* out, uint32_t max) {
+    char raw[USER_FD_PATH_MAX];
+    if (!copy_user_string(path_ptr, raw, sizeof(raw))) return err(ERR_EFAULT);
+    if (raw[0] == '\0') return err(ERR_ENOENT);
+    return at_resolve_raw(dirfd, raw, out, max);
+}
+
+static uint32_t do_openat(uint32_t dirfd, uint32_t path_ptr, uint32_t flags,
+                          uint32_t mode) {
+    char buf[128];
+    uint32_t rc = at_path((int32_t)dirfd, path_ptr, buf, sizeof(buf));
+    if ((int32_t)rc < 0) return rc;
+    return do_open_buf(buf, flags, mode);
+}
+
+static uint32_t do_mkdirat(uint32_t dirfd, uint32_t path_ptr) {
+    char buf[128];
+    uint32_t rc = at_path((int32_t)dirfd, path_ptr, buf, sizeof(buf));
+    if ((int32_t)rc < 0) return rc;
+    return do_mkdir_buf(buf);
+}
+
+static uint32_t do_unlinkat(uint32_t dirfd, uint32_t path_ptr, uint32_t flags) {
+    char buf[128];
+    uint32_t rc = at_path((int32_t)dirfd, path_ptr, buf, sizeof(buf));
+    if ((int32_t)rc < 0) return rc;
+    if (flags & AT_REMOVEDIR) return do_rmdir_buf(buf);
+    return do_unlink_buf(buf);
+}
+
+static uint32_t do_renameat(uint32_t olddirfd, uint32_t old_ptr,
+                            uint32_t newdirfd, uint32_t new_ptr) {
+    char obuf[128], nbuf[128];
+    uint32_t rc = at_path((int32_t)olddirfd, old_ptr, obuf, sizeof(obuf));
+    if ((int32_t)rc < 0) return rc;
+    rc = at_path((int32_t)newdirfd, new_ptr, nbuf, sizeof(nbuf));
+    if ((int32_t)rc < 0) return rc;
+    return do_rename_bufs(obuf, nbuf);
+}
+
+/* fstatat64(300): an empty path with AT_EMPTY_PATH stats the dirfd itself. */
+static uint32_t do_fstatat(uint32_t dirfd, uint32_t path_ptr, uint32_t st_ptr,
+                           uint32_t flags, bool_t is64) {
+    char raw[USER_FD_PATH_MAX];
+    if (!copy_user_string(path_ptr, raw, sizeof(raw))) return err(ERR_EFAULT);
+    if (raw[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH)) return err(ERR_ENOENT);
+        return do_fstat(dirfd, st_ptr, is64);
+    }
+    char buf[128];
+    uint32_t rc = at_resolve_raw((int32_t)dirfd, raw, buf, sizeof(buf));
+    if ((int32_t)rc < 0) return rc;
+    return do_stat_buf(buf, st_ptr, is64);
+}
+
+static uint32_t do_faccessat(uint32_t dirfd, uint32_t path_ptr, uint32_t mode) {
+    char buf[128];
+    uint32_t rc = at_path((int32_t)dirfd, path_ptr, buf, sizeof(buf));
+    if ((int32_t)rc < 0) return rc;
+    return do_access_buf(buf, mode);
+}
+
+static uint32_t do_fchmodat(uint32_t dirfd, uint32_t path_ptr, uint32_t mode) {
+    (void)mode;
+    char buf[128];
+    uint32_t rc = at_path((int32_t)dirfd, path_ptr, buf, sizeof(buf));
+    if ((int32_t)rc < 0) return rc;
+    return do_chmod_buf(buf);
+}
+
+/* readlinkat(305): the VFS has no symlinks, so an existing target is
+ * reported as "not a symlink" like Linux does. */
+static uint32_t do_readlinkat(uint32_t dirfd, uint32_t path_ptr,
+                              uint32_t buf_ptr, uint32_t bufsiz) {
+    (void)buf_ptr; (void)bufsiz;
+    char buf[128];
+    uint32_t rc = at_path((int32_t)dirfd, path_ptr, buf, sizeof(buf));
+    if ((int32_t)rc < 0) return rc;
+    vfs_ent_t e;
+    rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+    return err(ERR_EINVAL);
 }
 
 /* utimes/futimesat/utimensat update the RAM FS timestamps. The time array
@@ -2015,6 +2173,30 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_rename:
             ret = do_rename(regs->ebx, regs->ecx);
+            break;
+        case SYS_openat:
+            ret = do_openat(regs->ebx, regs->ecx, regs->edx, regs->esi);
+            break;
+        case SYS_mkdirat:
+            ret = do_mkdirat(regs->ebx, regs->ecx);
+            break;
+        case SYS_fstatat64:
+            ret = do_fstatat(regs->ebx, regs->ecx, regs->edx, regs->esi, true);
+            break;
+        case SYS_unlinkat:
+            ret = do_unlinkat(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_renameat:
+            ret = do_renameat(regs->ebx, regs->ecx, regs->edx, regs->esi);
+            break;
+        case SYS_readlinkat:
+            ret = do_readlinkat(regs->ebx, regs->ecx, regs->edx, regs->esi);
+            break;
+        case SYS_fchmodat:
+            ret = do_fchmodat(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_faccessat:
+            ret = do_faccessat(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_utimes:
             ret = do_utime_path(regs->ebx, -1, regs->ecx, false);
