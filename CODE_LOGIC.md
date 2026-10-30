@@ -263,6 +263,13 @@ USER_SIGTRAMP = 0x08847000
 - `ext2.c`:`ext2_init` 只接受 0x83/GPT 分区(或整盘),读分区 +1024 的超级块校验 `0xEF53`,取 `1K<<log_block_size`、组大小/inode 大小(rev0 固定 128);组描述符表位于 `first_data_block+1`,按 `group*32` 字节偏移取 inode table 块号。`read_inode` 按 `(ino-1)/ipg` 与 `%ipg` 定位 128 字节 inode;目录项是 `{inode, rec_len, name_len, name}` 线性表。文件块支持 12 个直接块 + 一级间接(间接块内索引)。`ext2_list/read_file` 与 FAT 版本接口对称。
 - 集成:内核在 `ata_init` 后依次调用 `part_init/fat_init/ext2_init`;`fs_persist_mount` 看到分区表就保持内存模式,避免把 FAT/ext2 盘格式化成 MuFS。Shell 增加 `part/fatls/fatcat/fatwrite/ext2ls/ext2cat`;`tools/make_fs_images.py` 生成带 MBR 或保护性 MBR+GPT 的 FAT32 镜像与一个 4MB ext2 镜像,`tools/test_fs_read.py` 三次启动验证 MBR FAT32、GPT FAT32 与 ext2 的目录/长名/子目录读取。
 
+### 7.12 安全与 ACPI(acpi.c / mm.c / user.c)
+
+- SMEP:开分页后读 CPUID leaf0 最大叶号,leaf7.0 EBX bit7 置位时把 CR4 bit20 置 1;内核不执行用户页。
+- 弱 ASLR:`build_user_stack` 用 PIT tick 让栈顶下移 0..7 页;同时在栈上生成 16 字节随机数并以 `AT_RANDOM(25)` 传给 ld-mu,ld-mu 用它把首个共享库基址从 `0x08400000` 偏移 0..31 页。
+- ACPI:扫描 EBDA(0x40E 段)与 `0xE0000–0xFFFFF` 找 `RSD PTR `(校验 20 字节和),读 RSDT/XSDT 指针,遍历表项找 `FACP`(FADT),取 `pm1a_cnt_blk`。所有指针先用 `ram_ok` 校验落在恒等映射 RAM 内(SeaBIOS 的表可能位于 RAM 顶端保留区,直接解引用会内核页故障)。`poweroff` 向 PM1a 控制块写 `SLP_TYPa=5<<10 | SLP_EN(bit13)`,无 FADT 时回退 QEMU 端口 0x604/0xB004;`reboot` 走 8042 0xFE。
+- 未实现:uid/gid 强制、文件权限检查、UEFI、USB、音频、SMP。
+
 ## 八、Shell / FS / 桌面
 
 - **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;30 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault|pie|dyn|net]` 运行内嵌 ELF(其中 `dyn` 先写 `/lib` 再跑动态程序;`net` 走 socket 自测),`pixel` 进入像素桌面原型,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。

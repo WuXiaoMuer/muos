@@ -20,6 +20,7 @@
 #include "part.h"
 #include "fat.h"
 #include "ext2.h"
+#include "acpi.h"
 
 /* ── Types ────────────────────────────── */
 #define CMD_MAX   128
@@ -53,7 +54,7 @@ static void isrt(char c){
 }
 
 /* ── Tab Completion ──────────────────── */
-static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod","pixel","disk","part","fatls","fatcat","fatwrite","ext2ls","ext2cat",NULL};
+static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod","pixel","disk","part","fatls","fatcat","fatwrite","ext2ls","ext2cat","poweroff",NULL};
 static void tab(void){
     if(!cmd_pos)return;
     int ws=0;
@@ -132,7 +133,7 @@ static void cmd_help(void){
     vga_print("  exec <file>                 - run an ELF from the RAM FS\n");
     vga_print("  mods / execmod <n>          - run a Multiboot -initrd module\n");
     vga_print("  help clear echo mem tasks time ps disk logo\n");
-    vga_print("  version gui win7 desktop pixel test reboot halt crash\n");
+    vga_print("  version gui win7 desktop pixel test reboot poweroff halt crash\n");
     vga_print("  part fatls [p] fatcat <f> fatwrite <f> <text>\n");
     vga_print("  ext2ls [p] ext2cat <f>\n");
 }
@@ -364,6 +365,12 @@ static void cmd_reboot(void){
     __asm__ volatile("int $0");
 }
 static void cmd_halt(void){vga_print("Halted.\n");serial_write("[shell] halt\n");__asm__ volatile("cli;hlt");}
+static void cmd_poweroff(void){
+    vga_print("Power off (ACPI S5)...\n");
+    serial_write("[shell] poweroff via ACPI\n");
+    for(volatile int i=0;i<100000;i++)__asm__ volatile("nop");
+    acpi_poweroff();
+}
 static void cmd_crash(void){
     /* The identity map covers all RAM, so a null write no longer faults.
      * 0xE0000000 lies above ram_top with no page table -> guaranteed
@@ -429,7 +436,8 @@ static void execute(void){
     else if(streq(cmd,"gui")||streq(cmd,"desktop"))win7_run();
     else if(streq(cmd,"win7"))win7_run();
     else if(streq(cmd,"pixel"))gui_run();
-    else if(streq(cmd,"reboot"))cmd_reboot();
+    else if(streq(cmd,"reboot")){ vga_print("Reboot (ACPI)...\n"); serial_write("[shell] acpi reboot\n"); acpi_reboot(); }
+    else if(streq(cmd,"poweroff"))cmd_poweroff();
     else if(streq(cmd,"halt"))cmd_halt();
     else if(streq(cmd,"crash"))cmd_crash();
     else if(streq(cmd,"touch"))cmd_touch(av,ac);

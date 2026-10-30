@@ -231,6 +231,23 @@ void mm_enable_paging(void) {
     cr0 |= 0x80000000;  /* Set PG bit */
     cr0 |= 0x00010000;  /* Set WP bit */
     __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+
+    /* SMEP (CR4 bit20) when the CPU advertises it: the kernel must never
+     * execute code from user pages. Guard the CPUID leaf-7 check. */
+    uint32_t max_leaf = 0, ebx7 = 0;
+    __asm__ volatile ("push %%ebx; xor %%ecx, %%ecx; cpuid; pop %%ebx"
+                      : "=a"(max_leaf) : "a"(0) : "ecx", "edx", "memory");
+    if (max_leaf >= 7) {
+        __asm__ volatile ("push %%ebx; xor %%ecx, %%ecx; mov $7, %%eax; cpuid; "
+                          "mov %%ebx, %0; pop %%ebx"
+                          : "=m"(ebx7) : "a"(7) : "ecx", "edx", "memory");
+        if (ebx7 & (1u << 7)) {
+            uint32_t cr4;
+            __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+            cr4 |= (1u << 20);
+            __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+        }
+    }
 }
 
 void* mm_alloc_page(void) {

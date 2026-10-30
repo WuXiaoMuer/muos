@@ -162,7 +162,10 @@
 - [x] 网卡(RTL8139)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] TCP 重传/并发服务端、其他网卡;MuFS 仍是整槽布局,无块分配位图/碎片整理
 - [ ] 动态链接器兼容真实 libc 产物(版本化符号;`.gnu.hash`/TLS/`R_386_COPY`/`IRELATIVE` 已支持);当前 `ld-mu.so` 只在自研 `.so` 上验证
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
+- [x] 安全基础:SMEP(CPUID leaf7 EBX bit7 时置 CR4 bit20);弱 ASLR(栈顶 0..7 页、`AT_RANDOM` 使库基址偏移 0..31 页)
+- [ ] uid/gid 强制与文件权限检查(`getuid` 恒 0、chown 仅校验目标)
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)
 - [ ] panic 打印带 addr2line 说明(已加 -g)
 - [x] ISO 路径构造最小 mb_info:`boot_cd.s` 用 BIOS INT 15h/E820 收集内存图,生成带 MEM|MMAP 的 Multiboot info(0x5600/0x5800)并交给内核;仅 BIOS 无 E820 时才回退 32MB
-- [ ] 多核/APIC(远期,单核不影响 ABI 兼容目标)
+- [x] ACPI:RSDP(EBDA/0xE0000) → RSDT/XSDT → FADT,取 PM1a_CNT;`poweroff` 写 SLP_TYPa=5|SLP_EN(回退 QEMU 0x604/0xB004),`reboot` 走 8042 复位线。校验所有表指针落在恒等映射 RAM 内,避免 SeaBIOS 表在 RAM 顶端保留区导致内核页故障
+- [ ] UEFI 引导、USB HID/存储、基础音频、SMP/APIC 未实现(远期)

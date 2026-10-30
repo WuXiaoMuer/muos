@@ -13,6 +13,7 @@
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
+- **安全与电源**:SMEP(CPUID 可用时置 CR4 bit20)、弱 ASLR(栈顶 0..7 页随机 + `AT_RANDOM` 驱动库加载基址随机)、ACPI FADT 定位与 S5 关机(`poweroff`) / 8042 复位(`reboot`)
 - **88 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
 
 演进目标见 **[ROADMAP.md](ROADMAP.md)**:以 Linux ABI 兼容(int 0x80 + ELF32,运行静态 i386 Linux 二进制)为主线;NT/Win32 兼容为长期远景。
@@ -178,6 +179,7 @@ muos> fatcat /HELLO.TXT   # 读取 FAT32 文件
 muos> fatwrite /NEW.TXT OK # 创建/覆盖 FAT32 文件(8.3 名,写穿)
 muos> ext2ls /            # 只读 ext2 目录
 muos> ext2cat /hello.txt  # 读取 ext2 文件(直接块 + 一级间接)
+muos> poweroff            # ACPI S5 关机(无 FADT 时用 QEMU 0x604/0xB004 端口)
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```
 

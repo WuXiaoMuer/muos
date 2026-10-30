@@ -24,6 +24,7 @@
 #include "part.h"
 #include "fat.h"
 #include "ext2.h"
+#include "acpi.h"
 #include "net.h"
 #include "fb.h"
 #include "task.h"
@@ -178,6 +179,9 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
         vga_print("[WARN] No ATA disk on the primary bus\n");
         serial_write("[WARN] No ATA disk\n");
     }
+
+    /* 6b2. ACPI FADT (PM1a control; independent of the disk) */
+    acpi_init();
 
     /* 6c. RTL8139 network card + minimal IPv4 stack */
     if (net_init()) {

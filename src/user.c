@@ -10,6 +10,7 @@
 #include "fs.h"
 #include "pipe.h"
 #include "keyboard.h"
+#include "pit.h"
 
 /* Embedded user image: built by build.ps1 into build/hello.elf and linked
  * into the kernel as a raw binary blob (see the objcopy step). */
@@ -491,7 +492,9 @@ static uint32_t push_string(uint32_t sp, const char* s) {
 static uint32_t build_user_stack(int argc, const char* const* argv,
                                  const elf32_load_info_t* li,
                                  uint32_t interp_base) {
-    uint32_t sp = USER_SIGTRAMP - 32;   /* top page is the sigreturn tramp */
+    /* Weak ASLR: shift the stack top by 0..7 pages using timer entropy. */
+    uint32_t rnd_off = (pit_get_ticks() & 7u) * PAGE_SIZE;
+    uint32_t sp = USER_SIGTRAMP - 32 - rnd_off;
     uint32_t addrs[16];
 
     if (argc < 1) argc = 1;
@@ -501,18 +504,28 @@ static uint32_t build_user_stack(int argc, const char* const* argv,
         addrs[i] = sp;
     }
 
+    /* 16 random bytes for AT_RANDOM (used by ld.so for library ASLR). */
+    sp -= 16;
+    uint32_t rnd_ptr = sp;
+    uint32_t seed = pit_get_ticks() * 1103515245u + 12345u;
+    for (int i = 0; i < 16; i++) {
+        seed = seed * 1103515245u + 12345u;
+        ((uint8_t*)sp)[i] = (uint8_t)(seed >> 16);
+    }
+
     /* Auxiliary vector in final order; pushed in reverse below. A real
      * ld.so needs AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/AT_BASE. */
-    uint32_t aux[7][2] = {
+    uint32_t aux[8][2] = {
         {  3, li ? li->phdr  : 0 },     /* AT_PHDR */
         {  4, li ? li->phent : 32 },    /* AT_PHENT */
         {  5, li ? li->phnum : 0 },     /* AT_PHNUM */
         {  6, 4096 },                   /* AT_PAGESZ */
         {  7, interp_base },            /* AT_BASE (interpreter bias) */
         {  9, li ? li->entry : 0 },     /* AT_ENTRY */
+        { 25, rnd_ptr },                /* AT_RANDOM */
         {  0, 0 },                      /* AT_NULL */
     };
-    for (int i = 6; i >= 0; i--) {
+    for (int i = 7; i >= 0; i--) {
         sp -= 4; *(uint32_t*)sp = aux[i][1];
         sp -= 4; *(uint32_t*)sp = aux[i][0];
     }
