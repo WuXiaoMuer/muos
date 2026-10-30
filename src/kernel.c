@@ -105,8 +105,9 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     vga_print("[OK] Paging enabled (identity map)\n");
     serial_write("[OK] Paging enabled\n");
 
-    /* 5a. VBE linear framebuffer (only the ISO bootloader sets it up) */
-    if (mb == NULL && fb_pending() && fb_enable()) {
+    /* 5a. VBE linear framebuffer (only the ISO bootloader sets it up;
+     * fb_pending() checks the 'VBE1' descriptor, independent of mb). */
+    if (fb_pending() && fb_enable()) {
         vga_repaint();
         vga_print("[OK] VBE framebuffer ");
         vga_print_dec(fb_width()); vga_print("x"); vga_print_dec(fb_height());

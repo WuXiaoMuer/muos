@@ -57,11 +57,16 @@ def iso_path():
     try:
         sh.start()
         tests_ok = "Results: 88 passed, 0 failed" in sh.text()
-        sh.run("exec hello.elf")
+        # The ISO loader now builds a synthetic Multiboot info with the BIOS
+        # E820 map, so the sandbox usually fits and hello.elf runs. Very
+        # small machines still get the graceful "sandbox above physical RAM"
+        # rejection instead.
+        sh.type("exec hello.elf\n")
+        time.sleep(1.0)
+        sh.type("x")
+        time.sleep(3.0)
         text = sh.text()
-        # The ISO path has no multiboot memory map, so the 128MB sandbox is
-        # above the fallback RAM: the loader must reject it gracefully and the
-        # shell must survive (this is the documented ISO behaviour).
+        ran = MARK in text and "[user] exit code=0" in text
         graceful = "sandbox above physical RAM" in text
         sh.run("help")
         text = sh.text()
@@ -69,7 +74,7 @@ def iso_path():
         panic = "PANIC" in text or "panic" in text.lower()
     finally:
         sh.close()
-    return tests_ok, graceful and alive, panic, text
+    return tests_ok, (ran or graceful) and alive, panic, text
 
 
 def main():
@@ -82,7 +87,7 @@ def main():
     print(f"kernel exec marker: {kexec and kmark}")
     print(f"kernel USER-HELLO-OK: {kmark}")
     print(f"ISO tests 88/0: {itests}")
-    print(f"ISO graceful reject: {igrace}")
+    print(f"ISO user program (run or graceful reject): {igrace}")
     print(f"ISO panic: {ipanic}")
     ok = ktests and kmark and kexec and itests and igrace and not ipanic
     print("RESULT:", "PASS" if ok else "FAIL")

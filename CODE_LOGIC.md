@@ -45,7 +45,7 @@ high_entry:     mov esp, stack_top  ; 16KB 内核栈(高地址)
 1. BIOS 加载引导扇区(boot.img 前半,由 make_iso.py 在偏移 4092 处补丁内核大小)到 0x7C00
 2. 实模式:读光盘其余部分到 0x8C00 → 开 A20 → **VBE 4F00/4F01/4F02 设置线性帧缓冲(0x6F00 处留下描述符)** → 建平坦 GDT → 置 PE 进入保护模式
 3. 把内核 flat binary 拷到 0x100000,远跳 `(0x08, 0x100000)`
-4. **EBX = 0**(无 multiboot 信息):mm.c 检测后回退 mem_upper 默认值;内核据 0x6F00 的 `VBE1` 魔数启用帧缓冲(`-kernel` 路径没有该魔数,保持 VGA 文本)
+4. **自建 Multiboot info**:`boot_cd.s` 在进入保护模式前用 `INT 15h, AX=E820` 收集内存图,写到 `0x5800`(每项带 4 字节 size=20 前缀),再在 `0x5600` 填 `flags=MEM|MMAP`、mem_lower/mem_upper、mmap_length/mmap_addr;EBX 指向 `0x5600`。内核据 0x6F00 的 `VBE1` 魔数启用帧缓冲(与是否有多 mem 信息无关)
 
 ### 2.3 kernel_main 初始化序列
 
@@ -78,7 +78,7 @@ serial → vga → GDT → IDT(256 项)→ PIC(重映射+全屏蔽)
 
 - `include/multiboot.h`:完整的 `multiboot_info_t`。**mmap_length 在偏移 44、mmap_addr 在偏移 48,中间隔着 syms[4]**——截断定义会读错位。
 - Pass 1:遍历 mmap 条目(`p += entry->size + 4`),type==1 的区域取最高 end,clamp 到 `MM_MAX_RAM_MB`(1GB,32 位上限防护),得到 `ram_top`。
-- 无 mmap(ISO 路径 EBX=0)→ 回退 `mem_upper + 1MB`;再无 → 默认 32MB。
+- 无 mmap(例如 BIOS 不支持 E820)→ 回退 `mem_upper + 1MB`;boot_cd.s 在 E820 失败时会把 mem_upper 填成 32MB,因此仍能启动。
 - >4GB 条目:base 在 ram_cap 之外直接不计,跨越部分截断。
 
 ### 4.2 物理位图分配器

@@ -145,7 +145,7 @@ qemu-system-i386 -kernel build\kernel.elf -m 256M
 
 **Higher-half**:内核链接在 0xC0100000、物理装载在 0x100000(`AT(ADDR - 0xC0000000)`),ELF 入口 `entry_phys = 0x100000`。`boot.s` 在关分页的物理地址上先建自举页目录(identity 0..8MB + `PDE[768]` 映射物理 0..4MB),打开分页后用绝对地址跳到高半区;`mm_init` 再把全部 RAM 别名到 0xC0000000(1GB 上限恰好是 256 个 PDE)。内核代码、静态数据、页表/heap 都在高地址运行。
 
-ISO 路径没有 multiboot 信息(EBX=0),内存管理回退到 mem_upper 默认值(32MB)——见 ROADMAP。ISO 引导同时用 BIOS `INT 10h`(VBE 4F00/4F01/4F02)设置线性帧缓冲,并把模式描述符留在 `0x6F00`;内核启动后映射这段显存,把 80×25 文本网格(8×8 字模纵向放大 2 倍)居中画到 800×600。`-kernel` 路径没有 VBE,继续用 VGA 文本模式(两条路径共用同一套 `vga_*` 接口)。
+ISO 路径的引导器自建一个最小 Multiboot info(位于 `0x5600`):先用 BIOS `INT 15h/AX=E820` 收集物理内存图(最多 24 项,按 Multiboot entry 格式写到 `0x5800`),再填 `flags=MEM|MMAP`、`mem_lower/mem_upper`、`mmap_length/mmap_addr`,最后把 EBX 指向该结构。因此 ISO 路径与 `-kernel` 路径使用同一套 E820 解析;只有 BIOS 不支持 E820 时才回退 `mem_upper=32MB`。ISO 引导同时用 BIOS `INT 10h`(VBE 4F00/4F01/4F02)设置线性帧缓冲,并把模式描述符留在 `0x6F00`;内核启动后映射这段显存,把 80×25 文本网格(8×8 字模纵向放大 2 倍)居中画到 800×600。`-kernel` 路径没有 VBE,继续用 VGA 文本模式(两条路径共用同一套 `vga_*` 接口)。
 
 ## Ring3 用户程序
 
@@ -205,7 +205,7 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - `nanosleep` 在单进程/没有其他可运行进程时用 `sti; hlt` 等 PIT tick(100Hz),整机暂停到时间到期;`times` 返回 tick 数,`getrusage` 返回全零结构,`chown/lchown/fchown/fchownat` 只校验目标(不跟踪所有权),`readlink` 对非符号链接返回 `EINVAL`。
 - `*at` 路径解析:绝对路径忽略 dirfd;相对路径在 `AT_FDCWD(-100)` 时按 cwd,在目录 fd 时拼接该 fd 的绝对路径;`fstatat64` 空路径 + `AT_EMPTY_PATH` 直接 stat dirfd,`unlinkat` 的 `AT_REMOVEDIR` 走 rmdir 语义。VFS 暂无符号链接,`readlinkat` 对已存在目标返回 `EINVAL`。
 - 路径统一规范化:支持绝对/相对路径、`.` 与 `..`(父目录越界时停在 `/`)。命名空间 = 扁平 RAM FS 根目录 + `/dev`、`/proc`、`/etc` 虚拟目录;`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`。
-- 沙箱要求物理 RAM > 128MB;ISO 路径因无 multiboot 信息回退 32MB,`run`/`exec` 会明确提示内存不足。
+- 沙箱要求物理 RAM > 128MB;ISO 路径现在通过自建 E820 info 获得真实内存图,内存足够时 `exec` 可正常运行,内存不足时才提示并优雅拒绝。
 
 ## 真实 Linux 二进制(BusyBox)
 

@@ -161,5 +161,5 @@
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)
 - [ ] panic 打印带 addr2line 说明(已加 -g)
-- [ ] ISO 路径构造最小 mb_info(消除 EBX=0 的 32MB 回退)
+- [x] ISO 路径构造最小 mb_info:`boot_cd.s` 用 BIOS INT 15h/E820 收集内存图,生成带 MEM|MMAP 的 Multiboot info(0x5600/0x5800)并交给内核;仅 BIOS 无 E820 时才回退 32MB
 - [ ] 多核/APIC(远期,单核不影响 ABI 兼容目标)

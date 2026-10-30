@@ -99,6 +99,99 @@ vbe_try:
     mov dword [0x6F00], 0x31454256   ; 'VBE1' (written last)
 
 vbe_done:
+    ; ── E820 memory map -> minimal Multiboot info at 0x5600 ──
+    ; The El Torito loader has no Multiboot header, so it builds the info
+    ; struct itself: flags = MEM|MMAP, E820 entries (with the Multiboot
+    ; size prefix) at 0x5800.  EBX is handed to the kernel, which then uses
+    ; the BIOS map instead of the 32MB mem_upper fallback.
+    mov ax, 0
+    mov es, ax
+    mov ds, ax
+    mov dword [0x5700], 0          ; entry count
+    mov dword [0x5704], 0          ; mem_lower (KB)
+    mov dword [0x5708], 0          ; mem_upper (KB)
+    xor ebx, ebx                   ; continuation value
+e820_loop:
+    mov ax, 0
+    mov es, ax
+    mov ds, ax
+    mov eax, 0xE820
+    mov edx, 0x534D4150            ; 'SMAP'
+    mov ecx, 24
+    mov di, 0x5C00
+    int 0x15
+    jc e820_done
+    cmp eax, 0x534D4150
+    jne e820_done
+    mov ax, 0
+    mov es, ax
+    mov ds, ax
+    mov eax, [0x5700]
+    cmp eax, 24
+    jae e820_done
+    imul eax, eax, 24
+    mov edi, 0x5800
+    add edi, eax
+    mov dword [edi], 20            ; Multiboot entry size field
+    mov eax, [0x5C00]              ; base low
+    mov [edi + 4], eax
+    mov eax, [0x5C04]
+    mov [edi + 8], eax
+    mov eax, [0x5C08]              ; length low
+    mov [edi + 12], eax
+    mov eax, [0x5C0C]
+    mov [edi + 16], eax
+    mov eax, [0x5C10]              ; type
+    mov [edi + 20], eax
+    inc dword [0x5700]
+    cmp eax, 1
+    jne e820_next
+    mov eax, [0x5C00]
+    cmp eax, 0x00100000
+    jae e820_high
+    mov edx, [0x5C08]
+    mov ecx, 0x00100000
+    sub ecx, eax
+    cmp edx, ecx
+    jbe e820_low_len
+    mov edx, ecx
+e820_low_len:
+    shr edx, 10
+    add [0x5704], edx
+    jmp e820_next
+e820_high:
+    mov edx, [0x5C08]
+    shr edx, 10
+    add [0x5708], edx
+e820_next:
+    test ebx, ebx
+    jz e820_done
+    jmp e820_loop
+e820_done:
+    mov ax, 0
+    mov es, ax
+    mov ds, ax
+    cmp dword [0x5700], 0
+    jne e820_have
+    mov dword [0x5704], 640        ; BIOS without E820: 640KB + 32MB fallback
+    mov dword [0x5708], 32768
+e820_have:
+    mov eax, 0x41                  ; MEM | MMAP
+    mov [0x5600], eax
+    mov eax, [0x5704]
+    mov [0x5604], eax
+    mov eax, [0x5708]
+    mov [0x5608], eax
+    xor eax, eax
+    mov edi, 0x560C
+    mov ecx, 7                     ; boot_device .. syms[3] (28 bytes)
+    rep stosd
+    mov eax, [0x5700]
+    imul eax, eax, 24
+    mov [0x562C], eax              ; mmap_length
+    mov dword [0x5630], 0x5800     ; mmap_addr
+    mov dword [0x5640], 0          ; mods_count (flags bit3 clear)
+
     ; Load GDT
     lgdt [gdtr]
 
@@ -130,10 +223,9 @@ pmode_entry:
     rep movsb
 
     ; Set up multiboot info for kernel_main(magic, mb_info)
-    ; EAX = 0x2BADB002 (multiboot magic)
-    ; EBX = 0 (no multiboot info struct, kernel handles this)
+    ; EAX = 0x2BADB002 (multiboot magic), EBX = our synthetic info struct
     mov eax, 0x2BADB002
-    xor ebx, ebx
+    mov ebx, 0x5600
 
     ; Jump to kernel entry point
     jmp 0x08:0x100000
