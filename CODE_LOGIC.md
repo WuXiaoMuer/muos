@@ -348,7 +348,7 @@ USER_SIGTRAMP = 0x08847000
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;无按需分页/换出
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
 3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc/musl `.so` 端到端验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回;ext2 只读、未接入 VFS
-4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32 支持 8.3 文件读写但未接入 `open/read` 的 VFS、不支持长名创建;ext2 只读、无二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(单段在途重传/RTO 退避/慢开始+拥塞避免;无发送队列、无乱序重排、无窗口缩放,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32 支持 8.3/长名创建与写入但未接入 `open/read` 的 VFS;ext2 只读、无二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免;无乱序重排、无窗口缩放,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
