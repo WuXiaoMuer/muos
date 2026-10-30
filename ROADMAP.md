@@ -17,7 +17,7 @@
 - [x] 内核堆 kmalloc/kfree/kcalloc
 - [x] 调度器死代码清理,task_t 入堆;IDT 256 项全覆盖(0x80 现为系统调用门)
 - [x] 公共字符串库(标准名,防 freestanding 隐式调用链接失败)
-- [x] 键盘/中断 EFLAGS 纪律;自检套件扩到 46 项(含 >4MB 分页、堆、mmap;当前 81 项)
+- [x] 键盘/中断 EFLAGS 纪律;自检套件扩到 46 项(含 >4MB 分页、堆、mmap;当前 88 项)
 - [x] ISO 启动路径修复(入口=镜像首字节);构建脚本零硬编码路径
 
 ## 阶段 1:内核与用户态隔离(基本完成)
@@ -74,7 +74,8 @@
 - [x] 进程 ABI:`fork(2)`、`waitpid(7)/wait4(114)`、`execve(11)`(顺序快照模型,每进程独立内存快照与内核栈)
 - [x] 管道 ABI:`pipe(42)/pipe2(331)`、fd 表 PIPE_READ/WRITE、shell 管道 `echo hi | cat`
 - [ ] 真正并发:`clone` 线程、信号投递、抢占调度、每进程页目录
-- [ ] 目录层级:`mkdir/rmdir/renameat`、子目录查找与多级 RAM FS(当前虚拟 `/dev` `/proc` `/etc` 之外仍是扁平的)
+- [x] 目录层级:`mkdir/rmdir`、子目录路径解析、直接子项枚举、跨目录文件 `rename`;`mkdir -p`/`cp`/`mv` 实测通过
+- [ ] `*at` 族(`openat/statat/unlinkat/renameat/mkdirat`)与目录 rename
 - [x] `/proc/<pid>/{stat,status,comm,cmdline}` 与动态 PID 目录;`ps` 显示 kernel/busybox
 - [x] `/proc/loadavg`、`/proc/stat`、`/proc/self/maps` 最小实现
 - [ ] `vmstat/top` 所需的完整 CPU/内存统计字段

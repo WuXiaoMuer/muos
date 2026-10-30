@@ -3,6 +3,51 @@
 #include "rtc.h"
 
 static fs_file_t files[FS_MAX_FILES];
+static fs_dir_t  dirs[FS_MAX_DIRS];
+
+static bool_t has_slash(const char* s) {
+    for (; *s; s++) if (*s == '/') return true;
+    return false;
+}
+
+static bool_t file_exists(const char* path) {
+    if (!*path) return false;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (files[i].used && strcmp(files[i].name, path) == 0) return true;
+    }
+    return false;
+}
+
+static bool_t dir_exists(const char* path) {
+    if (!*path) return true;                  /* root */
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (dirs[i].used && strcmp(dirs[i].name, path) == 0) return true;
+    }
+    return false;
+}
+
+/* Split "a/b/c" into parent "a/b" and base "c". Root has an empty parent. */
+static bool_t split_parent(const char* path, char* parent, const char** base) {
+    if (!path || !*path || path[0] == '/' || strlen(path) >= FS_MAX_NAME)
+        return false;
+    const char* slash = NULL;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/') {
+            if (p == path || p[1] == '\0' || p[1] == '/') return false;
+            slash = p;
+        }
+    }
+    if (!slash) {
+        parent[0] = '\0';
+        *base = path;
+        return true;
+    }
+    uint32_t n = (uint32_t)(slash - path);
+    memcpy(parent, path, n);
+    parent[n] = '\0';
+    *base = slash + 1;
+    return true;
+}
 
 void fs_init(void) {
     for (int i = 0; i < FS_MAX_FILES; i++) {
@@ -11,18 +56,37 @@ void fs_init(void) {
         files[i].name[0] = '\0';
         files[i].atime = files[i].mtime = files[i].ctime = 0;
     }
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        dirs[i].used = 0;
+        dirs[i].name[0] = '\0';
+    }
 }
 
-int fs_create(const char* name) {
-    /* Check for duplicate */
-    for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (files[i].used && strcmp(files[i].name, name) == 0)
-            return -1;  /* Already exists */
-    }
-    /* Find free slot */
+bool_t fs_is_file(const char* path) {
+    return file_exists(path);
+}
+
+bool_t fs_is_dir(const char* path) {
+    return dir_exists(path);
+}
+
+bool_t fs_parent_is_dir(const char* path) {
+    char parent[FS_MAX_NAME];
+    const char* base = NULL;
+    if (!split_parent(path, parent, &base)) return false;
+    return dir_exists(parent);
+}
+
+int fs_create(const char* path) {
+    char parent[FS_MAX_NAME];
+    const char* base = NULL;
+    if (!split_parent(path, parent, &base)) return -1;
+    if (!dir_exists(parent)) return -1;              /* parent not a directory */
+    if (file_exists(path) || dir_exists(path)) return -1;
+
     for (int i = 0; i < FS_MAX_FILES; i++) {
         if (!files[i].used) {
-            strncpy(files[i].name, name, FS_MAX_NAME - 1);
+            strncpy(files[i].name, path, FS_MAX_NAME - 1);
             files[i].name[FS_MAX_NAME - 1] = '\0';
             files[i].size = 0;
             files[i].used = 1;
@@ -31,6 +95,110 @@ int fs_create(const char* name) {
         }
     }
     return -1;  /* No free slots */
+}
+
+int fs_mkdir(const char* path) {
+    char parent[FS_MAX_NAME];
+    const char* base = NULL;
+    if (!split_parent(path, parent, &base)) return -1;
+    if (!dir_exists(parent)) return -1;
+    if (file_exists(path) || dir_exists(path)) return -1;
+
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (!dirs[i].used) {
+            strncpy(dirs[i].name, path, FS_MAX_NAME - 1);
+            dirs[i].name[FS_MAX_NAME - 1] = '\0';
+            dirs[i].used = 1;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+bool_t fs_dir_is_empty(const char* path) {
+    if (!dir_exists(path)) return false;
+    uint32_t n = strlen(path);
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (!files[i].used) continue;
+        if (strncmp(files[i].name, path, n) == 0 && files[i].name[n] == '/')
+            return false;
+    }
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (!dirs[i].used) continue;
+        if (strncmp(dirs[i].name, path, n) == 0 && dirs[i].name[n] == '/')
+            return false;
+    }
+    return true;
+}
+
+int fs_rmdir(const char* path) {
+    if (!*path || !dir_exists(path) || !fs_dir_is_empty(path)) return -1;
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (dirs[i].used && strcmp(dirs[i].name, path) == 0) {
+            dirs[i].used = 0;
+            dirs[i].name[0] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Enumerate a directory: subdirectories first, then files. */
+static bool_t child_name(const char* dir, const char* path, const char** out) {
+    if (!*dir) {
+        if (has_slash(path)) return false;
+        *out = path;
+        return true;
+    }
+    uint32_t n = strlen(dir);
+    if (strncmp(path, dir, n) != 0 || path[n] != '/') return false;
+    const char* rest = path + n + 1;
+    if (!*rest || has_slash(rest)) return false;
+    *out = rest;
+    return true;
+}
+
+int fs_dir_count(const char* path) {
+    if (!dir_exists(path)) return -1;
+    int n = 0;
+    const char* name;
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (dirs[i].used && child_name(path, dirs[i].name, &name)) n++;
+    }
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (files[i].used && child_name(path, files[i].name, &name)) n++;
+    }
+    return n;
+}
+
+bool_t fs_dir_get(const char* path, int idx, fs_dirent_t* out) {
+    if (!dir_exists(path) || idx < 0 || !out) return false;
+    const char* name;
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (!dirs[i].used) continue;
+        if (!child_name(path, dirs[i].name, &name)) continue;
+        if (idx-- == 0) {
+            strncpy(out->name, name, FS_MAX_NAME - 1);
+            out->name[FS_MAX_NAME - 1] = '\0';
+            out->is_dir = true;
+            out->size = 0;
+            out->slot = -1;
+            return true;
+        }
+    }
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (!files[i].used) continue;
+        if (!child_name(path, files[i].name, &name)) continue;
+        if (idx-- == 0) {
+            strncpy(out->name, name, FS_MAX_NAME - 1);
+            out->name[FS_MAX_NAME - 1] = '\0';
+            out->is_dir = false;
+            out->size = files[i].size;
+            out->slot = i;
+            return true;
+        }
+    }
+    return false;
 }
 
 int fs_write(int fd, const char* data, uint32_t len) {
@@ -74,6 +242,10 @@ int fs_open(const char* name) {
 
 int fs_rename(int slot, const char* new_name) {
     if (slot < 0 || slot >= FS_MAX_FILES || !files[slot].used) return -1;
+    char parent[FS_MAX_NAME];
+    const char* base = NULL;
+    if (!split_parent(new_name, parent, &base)) return -1;
+    if (!dir_exists(parent) || dir_exists(new_name)) return -1;
     for (int i = 0; i < FS_MAX_FILES; i++) {
         if (i != slot && files[i].used && strcmp(files[i].name, new_name) == 0)
             return -1;

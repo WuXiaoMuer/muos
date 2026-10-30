@@ -3,7 +3,8 @@
 #include "types.h"
 
 #define FS_MAX_FILES    16
-#define FS_MAX_NAME     32
+#define FS_MAX_DIRS     16
+#define FS_MAX_NAME     64      /* full path relative to root, no leading '/' */
 #define FS_MAX_SIZE     65536   /* 64KB per file; room for a static i386 ELF */
 
 typedef struct {
@@ -16,12 +17,32 @@ typedef struct {
     uint32_t ctime;
 } fs_file_t;
 
+typedef struct {
+    char   name[FS_MAX_NAME];   /* path relative to root */
+    uint32_t used;
+} fs_dir_t;
+
+typedef struct {
+    char     name[FS_MAX_NAME];  /* child name (single component) */
+    bool_t   is_dir;
+    uint32_t size;
+    int      slot;               /* file slot when !is_dir */
+} fs_dirent_t;
+
 void fs_init(void);
-int  fs_create(const char* name);
+int  fs_create(const char* path);
+int  fs_mkdir(const char* path);
+int  fs_rmdir(const char* path);
+bool_t fs_is_dir(const char* path);
+bool_t fs_is_file(const char* path);
+bool_t fs_parent_is_dir(const char* path);
+bool_t fs_dir_is_empty(const char* path);
+int  fs_dir_count(const char* path);
+bool_t fs_dir_get(const char* path, int idx, fs_dirent_t* out);
 int  fs_write(int fd, const char* data, uint32_t len);
 int  fs_read(int fd, char* buf, uint32_t maxlen);
-int  fs_delete(const char* name);
-int  fs_open(const char* name);
+int  fs_delete(const char* path);
+int  fs_open(const char* path);
 int  fs_rename(int slot, const char* new_name);   /* 0 = ok, -1 = bad/duplicate */
 int  fs_count(void);
 const char* fs_name(int idx);

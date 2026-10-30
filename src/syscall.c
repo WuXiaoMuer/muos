@@ -36,6 +36,8 @@
 #define SYS_getuid    24
 #define SYS_access    33
 #define SYS_kill      37
+#define SYS_mkdir     39
+#define SYS_rmdir     40
 #define SYS_rename    38
 #define SYS_setpgid   57
 #define SYS_getpgrp   65
@@ -113,6 +115,7 @@
 #define ERR_ECHILD    10
 #define ERR_EAGAIN    11
 #define ERR_EACCES    13
+#define ERR_EEXIST    17
 #define ERR_ENOMEM    12
 #define ERR_EFAULT    14
 #define ERR_ENODEV    19
@@ -125,6 +128,7 @@
 #define ERR_ERANGE    34
 #define ERR_ENAMETOOLONG 36
 #define ERR_ENOSYS    38
+#define ERR_ENOTEMPTY 39
 
 /* open(2) flags and mmap(2) constants (Linux i386 values) */
 #define O_WRONLY    0x01
@@ -288,6 +292,7 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
 #define VFS_DIR_BIN  6
 #define VFS_DIR_USRBIN 7
 #define VFS_DIR_SBIN 8
+#define VFS_DIR_REAL 9
 
 #define VFS_DEV_NULL    1
 #define VFS_DEV_ZERO    2
@@ -497,7 +502,11 @@ static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
     }
 
     const char* name = e->path + 1;
-    if (has_slash(name)) return err(ERR_ENOTDIR);
+    if (fs_is_dir(name)) {
+        e->type = VFS_T_DIR;
+        e->id = VFS_DIR_REAL;
+        return 0;
+    }
     int slot = fs_open(name);
     if (slot < 0) return err(ERR_ENOENT);
     e->type = VFS_T_FILE;
@@ -696,10 +705,17 @@ static bool_t vfs_dir_meta(const char* path, int* id, uint32_t* pid) {
     int d = vfs_dir_id(path);
     if (d) { *id = d; *pid = 0; return true; }
     uint32_t v = 0;
-    if (!vfs_proc_pid_dir(path, &v)) return false;
-    *id = VFS_DIR_PID;
-    *pid = v;
-    return true;
+    if (vfs_proc_pid_dir(path, &v)) {
+        *id = VFS_DIR_PID;
+        *pid = v;
+        return true;
+    }
+    if (path[0] == '/' && fs_is_dir(path + 1)) {
+        *id = VFS_DIR_REAL;
+        *pid = 0;
+        return true;
+    }
+    return false;
 }
 
 static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
@@ -713,17 +729,17 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
     idx -= 2;
 
     if (dir == VFS_DIR_ROOT) {
-        int files = fs_count();
-        if ((int)idx < files) {
-            const char* n = fs_name((int)idx);
-            if (!n) return false;
-            strncpy(name, n, USER_FD_PATH_MAX - 1);
+        int entries = fs_dir_count("");
+        if ((int)idx < entries) {
+            fs_dirent_t de;
+            if (!fs_dir_get("", (int)idx, &de)) return false;
+            strncpy(name, de.name, USER_FD_PATH_MAX - 1);
             name[USER_FD_PATH_MAX - 1] = '\0';
-            *ino = idx + 3;
-            *type = 8;                  /* DT_REG */
+            *ino = de.is_dir ? 1000 + idx : (uint32_t)(de.slot + 3);
+            *type = de.is_dir ? 4 : 8;
             return true;
         }
-        idx -= (uint32_t)files;
+        idx -= (uint32_t)entries;
         const char* extra[4] = { "bin", "dev", "proc", "etc" };
         if (idx < 4) {
             strncpy(name, extra[idx], USER_FD_PATH_MAX);
@@ -775,6 +791,16 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
         }
         return false;
     }
+    if (dir == VFS_DIR_REAL) {
+        fs_dirent_t de;
+        const char* rel = path[0] == '/' ? path + 1 : path;
+        if (!fs_dir_get(rel, (int)idx, &de)) return false;
+        strncpy(name, de.name, USER_FD_PATH_MAX - 1);
+        name[USER_FD_PATH_MAX - 1] = '\0';
+        *ino = de.is_dir ? 1100 + idx : (uint32_t)(de.slot + 3);
+        *type = de.is_dir ? 4 : 8;
+        return true;
+    }
     if (dir == VFS_DIR_BIN || dir == VFS_DIR_USRBIN || dir == VFS_DIR_SBIN) {
         const char* progs[5] = { "busybox", "sh", "ls", "cat", "ps" };
         if (idx < 5) {
@@ -806,8 +832,9 @@ static uint32_t do_open(uint32_t path, uint32_t flags, uint32_t mode) {
         if (!(flags & O_CREAT) || (flags & O_DIRECTORY)) return rc;
 
         const char* name = e.path + 1;
-        if (!*name || has_slash(name)) return err(ERR_ENOTDIR);
+        if (!*name) return err(ERR_ENOTDIR);
         if (strlen(name) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
+        if (!fs_parent_is_dir(name)) return err(ERR_ENOTDIR);
         int slot = fs_create(name);
         if (slot < 0) return err(ERR_ENOSPC);
         int fd = user_fd_alloc(slot);
@@ -922,6 +949,7 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
             else if (e->id == VFS_DIR_PROC) base = 101;
             else if (e->id == VFS_DIR_ETC) base = 102;
             else if (e->id == VFS_DIR_PID) base = 500 + e->pid * 8;
+            else if (e->id == VFS_DIR_REAL) base = 1000;
             *ino = base;
             *mode = S_IFDIR | 0755;
             *nlink = 2;
@@ -1385,6 +1413,36 @@ static uint32_t do_chdir(uint32_t path_ptr) {
     return user_cwd_set(e.path) ? 0 : err(ERR_ENAMETOOLONG);
 }
 
+static uint32_t do_mkdir(uint32_t path_ptr) {
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc == 0) return err(ERR_EEXIST);
+    if ((uint32_t)(-(int32_t)rc) != ERR_ENOENT) return rc;
+
+    const char* name = e.path + 1;
+    if (!*name) return err(ERR_EEXIST);
+    if (strlen(name) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
+    if (!fs_parent_is_dir(name)) return err(ERR_ENOTDIR);
+    return fs_mkdir(name) == 0 ? 0 : err(ERR_ENOSPC);
+}
+
+static uint32_t do_rmdir(uint32_t path_ptr) {
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+
+    if (e.type != VFS_T_DIR || e.id != VFS_DIR_REAL) return err(ERR_EPERM);
+    const char* name = e.path + 1;
+    if (!fs_dir_is_empty(name)) return err(ERR_ENOTEMPTY);
+    return fs_rmdir(name) == 0 ? 0 : err(ERR_ENOENT);
+}
+
 static uint32_t do_unlink(uint32_t path_ptr) {
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
@@ -1422,8 +1480,10 @@ static uint32_t do_rename(uint32_t old_ptr, uint32_t new_ptr) {
     }
 
     const char* nname = ne.path + 1;
-    if (!*nname || has_slash(nname)) return err(ERR_ENOTDIR);
+    if (!*nname) return err(ERR_ENOTDIR);
     if (strlen(nname) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
+    if (!fs_parent_is_dir(nname)) return err(ERR_ENOTDIR);
+    if (fs_is_dir(nname)) return err(ERR_EISDIR);
     return fs_rename(oe.slot, nname) == 0 ? 0 : err(ERR_EINVAL);
 }
 
@@ -1924,6 +1984,12 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_kill:
             ret = do_kill(regs->ebx, regs->ecx);
+            break;
+        case SYS_mkdir:
+            ret = do_mkdir(regs->ebx);
+            break;
+        case SYS_rmdir:
+            ret = do_rmdir(regs->ebx);
             break;
         case SYS_waitpid:
         case SYS_wait4:

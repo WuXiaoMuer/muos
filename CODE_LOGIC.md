@@ -1,6 +1,6 @@
 # MuOS 代码逻辑(v1.2)
 
-本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、顺序快照进程模型、81 项自检。演进计划见 ROADMAP.md。
+本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、单任务模型、Ring3 用户态(int 0x80 + ELF32)、PS/2 鼠标 + RTC 桌面、顺序快照进程模型、88 项自检。演进计划见 ROADMAP.md。
 
 ## 一、总体结构
 
@@ -51,7 +51,7 @@ serial → vga → GDT → IDT(256 项)→ PIC(重映射+全屏蔽)
 → tss_init()                      [TSS + 8KB Ring0 入口栈 + ltr]
 → PIT 100Hz + IRQ0 → keyboard → mouse(8042 aux / IRQ12)
 → task_init + task_register("kernel")
-→ tests_run()                     [81 项自检,失败打印 SELF-TEST FAILED]
+→ tests_run()                     [88 项自检,失败打印 SELF-TEST FAILED]
 → 启动动画 → shell_run()(内核栈上)
 ```
 
@@ -148,7 +148,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
   - 内存/其他:`brk(45) old_mmap(90) mmap2(192) munmap(91) mprotect(125) uname(122) sysinfo(116) set/get_thread_area(243/244) time(13) gettimeofday(78) clock_gettime(265/403)`
   - 未知号返回 `-ENOSYS(-38)` 并在串口打印一次编号,作为 ROADMAP 阶段 4 的待办清单。
 - fd 表在 user.c 统一管理 0..10:启动时 0/1/2 是 `USER_FD_STDIN/STDOUT/STDERR`,其余条目可为 RAM FS 文件、目录、`/dev` 节点、`/proc` 快照或已关闭(FREE)。新 fd 从 3 起分配;`dup(41)` 复制任意条目,`dup2(63)` 可把文件/设备重定向到 0..2(或反向),`dd` 的 `dup2(if_fd,0)` 由此可用。
-- 路径解析 `vfs_normalize`:以进程 cwd(`user_cwd_get/set`,启动时 `/`)为基准处理绝对/相对路径、`.`、`..`(越界停在 `/`),输出规范绝对路径。命名空间:`/` 是 RAM FS(仅单段文件名),另有虚拟 `/dev`、`/proc`、`/etc`。
+- 路径解析 `vfs_normalize`:以进程 cwd(`user_cwd_get/set`,启动时 `/`)为基准处理绝对/相对路径、`.`、`..`(越界停在 `/`),输出规范绝对路径。命名空间:`/` 是 RAM FS(支持多级目录,路径去掉前导 `/` 后存于 fs.c),另有虚拟 `/dev`、`/proc`、`/etc`、`/bin`。
 - 虚拟文件:`/dev/null` 读 EOF/写丢弃,`/dev/zero` 读零/写丢弃,`/dev/console` 接键盘与 VGA+串口;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/proc/<pid>/{stat,status,comm,cmdline}` 与 `/etc/mtab` 在 `open` 时由内核生成快照存入 fd,`/proc/meminfo` 取 mm 页统计,`uptime` 取 PIT 100Hz;`/proc/<pid>/stat` 输出 Linux 的 52 字段(尾部保留空格),BusyBox `ps` 可解析。
 - `getdents/getdents64` 按目录 fd 的绝对路径枚举 `.`、`..`、RAM FS 文件以及 `dev/proc/etc` 虚拟子目录,分别按 i386 `linux_dirent`(10 字节头)与 `linux_dirent64`(19 字节头)打包;`d_off` 写下一项序号,缓冲区不足时保留偏移。
 - `stat` 族:`stat64` 写 96 字节 i386 布局,旧 `stat` 写 64 字节布局;目录 `S_IFDIR|0755`/nlink 2,文件 `S_IFREG|0644`,设备 `S_IFCHR|0666`,`/proc` 快照 `S_IFREG|0444`,`st_dev=1`;三类时间来自 RAM FS 的 atime/mtime/ctime。`statx(383)` 写 256 字节 `struct statx`(mask=STATX_BASIC_STATS),空路径且 `AT_EMPTY_PATH` 时改为 stat dirfd。
@@ -198,7 +198,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 ## 八、Shell / FS / 桌面
 
 - **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault]` 运行内嵌 ELF,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
-- **fs.c**:RAM 文件系统,16 槽 × 64KB(能存放静态 i386 ELF),fd 即槽位下标(无句柄/引用保护——`fs_open` 后文件可被删,这是已知局限)。除 shell 用的整文件 write/read 外,`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 支持同目录改名/覆盖(重名校验、内容保留)。架构级改造见 ROADMAP。
+- **fs.c**:RAM 文件系统,16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。fd 仍是槽位下标(无句柄/引用保护——`fs_open` 后文件可被删)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
 - **win7.c**:文本模式 Win7 风格桌面——行 0 标题、1..23 桌面、24 任务栏;窗口按 z-order 绘制(活动窗口最后),鼠标点击/标题栏拖拽/最小化/最大化/关闭,开始菜单鼠标/键盘双操作,桌面图标可见;任务栏显示实时内存与 CMOS RTC `HH:MM:SS`。`gui`/`win7`/`desktop` 命令共用此实现;`run` 之外的 Text Editor/Calculator 可从菜单或图标启动(Calculator 聚焦时直接吃数字/运算符)。
 - **mouse.c + rtc.c**:PS/2 鼠标初始化(0xA8/命令字节/0xF6/0xF4)与 3 字节包解析(9 位 dx/dy、溢出位、按键),映射为 80×25 文本单元;`rtc_read_time` 处理 UIP、BCD/12 小时制,失败时任务栏回退 `UP:MM`。
@@ -235,10 +235,10 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 ## 十一、已知局限(真实清单)
 
 1. 用户态是**固定 8MB 单地址空间 + 顺序快照进程模型**:无 higher-half、无每进程页目录、无抢占调度;子进程只在父 `waitpid` 时运行,不是真正并发(ROADMAP 阶段 1 剩余项)
-2. 系统调用仍缺真正并发:`clone` 只支持非线程 fork,`kill` 不投递信号,无抢占调度/线程;`mkdir/rmdir` 与文件 mmap、`/proc/stat` 全量字段仍缺(ROADMAP 阶段 2/4)
-3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;`fork+execve+waitpid`、虚拟 `/bin/*`、`pipe2` 与 shell 管道已跑通,但仍无多级目录/磁盘/网络/图形
+2. 系统调用仍缺真正并发:`clone` 只支持非线程 fork,`kill` 不投递信号,无抢占调度/线程;文件 mmap、`/proc/stat` 全量字段与 `*at` 族仍缺(ROADMAP 阶段 2/4)
+3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;`fork+execve+waitpid`、虚拟 `/bin/*`、`pipe2`、shell 管道与多级 RAM FS 已跑通,但仍无磁盘/网络/图形
 4. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
-5. fs 无句柄保护、无目录层级/持久化;时间戳仅存于 RAM FS,重启丢失;write 截断不告警;`/dev`、`/proc`、`/etc` 为只读虚拟层
+5. fs 无句柄保护、无持久化;有 16 级目录槽但路径/名称上限 64 字符;时间戳仅存于 RAM FS,重启丢失;write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 6. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
 7. 桌面仍是 80×25 文本模式,无图形帧缓冲、字体渲染与动画;窗口内容除 Calculator 外主要是状态展示
 8. 单处理器(PIC,非 APIC);内核仍是协作式单任务

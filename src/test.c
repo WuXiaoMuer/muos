@@ -328,6 +328,25 @@ static void test_proc(void) {
     CHECK(proc_count() == n0, "proc_reap frees process slots");
 }
 
+/* ---------- Nested RAM FS directories ---------- */
+static void test_fs_dirs(void) {
+    CHECK(fs_mkdir("__d") == 0, "fs_mkdir creates a directory");
+    CHECK(fs_is_dir("__d"), "fs_is_dir sees the new directory");
+
+    int fd = fs_create("__d/a");
+    CHECK(fd >= 0 && fs_parent_is_dir("__d/a"), "file can live in a subdirectory");
+    CHECK(fs_dir_count("__d") == 1, "fs_dir_count lists one child");
+
+    fs_dirent_t de;
+    CHECK(fs_dir_get("__d", 0, &de) && de.is_dir == false &&
+          strcmp(de.name, "a") == 0, "fs_dir_get returns the child");
+
+    CHECK(fs_rmdir("__d") == -1, "rmdir refuses a non-empty directory");
+    if (fd >= 0) fs_delete("__d/a");
+    CHECK(fs_rmdir("__d") == 0 && !fs_is_dir("__d"),
+          "rmdir removes an empty directory");
+}
+
 /* ---------- Pipe ring buffer ---------- */
 static void test_pipe(void) {
     int id = pipe_create();
@@ -388,6 +407,7 @@ int tests_run(void) {
     test_fs();
     test_fs_offsets();
     test_fs_rename();
+    test_fs_dirs();
     test_time();
     test_proc();
     test_pipe();

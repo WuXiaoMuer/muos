@@ -6,11 +6,11 @@
 - **硬件抽象**:GDT / IDT(256 项全覆盖)/ PIC / PIT / PS/2 键盘 + PS/2 鼠标 / 串口 / VGA 文本模式
 - **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、全 RAM 恒等映射分页、内核堆(kmalloc/kfree/kcalloc)
 - **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,可在 0x08048000 沙箱内运行 C 程序;ELF 可来自内核内嵌(`run`)或 RAM FS(`exec hello.elf`);用户态故障只杀进程,不 panic 内核
-- **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;扁平 VFS 暴露根目录 `/` 与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`fork/execve/waitpid` 使用顺序快照进程模型,`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块
+- **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;多级 RAM FS(`mkdir/rmdir`、子目录路径解析)与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`fork/execve/waitpid` 使用顺序快照进程模型,`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
-- **RAM 文件系统**:16 槽 × 64KB(足够存放静态 i386 ELF)+ 全屏文本编辑器
+- **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
-- **81 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
+- **88 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
 
 演进目标见 **[ROADMAP.md](ROADMAP.md)**:以 Linux ABI 兼容(int 0x80 + ELF32,运行静态 i386 Linux 二进制)为主线;NT/Win32 兼容为长期远景。
 
@@ -115,7 +115,7 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - 进入 Ring3 使用 TSS.esp0 切换内核栈;`int 0x80`(DPL3 门)按 Linux i386 ABI 分发(eax=号,ebx/ecx/edx 传参);退出/故障时恢复 `user_enter` 保存的内核上下文返回 Shell。
 - 已实现调用(按用途分组):
   - 进程/stdio:`exit(1)`、`exit_group(252)`、`fork(2)`、`vfork(190)`、`clone(120,非线程)`、`waitpid(7)`、`wait4(114)`、`execve(11)`、`pipe(42)`、`pipe2(331)`、`kill(37,不投递)`、`getpid(20)`、`getppid(64)`、`setpgid/getpgrp/setsid/getpgid/getsid`、`read(3)`、`write(4)`、`readv(145)`、`writev(146)`、uid/gid 及其 32 位变体(24/47/49/50、199-202)、`getgroups(80/205)`;`close(6)` 可关闭 0/1/2
-  - 文件/目录:`open(5)`、`close(6)`、`lseek(19)`、`llseek(140)`、`sendfile(187/239)`、`dup(41)`、`dup2(63,含 stdio 重定向)`、`fcntl(55/221)`、`access(33)`、`getcwd(183)`、`chdir(12)`、`unlink(10)`、`rename(38)`
+  - 文件/目录:`open(5)`、`close(6)`、`lseek(19)`、`llseek(140)`、`sendfile(187/239)`、`dup(41)`、`dup2(63,含 stdio 重定向)`、`fcntl(55/221)`、`access(33)`、`getcwd(183)`、`chdir(12)`、`mkdir(39)`、`rmdir(40)`、`unlink(10)`、`rename(38)`
   - 目录/元数据:`getdents(141)`、`getdents64(220)`、`stat/lstat/fstat(106-108)`、`stat64/lstat64/fstat64(195-197)`、`statx(383)`、`statfs/fstatfs(99/100)`、`statfs64/fstatfs64(268/269)`;`utimes(271)`、`futimesat(299)`、`utimensat(320)` 校验路径后返回成功(时间戳暂未持久化)
   - 内存/其他:`brk(45)`、`old_mmap(90)`、`mmap2(192)`、`munmap(91)`、`mprotect(125)`、`uname(122)`、`sysinfo(116)`、`set/get_thread_area(243/244)`、`modify_ldt(123,ENOSYS)`、`rt_sigaction/rt_sigprocmask(174/175,空实现)`、`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)`
   - 未知调用返回 `-ENOSYS` 并在串口记录编号,便于用真实二进制驱动后续补齐。
@@ -167,7 +167,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 注意:
 - BusyBox 静态包约 1MB,OS 模块只接受外部 `-initrd`,不放进 64KB RAM FS。
-- RAM FS 仍无子目录;虚拟 `/dev`、`/proc`、`/etc`、`/bin` 只读。进程模型是**顺序快照**的:只有父进程 `waitpid` 时子进程才在同一个沙箱里运行,没有真正并发/抢占;`clone` 只支持非线程 fork,`kill` 不投递信号,`mkdir/rmdir` 未实现。
+- RAM FS 已支持多级目录(`mkdir/rmdir`、`mkdir -p`、跨目录 `cp/mv`),虚拟 `/dev`、`/proc`、`/etc`、`/bin` 只读。进程模型是**顺序快照**的:只有父进程 `waitpid` 时子进程才在同一个沙箱里运行,没有真正并发/抢占;`clone` 只支持非线程 fork,`kill` 不投递信号。
 - BusyBox shell 已能通过虚拟 `/bin/<applet>` → BusyBox 模块执行外部 applet,并跑通管道:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`。`pipe/pipe2` 是 8 个 4KB 环形缓冲,管道写满会截断返回部分写入。
 - 时间戳来自 CMOS RTC 并保存在 RAM FS 内,重启后随 RAM FS 一起丢失;`date`/`ls -l`/`stat` 显示真实时间,`touch`/`utimensat` 会实际修改 atime/mtime。
 - 首次运行会分配 257 页连续内存做模块副本;256MB 内存下正常。
@@ -186,6 +186,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 - 时间:1970-01-01 / 2000-03-01(闰年)/ 2026-10-29 的 epoch 换算,以及 FS atime/mtime/ctime
 - 进程表:pid/ppid 分配、`proc_find`、`proc_reap` 释放槽位;ELF 预校验接口
 - 管道 ring buffer:create/write/fill/read 与 FIFO 顺序
+- 多级目录:mkdir、子目录文件、子项枚举、非空目录 rmdir 拒绝、空目录删除
 - 内嵌 ELF:存在性、ELF32/i386/ET_EXEC 头校验、入口点位于用户沙箱
 
 ## 踩坑备忘
@@ -227,9 +228,9 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 当前 **v1.2**:在 v1.1(mmap 解析、全 RAM 恒等映射、内核堆、寄存器布局修复)基础上加入 Ring3 用户态、TSS、Linux i386 `int 0x80` 调用、ELF32 加载器与 RAM FS 16×64KB,支持 `run`(内嵌 ELF)/`exec hello.elf`(FS ELF)、文件 fd(open/close/lseek/read/write)、`uname` 与匿名 `mmap`。首个用户 C 程序 `user/hello.c` 可由 `run` 或 `exec hello.elf` 启动。
 
-桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 81 项)。
+桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 88 项)。
 
-**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 顺序快照进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过。下一步:多级目录与 `mkdir/rmdir`、真正的 clone/线程、信号投递、抢占调度。
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 顺序快照进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)**,`ls /tmp`、`cat /tmp/x` 通过。下一步:真正的 clone/线程、信号投递、抢占调度、动态链接与网络/图形。
 
 ## 参考资源
 
