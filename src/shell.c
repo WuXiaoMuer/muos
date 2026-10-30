@@ -53,7 +53,7 @@ static void isrt(char c){
 }
 
 /* ── Tab Completion ──────────────────── */
-static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod","pixel","disk","part","fatls","fatcat","ext2ls","ext2cat",NULL};
+static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod","pixel","disk","part","fatls","fatcat","fatwrite","ext2ls","ext2cat",NULL};
 static void tab(void){
     if(!cmd_pos)return;
     int ws=0;
@@ -133,7 +133,8 @@ static void cmd_help(void){
     vga_print("  mods / execmod <n>          - run a Multiboot -initrd module\n");
     vga_print("  help clear echo mem tasks time ps disk logo\n");
     vga_print("  version gui win7 desktop pixel test reboot halt crash\n");
-    vga_print("  part fatls [p] fatcat <f> ext2ls [p] ext2cat <f>\n");
+    vga_print("  part fatls [p] fatcat <f> fatwrite <f> <text>\n");
+    vga_print("  ext2ls [p] ext2cat <f>\n");
 }
 static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
 static void slog_u32(uint32_t v);
@@ -200,6 +201,20 @@ static void cmd_fatcat(char**a,int n){
     vga_print((const char*)fs_file);
     serial_write((const char*)fs_file);
     serial_write("[fat] cat ok\n");
+}
+
+static void cmd_fatwrite(char**a,int n){
+    if(!fat_present()){ vga_print("No FAT32 volume\n"); serial_write("[fat] absent\n"); return; }
+    if(n<3){ vga_print("usage: fatwrite <file> <text>\n"); return; }
+    char buf[128];
+    int len = 0;
+    for(const char* p=a[2]; *p && len<126; p++) buf[len++]=*p;
+    buf[len++]='\n';
+    int r = fat_write_file(a[1], buf, (uint32_t)len);
+    if(r < 0){ vga_print("FAT: write failed\n"); serial_write("[fat] write fail\n"); return; }
+    vga_print("[fat] wrote "); vga_print_dec((uint32_t)r);
+    vga_print(" bytes to "); vga_print(a[1]); vga_putchar('\n');
+    serial_write("[fat] write ok\n");
 }
 
 static void cmd_ext2ls(char**a,int n){
@@ -432,6 +447,7 @@ static void execute(void){
     else if(streq(cmd,"part"))cmd_part();
     else if(streq(cmd,"fatls"))cmd_fatls(av,ac);
     else if(streq(cmd,"fatcat"))cmd_fatcat(av,ac);
+    else if(streq(cmd,"fatwrite"))cmd_fatwrite(av,ac);
     else if(streq(cmd,"ext2ls"))cmd_ext2ls(av,ac);
     else if(streq(cmd,"ext2cat"))cmd_ext2cat(av,ac);
     else if(streq(cmd,"execmod"))cmd_execmod(av,ac);

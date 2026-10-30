@@ -3,6 +3,7 @@
 #include "rtc.h"
 #include "ata.h"
 #include "part.h"
+#include "serial.h"
 
 static fs_file_t files[FS_MAX_FILES];
 static fs_dir_t  dirs[FS_MAX_DIRS];
@@ -503,6 +504,13 @@ int fs_write_at(int fd, uint32_t offset, const char* data, uint32_t len) {
 #define MUFS_DIR_LBA      6
 #define MUFS_DATA_LBA     16
 #define MUFS_SLOT_SECTORS 128          /* 64KB per file slot */
+/* Metadata write-ahead journal: sector 9 header, 10-12 meta copy,
+ * 13-15 directory copy. A valid header means the commit was interrupted
+ * and the copies must be replayed at mount time. */
+#define MUFS_JL_LBA       9
+#define MUFS_JMETA_LBA    10
+#define MUFS_JDIR_LBA     13
+#define MUFS_J_MAGIC      0x4D554C4Au    /* 'MULJ' */
 
 typedef struct {
     char     magic[4];
@@ -550,13 +558,26 @@ static void persist_meta(void) {
         meta_buf[i].mtime = files[i].mtime;
         meta_buf[i].ctime = files[i].ctime;
     }
-    ata_write_bytes(MUFS_META_LBA * 512, meta_buf, (uint32_t)sizeof(meta_buf));
-
     for (int i = 0; i < FS_MAX_DIRS; i++) {
         memcpy(dmeta_buf[i].name, dirs[i].name, FS_MAX_NAME);
         dmeta_buf[i].used = dirs[i].used;
     }
+
+    /* Journal: data copies first, then the valid header; after the real
+     * metadata is written, clear the header. */
+    uint32_t jh[8];
+    memset(jh, 0, sizeof(jh));
+    jh[0] = MUFS_J_MAGIC;
+    jh[1] = persist_gen;
+    ata_write_bytes(MUFS_JMETA_LBA * 512, meta_buf, (uint32_t)sizeof(meta_buf));
+    ata_write_bytes(MUFS_JDIR_LBA * 512, dmeta_buf, (uint32_t)sizeof(dmeta_buf));
+    ata_write_bytes(MUFS_JL_LBA * 512, jh, sizeof(jh));
+
+    ata_write_bytes(MUFS_META_LBA * 512, meta_buf, (uint32_t)sizeof(meta_buf));
     ata_write_bytes(MUFS_DIR_LBA * 512, dmeta_buf, (uint32_t)sizeof(dmeta_buf));
+
+    jh[0] = 0;
+    ata_write_bytes(MUFS_JL_LBA * 512, jh, sizeof(jh));
 }
 
 /* Write the whole file body of one slot (size rounded to sectors). */
@@ -583,6 +604,27 @@ void fs_persist_mount(void) {
     if (!ata_present()) return;
 
     mufs_sb_t sb;
+
+    /* Replay an interrupted metadata commit before reading the real tables. */
+    {
+        uint32_t jh[8];
+        if (ata_read_bytes(MUFS_JL_LBA * 512, jh, sizeof(jh)) == (int)sizeof(jh) &&
+            jh[0] == MUFS_J_MAGIC) {
+            if (ata_read_bytes(MUFS_JMETA_LBA * 512, meta_buf,
+                               (uint32_t)sizeof(meta_buf)) == (int)sizeof(meta_buf) &&
+                ata_read_bytes(MUFS_JDIR_LBA * 512, dmeta_buf,
+                               (uint32_t)sizeof(dmeta_buf)) == (int)sizeof(dmeta_buf)) {
+                ata_write_bytes(MUFS_META_LBA * 512, meta_buf,
+                                (uint32_t)sizeof(meta_buf));
+                ata_write_bytes(MUFS_DIR_LBA * 512, dmeta_buf,
+                                (uint32_t)sizeof(dmeta_buf));
+                serial_write("[mufs] replayed metadata journal\n");
+            }
+            jh[0] = 0;
+            ata_write_bytes(MUFS_JL_LBA * 512, jh, sizeof(jh));
+        }
+    }
+
     if (ata_read_bytes(MUFS_SB_LBA * 512, &sb, sizeof(sb)) == (int)sizeof(sb) &&
         memcmp(sb.magic, MUFS_MAGIC, 4) == 0 &&
         sb.version == MUFS_VERSION &&

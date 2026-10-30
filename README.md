@@ -9,7 +9,7 @@
 - **进程与信号**:`fork/execve/wait4/waitid`、`clone` 线程(`CLONE_VM/FILES/THREAD/SETTLS`,共享地址空间)、信号 pending/blocked 掩码与 `signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline、默认终止动作、`alarm`;阻塞 `wait4/waitid/poll/read` 在管道/键盘/定时器事件上唤醒
 - **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;多级 RAM FS(`mkdir/rmdir`、子目录路径解析)与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块;`/dev/hda` 提供 ATA PIO 块设备(跨启动持久化)
 - **ATA 磁盘 + MuFS**:primary master PIO / 28-bit LBA,`/dev/hda` 字节级读写(部分扇区读改写);扇区 0 超级块、元数据表、16×64KB 数据槽,所有文件变更写穿、`fsync/sync` 全量刷新、开机自动挂载(无盘时退回纯 RAM FS);`tools/test_ata.py` 两次启动验证文件内容与裸扇区数据都保留
-- **分区与真实文件系统(只读)**:`part.c` 解析 MBR 与 GPT(保护性 MBR → GPT 表项,过滤 Basic Data GUID),`fat.c` 读取 FAT32(8.3 + VFAT 长名、簇链、子目录),`ext2.c` 读取 ext2(超级块/组描述符/12 直接块 + 一级间接);检测到分区表时 MuFS 不再格式化该盘。`tools/test_fs_read.py` 用生成的 MBR/GPT FAT32 与 ext2 镜像验证 `part/fatls/fatcat/ext2ls/ext2cat`
+- **分区与真实文件系统**:`part.c` 解析 MBR 与 GPT(保护性 MBR → GPT 表项,过滤 Basic Data GUID),`fat.c` 读取 FAT32(8.3 + VFAT 长名、簇链、子目录)并可创建/覆盖 8.3 文件(分配/释放簇链、双 FAT 写穿),`ext2.c` 读取 ext2(超级块/组描述符/12 直接块 + 一级间接);检测到分区表时 MuFS 不再格式化该盘;MuFS 元数据提交带写前日志(扇区 9–15,挂载时重放未完成提交)。`tools/test_fs_read.py` 用生成的 MBR/GPT FAT32 与 ext2 镜像验证 `part/fatls/fatcat/fatwrite/ext2ls/ext2cat`,并二次启动验证写入持久化
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
@@ -174,6 +174,7 @@ muos> disk                # ATA 型号、扇区数与 MuFS generation
 muos> part                # 打印 MBR/GPT 分区表(起始 LBA/扇区数/类型)
 muos> fatls /             # 只读 FAT32 目录(8.3 + VFAT 长名/子目录)
 muos> fatcat /HELLO.TXT   # 读取 FAT32 文件
+muos> fatwrite /NEW.TXT OK # 创建/覆盖 FAT32 文件(8.3 名,写穿)
 muos> ext2ls /            # 只读 ext2 目录
 muos> ext2cat /hello.txt  # 读取 ext2 文件(直接块 + 一级间接)
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程

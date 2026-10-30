@@ -23,6 +23,7 @@ typedef struct {
     uint32_t total_sectors;
     uint32_t fat_start;          /* absolute LBA of FAT #0 */
     uint32_t data_start;         /* absolute LBA of cluster 2 */
+    uint32_t cluster_count;
     char     label[12];
 } fat_vol_t;
 
@@ -256,6 +257,227 @@ int fat_read_file(const char* path, void* buf, uint32_t cap) {
     return (int)done;
 }
 
+/* ---------------- write path (8.3 names, write-through) ---------------- */
+
+static bool_t wr(uint64_t byte_off, const void* buf, uint32_t n) {
+    if (byte_off > 0xFFFFFFFFu || n > 0xFFFFFFFFu - (uint32_t)byte_off)
+        return false;
+    return ata_write_bytes((uint32_t)byte_off, buf, n) == (int)n;
+}
+
+static bool_t set_fat(uint32_t cluster, uint32_t value) {
+    uint32_t off = cluster * 4;
+    for (uint32_t f = 0; f < vol.nfats; f++) {
+        uint32_t sec = vol.fat_start + f * vol.fsz + off / SECTOR;
+        uint8_t b[SECTOR];
+        if (!rd((uint64_t)sec * SECTOR, b, SECTOR)) return false;
+        memcpy(b + (off % SECTOR), &value, 4);
+        if (!wr((uint64_t)sec * SECTOR, b, SECTOR)) return false;
+    }
+    return true;
+}
+
+static uint32_t alloc_hint = 2;
+
+static bool_t alloc_cluster(uint32_t* out) {
+    uint32_t last = 2 + vol.cluster_count;
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        uint32_t start = pass ? 2 : alloc_hint;
+        uint32_t stop  = pass ? alloc_hint : last;
+        for (uint32_t c = start; c < stop; c++) {
+            if (fat_next(c) == 0) {
+                if (!set_fat(c, 0x0FFFFFFFu)) return false;
+                alloc_hint = c + 1;
+                if (alloc_hint >= last) alloc_hint = 2;
+                *out = c;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void free_chain(uint32_t first) {
+    uint32_t c = first;
+    for (uint32_t guard = 0; c >= 2 && c < 0x0FFFFFF8u && guard < 4096; guard++) {
+        uint32_t next = fat_next(c);
+        set_fat(c, 0);
+        c = next;
+    }
+}
+
+static void make_short(const char* name, uint8_t out[11]) {
+    for (int i = 0; i < 11; i++) out[i] = ' ';
+    int n = 0, dot = -1;
+    for (const char* p = name; *p && n < 12; p++) {
+        if (*p == '.') { dot = n; continue; }
+        n++;
+    }
+    int base_len = (dot >= 0 && dot <= 8) ? dot : (n > 8 ? 8 : n);
+    if (dot < 0 || dot > 8) base_len = n > 8 ? 8 : n;
+    int bi = 0;
+    for (const char* p = name; *p && bi < base_len; p++) {
+        if (*p == '.') continue;
+        char ch = *p;
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+              ch == '_' || ch == '-' || ch == '~'))
+            ch = '_';
+        out[bi++] = (uint8_t)ch;
+    }
+    if (dot >= 0 && dot < 8) {
+        int ei = 0;
+        const char* p = name + dot + 1;
+        for (; *p && ei < 3; p++) {
+            char ch = *p;
+            if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+            if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                  ch == '_' || ch == '-'))
+                ch = '_';
+            out[8 + ei++] = (uint8_t)ch;
+        }
+    }
+}
+
+/* Find the directory slot for `shortname`; if it does not exist, return the
+ * first free 32-byte slot (extending the directory chain if necessary). */
+static bool_t dir_slot(uint32_t dir_cluster, const uint8_t shortname[11],
+                       bool_t* exists, uint32_t* slot_cluster,
+                       uint32_t* slot_off, uint32_t* entry_cluster,
+                       uint32_t* entry_size) {
+    uint32_t free_c = 0xFFFFFFFFu, free_off = 0;
+    uint32_t last = dir_cluster;
+    *exists = false;
+
+    for (uint32_t c = dir_cluster, guard = 0; c >= 2 && c < 0x0FFFFFF8u;
+         c = fat_next(c)) {
+        if (++guard > 4096) return false;
+        last = c;
+        if (!read_cluster(c, dirbuf)) return false;
+        for (uint32_t off = 0; off + 32 <= vol.spc * SECTOR; off += 32) {
+            const uint8_t* e = dirbuf + off;
+            if (e[0] == 0xE5) {
+                if (free_c == 0xFFFFFFFFu) { free_c = c; free_off = off; }
+                continue;
+            }
+            if (e[0] == 0x00) {
+                if (free_c == 0xFFFFFFFFu) { free_c = c; free_off = off; }
+                goto slot_found;
+            }
+            if ((e[11] & 0x3F) == 0x0F || (e[11] & 0x08)) continue;
+            int same = 1;
+            for (int i = 0; i < 11; i++) if (e[i] != shortname[i]) same = 0;
+            if (same) {
+                *exists = true;
+                *slot_cluster = c;
+                *slot_off = off;
+                if (entry_cluster)
+                    *entry_cluster = ((uint32_t)le16(e + 20) << 16) | le16(e + 26);
+                if (entry_size) *entry_size = le32(e + 28);
+                return true;
+            }
+        }
+    }
+
+slot_found:
+    if (free_c != 0xFFFFFFFFu) {
+        *slot_cluster = free_c;
+        *slot_off = free_off;
+        return true;
+    }
+
+    /* Directory is full: append one zeroed cluster. */
+    uint32_t fresh;
+    if (!alloc_cluster(&fresh)) return false;
+    if (!set_fat(last, fresh)) return false;
+    uint32_t bytes = vol.spc * SECTOR;
+    memset(dirbuf, 0, bytes);
+    if (!wr((uint64_t)(vol.data_start + (fresh - 2) * vol.spc) * SECTOR,
+            dirbuf, bytes)) return false;
+    *slot_cluster = fresh;
+    *slot_off = 0;
+    return true;
+}
+
+int fat_write_file(const char* path, const void* data, uint32_t len) {
+    if (!present || !path) return -1;
+
+    /* Split parent path and file component. */
+    char parent[96];
+    const char* slash = 0;
+    for (const char* p = path; *p; p++) if (*p == '/') slash = p;
+    const char* name = slash ? slash + 1 : path;
+    if (!name[0]) return -1;
+    if (slash) {
+        uint32_t n = (uint32_t)(slash - path);
+        if (n == 0) { parent[0] = '/'; parent[1] = '\0'; }
+        else {
+            if (n > sizeof(parent) - 1) return -1;
+            memcpy(parent, path, n);
+            parent[n] = '\0';
+        }
+    } else {
+        parent[0] = '/';
+        parent[1] = '\0';
+    }
+
+    dirent_t pd;
+    if (!resolve(parent, &pd) || !(pd.attr & 0x10)) return -1;
+
+    uint8_t sn[11];
+    make_short(name, sn);
+
+    bool_t exists;
+    uint32_t slot_c, slot_off, old_c = 0, old_size = 0;
+    if (!dir_slot(pd.cluster, sn, &exists, &slot_c, &slot_off, &old_c, &old_size))
+        return -1;
+
+    uint32_t first = 0, prev = 0, written = 0;
+    uint32_t bytes_per = vol.spc * SECTOR;
+    if (exists && old_c) free_chain(old_c);
+
+    while (written < len) {
+        uint32_t c;
+        if (!alloc_cluster(&c)) { if (first) free_chain(first); return -1; }
+        if (!first) first = c;
+        else if (!set_fat(prev, c)) { if (first) free_chain(first); return -1; }
+        uint32_t chunk = len - written;
+        if (chunk > bytes_per) chunk = bytes_per;
+        uint64_t off = (uint64_t)(vol.data_start + (c - 2) * vol.spc) * SECTOR;
+        if (!wr(off, (const uint8_t*)data + written, chunk)) {
+            if (first) free_chain(first);
+            return -1;
+        }
+        written += chunk;
+        prev = c;
+    }
+    if (!first && len == 0) first = 0;
+
+    /* Rewrite the directory entry in place. */
+    if (!read_cluster(slot_c, dirbuf)) {
+        if (first) free_chain(first);
+        return -1;
+    }
+    uint8_t* e = dirbuf + slot_off;
+    for (int i = 0; i < 11; i++) e[i] = sn[i];
+    e[11] = 0x20;                      /* archive */
+    e[12] = 0;
+    e[13] = 0;
+    e[14] = e[15] = e[16] = e[17] = e[18] = e[19] = 0;
+    e[20] = (uint8_t)(first >> 16);
+    e[21] = (uint8_t)(first >> 24);
+    e[22] = e[23] = e[24] = e[25] = 0;
+    e[26] = (uint8_t)first;
+    e[27] = (uint8_t)(first >> 8);
+    memcpy(e + 28, &len, 4);
+    uint64_t off = (uint64_t)(vol.data_start + (slot_c - 2) * vol.spc) * SECTOR;
+    if (!wr(off, dirbuf, bytes_per)) {
+        if (first) free_chain(first);
+        return -1;
+    }
+    return (int)len;
+}
+
 const char* fat_label(void) { return vol.label; }
 uint32_t fat_part_lba(void) { return (uint32_t)(vol.base / SECTOR); }
 
@@ -289,6 +511,7 @@ static bool_t try_volume(uint64_t base_bytes) {
     vol.total_sectors = total;
     vol.fat_start = (uint32_t)(base_bytes / SECTOR) + rsvd;
     vol.data_start = vol.fat_start + nfat * fsz32;
+    vol.cluster_count = (total - rsvd - nfat * fsz32) / spc;
 
     for (int i = 0; i < 11; i++) vol.label[i] = bs[71 + i];
     vol.label[11] = '\0';

@@ -19,7 +19,7 @@
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE 与静态 TLS 已支持,符号版本化未做,未用真实 glibc/musl `.so` 验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(单段在途重传/RTO 退避/慢开始+拥塞避免,无发送队列,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32/ext2 目前只读(无写入、无 VFS 挂载点),MuFS 仍无日志/空间回收;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 只是桌面原型。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE 与静态 TLS 已支持,符号版本化未做,未用真实 glibc/musl `.so` 验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(单段在途重传/RTO 退避/慢开始+拥塞避免,无发送队列,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32 已支持 8.3 文件写入但未接入 VFS、不支持长名创建;ext2 仍只读;MuFS 有元数据写前日志,但无块分配位图/碎片整理;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 只是桌面原型。
 
 ## 后续计划(建议顺序)
 
@@ -50,7 +50,8 @@
 - [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`tools/test_ata.py` 两次启动验证持久化
 - [x] 持久化文件系统 MuFS:扇区 0 超级块、扇区 2–8 文件/目录元数据表、扇区 16 起 16×64KB 数据槽;每次变更写穿(元数据表 + 涉及扇区),`fsync/sync` 全量刷新,开机 `fs_persist_mount` 挂载或首次格式化;`run fsata` → 重启 `run fsread` 验证
 - [x] 网络:PCI 枚举 + RTL8139(轮询 ISR,32K RX 环)+ ARP/IPv4/ICMP echo/UDP + DHCP 客户端;`run net` 实测 ping 网关与 DNS 查询成功
-- [x] 分区与真实文件系统(只读):MBR 4 项 + GPT(保护性 MBR → LBA1 头/LBA2 表项,Basic Data GUID);FAT32(8.3/VFAT 长名/簇链/子目录)与 ext2(超级块/组描述符/直接块 + 一级间接);有分区表时 MuFS 拒绝格式化;`part/fatls/fatcat/ext2ls/ext2cat` + `tools/test_fs_read.py`(MBR/GPT FAT32 + ext2 镜像)实测通过
+- [x] 分区与真实文件系统:MBR 4 项 + GPT(保护性 MBR → LBA1 头/LBA2 表项,Basic Data GUID);FAT32 读取(8.3/VFAT 长名/簇链/子目录)与**写入**(创建/覆盖 8.3 文件、簇分配与释放、双 FAT 写穿);ext2 只读(超级块/组描述符/直接块 + 一级间接);有分区表时 MuFS 拒绝格式化;`part/fatls/fatcat/fatwrite/ext2ls/ext2cat` + `tools/test_fs_read.py`(MBR/GPT FAT32 + ext2 镜像 + 二次启动写入持久化)实测通过
+- [x] MuFS 元数据写前日志:提交前把 meta/dir 副本写到扇区 10–15 并置扇区 9 头魔数,真实表写完后清除;挂载时发现有效头即重放。槽位引用计数归零后回收(空间回收已随 unlink 生效)
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/listen(363)/accept4(364)/sendto(369)/recvfrom(371)/shutdown(373)/getsockname(367)/getpeername(368)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽
 - [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;单在途段重传 + RTO 指数退避(最多 5 次)、慢开始/拥塞避免窗口;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)
 - [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
