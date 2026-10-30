@@ -125,7 +125,7 @@ static int tokenize(char*b,char**a,int max_args){
 /* ═══════════════════ Commands ═══════════════════ */
 static void cmd_help(void){
     vga_print("  touch ls cat rm write edit  - filesystem\n");
-    vga_print("  run [fault]                 - Ring3 C program (Linux ABI)\n");
+    vga_print("  run [fault|pie|dyn|tls]     - Ring3 C program (Linux ABI)\n");
     vga_print("  exec <file>                 - run an ELF from the RAM FS\n");
     vga_print("  mods / execmod <n>          - run a Multiboot -initrd module\n");
     vga_print("  help clear echo mem tasks time ps disk logo\n");
@@ -159,6 +159,8 @@ static void cmd_run(char**a,int n){
         user_run_pie_embedded("hello-pie", "pie");
     else if(n>1 && streq(a[1],"dyn"))
         user_run_dyn_embedded();
+    else if(n>1 && streq(a[1],"tls"))
+        user_run_tls_embedded();
     else
         user_run_embedded("hello", n>1?a[1]:NULL);
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));

@@ -11,6 +11,7 @@ PHDRS
     interp  PT_INTERP;
     load    PT_LOAD    FILEHDR PHDRS FLAGS(7);
     dynamic PT_DYNAMIC FLAGS(6);
+    tls     PT_TLS;
 }
 
 SECTIONS
@@ -28,6 +29,8 @@ SECTIONS
     .rel.plt  : { *(.rel.plt) }                     :load
     .plt      : { *(.plt) *(.plt.*) }               :load
     .got      : { *(.got) *(.got.plt) }             :load
+    .tdata    : { *(.tdata) *(.tdata.*) }           :load :tls
+    .tbss     : { *(.tbss) *(.tbss.*) }             :load :tls
     .data     : { *(.data) *(.data.*) }             :load
     .bss      : { *(COMMON) *(.bss) *(.bss.*) }     :load
 

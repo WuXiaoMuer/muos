@@ -201,7 +201,8 @@ USER_SIGTRAMP = 0x08847000
 - `dyn.c` + `libmu.c`:`run dyn` 运行 `dyn.elf`,它只声明未定义的 `mu_hello()`;共享库里的实现通过 `DT_NEEDED` 由 `ld-mu.so` 在运行时装载并解析,输出的 `DYN-LIB-OK`/`DYN-OK` 证明跨对象符号绑定与 RELATIVE 重定位都生效。
 - `linker.ld`(ET_EXEC,0x08048000)与 `linker_pie.ld`(ET_DYN,从 `SIZEOF_HEADERS` 开始、`load PT_LOAD FILEHDR PHDRS` + `dynamic PT_DYNAMIC`);build.ps1 用 `-fPIE -pie` 产出 `hello-pie.elf` 并作为第二个 blob 嵌入。
 - **动态链接集**:`linker_so.ld`(共享对象,`FILEHDR PHDRS`,从 `SIZEOF_HEADERS` 起)产出 `libmu.so`(导出 `mu_hello`,数据指针经 `R_386_RELATIVE` 修正)与 `ld-mu.so`(`ld_start.s` 取原始 esp 调 `ld_main`);`linker_dyn.ld` 增加 `interp PT_INTERP` 与独立的 `.rel.dyn/.rel.plt`,配合 `-Wl,--dynamic-linker=/lib/ld-mu.so -L build -lmu` 产出 `dyn.elf`(DT_NEEDED libmu.so)。三者都以 `objcopy -I binary` 嵌入内核。
-- `ldmu.c`(ld-mu.so,无依赖):从栈解析 auxv → 由 `AT_PHDR` + `PROG_BASE` 反推主程序 bias → 解析 `PT_DYNAMIC` → 按 `DT_NEEDED` 从 `/lib/<name>` 用 `open/read` 读入 `fbuf` 并映射到 `0x08400000` 起的空位 → 符号解析(SysV `DT_HASH` 或 `DT_GNU_HASH`:gnu 走 bloom 过滤 + bucket/chain 链)→ 对依赖库和主程序依次应用 `RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY`(COPY 按 `st_size` 从提供者复制数据)→ `jmp AT_ENTRY`(不改动栈)。未知重定位(TLS/IRELATIVE)会打印 `unsupported relocation` 并退出,不再静默跳过。
+- `ldmu.c`(ld-mu.so,无依赖):从栈解析 auxv → 由 `AT_PHDR` + `PROG_BASE` 反推主程序 bias → 解析 `PT_DYNAMIC`/`PT_TLS` → 按 `DT_NEEDED` 从 `/lib/<name>` 用 `open/read` 读入 `fbuf` 并映射到 `0x08400000` 起的空位 → 符号解析(SysV `DT_HASH` 或 `DT_GNU_HASH`:gnu 走 bloom 过滤 + bucket/chain 链)→ `tls_setup()` 布局静态 TLS → 对依赖库和主程序依次应用 `RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY/IRELATIVE`(COPY 按 `st_size` 从提供者复制数据;IRELATIVE 调用 `bias + addend` 处的 resolver 并写回结果)→ `jmp AT_ENTRY`(不改动栈)。未知重定位会打印 `unsupported relocation` 并退出,不再静默跳过。
+- 静态 TLS 细节:`tls_setup` 以 `TLS_TP=0x08780000` 为线程指针,按对象顺序(主程序在前)从 TP 向下扣减对齐后的 `p_memsz`,记录每模块的负偏移与模块 id;把 `bias + p_vaddr` 的 `.tdata` 复制进块、`.tbss` 清零;`*(u32*)TP = TP` 写自指针,再 `set_thread_area(243, {base=TP, limit=0xFFFFF, flags=0x51})` 并 `mov %gs,0x33`。`R_386_TLS_TPOFF/IE/GOTIE/TPOFF32/IE_32` 只把模块偏移加到 GOT 里已就位的符号偏移(与 glibc i386 ld.so 的规则一致),`LE/LE_32` 完整解析;`DTPMOD32` 写模块 id、`DTPOFF32` 加符号块内偏移。`__tls_get_addr` 由 ld-mu 内建:汇编入口 `ldmu_tls_get_addr_entry` 按 i386 约定从 `%eax` 取 (mod,off) 二元组指针,压栈后调 `ldmu_tls_get_addr_c` 返回 `TP + 模块偏移 + off`。
 - 用户态异常在 `isr_handler` 开头分流:`(regs->cs & 3) == 3 && user_is_active()` → `user_handle_fault` 打印 EIP/CS/CR2 后回 Shell,内核 panic 路径不受影响。
 
 ### 7.6 i386 TLS 与真实 libc 启动
@@ -210,6 +211,7 @@ USER_SIGTRAMP = 0x08847000
 - 描述符:access 0xF2(可写数据)/0xF0(只读),gran 0x40(字节)或 0xC0(4KB);limit 取 20 位。
 - `get_thread_area(244)` 回读;`exit_group(252)` 走 exit;`set_tid_address(258)` 返回 1;`getuid32/...` 返回 0;`ioctl` 返回 `-ENOTTY`;`dup/dup2` 复制 fd 表条目并可重定向 stdio。
 - **验收**:Alpine static i386 BusyBox 1.36.1(musl)作为 `-initrd` 模块进入 Ring3;`echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a` 及 20+ applet(含 `wc/grep/sed/od/stat/cp/rm/mv/touch`)实测通过,不存在的路径返回 ENOENT。
+- **动态链接器的 TLS**:`tls.elf` 的主程序 `main_tls` 采用 local-exec,由静态链接器把偏移直接编码成 `addl $5,-4(%tp)`;`libtls.so` 中 `tls_add` 的 `ie_counter` 用 initial-exec(GOT 里是待修正的块内偏移,经 `R_386_TLS_TPOFF` 加上模块偏移),`tls_add_gd` 的 `gd_counter` 用 global-dynamic(`R_386_TLS_DTPMOD32/DTPOFF32` 填 GOT 二元组,调用 `__tls_get_addr`)。三者都落在 `tls_setup` 分配的静态块里,`run tls` 输出 `TLS-OK` 说明主程序/库/两种模型一致。
 
 ### 7.7 进程、线程与信号(proc.c)
 
@@ -292,6 +294,9 @@ USER_SIGTRAMP = 0x08847000
 | `_binary_ld_mu_so_start/end` | 链接器 | 内嵌动态链接器 ld-mu.so 起止 |
 | `_binary_libmu_so_start/end` | 链接器 | 内嵌共享库 libmu.so 起止 |
 | `_binary_dyn_elf_start/end` | 链接器 | 内嵌动态链接测试程序 dyn.elf 起止 |
+| `_binary_libtls_so_start/end` | 链接器 | 内嵌 TLS 共享库 libtls.so 起止 |
+| `_binary_tls_elf_start/end` | 链接器 | 内嵌 TLS 测试程序 tls.elf 起止 |
+| `tls_tp / tls_mod_off[] / tls_mod_id[]` | user/ldmu.c | 静态 TLS 线程指针、各模块 TP 偏移与模块 id |
 | `KERNEL_VBASE / KERNEL_BASE / KERNEL_PHYS_BASE` | mm.h | higher-half 虚拟基址、链接地址、物理装载地址 |
 | `entry_phys / _kernel_end` | linker.ld | ELF 入口物理地址、内核虚拟结束地址 |
 | `persist_active / persist_gen` | fs.c | MuFS 挂载状态与 generation |
@@ -306,7 +311,7 @@ USER_SIGTRAMP = 0x08847000
 
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
-3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash 与 `R_386_COPY` 已支持;TLS 重定位、`R_386_IRELATIVE`、符号版本化未实现,遇到未知重定位会明确报错,因此仍不能加载真实 libc 的共享库;`MAP_SHARED` 不写回
+3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE` 与静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)已支持;符号版本化(`.gnu.version`)未实现,也未用真实 glibc/musl 的 `.so` 验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回
 4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + 最小 TCP(无重传/超时/拥塞控制,用户态 listen/accept 未做并发验证);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层

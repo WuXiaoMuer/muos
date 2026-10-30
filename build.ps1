@@ -386,6 +386,48 @@ if (-not (Test-OutputFresh "$BuildDir\dyn.elf" @(
 }
 $step++
 
+# TLS set: libtls.so (initial-exec + global-dynamic TLS) and tls.elf.
+Write-Host ">>> [$step] Building libtls.so (TLS shared library) ..." -ForegroundColor Cyan
+if (-not (Test-ObjectFresh "$BuildDir\tlslib_pic.o" "$UserDir\tlslib.c" $userStamp)) {
+    & $GCC @SoCFlags -c "$UserDir\tlslib.c" -o "$BuildDir\tlslib_pic.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC tlslib.c failed" }
+}
+if (-not (Test-OutputFresh "$BuildDir\libtls.so" @("$BuildDir\tlslib_pic.o",
+        "$UserDir\linker_so.ld"))) {
+    & $LD -m elf_i386 -shared -T "$UserDir\linker_so.ld" `
+          "$BuildDir\tlslib_pic.o" -o "$BuildDir\libtls.so" `
+          --hash-style=gnu --build-id=none --no-warn-rwx-segments
+    if ($LASTEXITCODE -ne 0) { throw "Link libtls.so failed" }
+    Write-Host "      OK -> build\libtls.so" -ForegroundColor Green
+} else {
+    Write-Host "      libtls.so up to date" -ForegroundColor DarkGray
+}
+$step++
+
+Write-Host ">>> [$step] Building tls.elf (main TLS + DT_NEEDED libtls.so) ..." -ForegroundColor Cyan
+if (-not (Test-ObjectFresh "$BuildDir\pie_tls.o" "$UserDir\tls.c" $userStamp)) {
+    & $GCC @PieCFlags -c "$UserDir\tls.c" -o "$BuildDir\pie_tls.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC tls.c failed" }
+}
+if (-not (Test-OutputFresh "$BuildDir\tls.elf" @(
+        "$BuildDir\pie_start.o", "$BuildDir\pie_runtime.o",
+        "$BuildDir\pie_tls.o", "$BuildDir\pie_syscall6.o",
+        "$BuildDir\libtls.so", "$UserDir\linker_dyn.ld"))) {
+    & $GCC -m32 -nostdlib -pie -T "$UserDir\linker_dyn.ld" `
+           "$BuildDir\pie_start.o" "$BuildDir\pie_runtime.o" "$BuildDir\pie_tls.o" `
+           "$BuildDir\pie_syscall6.o" `
+           -L"$BuildDir" -ltls `
+           -o "$BuildDir\tls.elf" `
+           "-Wl,--dynamic-linker=/lib/ld-mu.so" "-Wl,--hash-style=sysv" `
+           "-Wl,--allow-shlib-undefined" `
+           "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
+    if ($LASTEXITCODE -ne 0) { throw "Link tls.elf failed" }
+    Write-Host "      OK -> build\tls.elf" -ForegroundColor Green
+} else {
+    Write-Host "      tls.elf up to date" -ForegroundColor DarkGray
+}
+$step++
+
 Write-Host ">>> [$step] Embedding dynamic-linking blobs ..." -ForegroundColor Cyan
 Push-Location $BuildDir
 if (-not (Test-OutputFresh "ld_mu_so.o" @("ld-mu.so"))) {
@@ -400,6 +442,14 @@ if (-not (Test-OutputFresh "dyn_elf.o" @("dyn.elf"))) {
     & $OBJCOPY -I binary -O elf32-i386 -B i386 "dyn.elf" "dyn_elf.o"
     if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy dyn.elf failed" }
 }
+if (-not (Test-OutputFresh "libtls_so.o" @("libtls.so"))) {
+    & $OBJCOPY -I binary -O elf32-i386 -B i386 "libtls.so" "libtls_so.o"
+    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy libtls.so failed" }
+}
+if (-not (Test-OutputFresh "tls_elf.o" @("tls.elf"))) {
+    & $OBJCOPY -I binary -O elf32-i386 -B i386 "tls.elf" "tls_elf.o"
+    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy tls.elf failed" }
+}
 Pop-Location
 Write-Host "      OK -> dynamic blobs ready" -ForegroundColor Green
 $step++
@@ -409,7 +459,8 @@ Write-Host ">>> [$step] Linking kernel.elf ..." -ForegroundColor Cyan
 $AllObj = @("$BuildDir\boot.o", "$BuildDir\isr_stubs.o",
             "$BuildDir\hello_elf.o", "$BuildDir\hello_pie_elf.o",
             "$BuildDir\ld_mu_so.o", "$BuildDir\libmu_so.o",
-            "$BuildDir\dyn_elf.o") + $ObjFiles
+            "$BuildDir\dyn_elf.o", "$BuildDir\libtls_so.o",
+            "$BuildDir\tls_elf.o") + $ObjFiles
 $LdArgs = @("-nostdlib", "-T", "$PSScriptRoot\linker.ld",
             "-Wl,--no-warn-rwx-segments") + $AllObj + @("-o", "$BuildDir\kernel.elf")
 if (Test-OutputFresh "$BuildDir\kernel.elf" ($AllObj + @("$PSScriptRoot\linker.ld"))) {

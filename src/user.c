@@ -28,6 +28,11 @@ extern const uint8_t _binary_libmu_so_start[];
 extern const uint8_t _binary_libmu_so_end[];
 extern const uint8_t _binary_dyn_elf_start[];
 extern const uint8_t _binary_dyn_elf_end[];
+/* TLS set: libtls.so + tls.elf (initial-exec / global-dynamic TLS). */
+extern const uint8_t _binary_libtls_so_start[];
+extern const uint8_t _binary_libtls_so_end[];
+extern const uint8_t _binary_tls_elf_start[];
+extern const uint8_t _binary_tls_elf_end[];
 
 /* Saved kernel ESP at user_enter (callee-saved regs + return address live
  * above it). Written by isr_stubs.s, read by user_return_to_kernel. */
@@ -630,6 +635,8 @@ void user_install_dyn_runtime(void) {
                     (uint32_t)(_binary_ld_mu_so_end - _binary_ld_mu_so_start));
     fs_install_blob("lib/libmu.so", _binary_libmu_so_start,
                     (uint32_t)(_binary_libmu_so_end - _binary_libmu_so_start));
+    fs_install_blob("lib/libtls.so", _binary_libtls_so_start,
+                    (uint32_t)(_binary_libtls_so_end - _binary_libtls_so_start));
     fs_sync();
 }
 
@@ -637,6 +644,12 @@ int user_run_dyn_embedded(void) {
     user_install_dyn_runtime();
     uint32_t size = (uint32_t)(_binary_dyn_elf_end - _binary_dyn_elf_start);
     return user_run_image(_binary_dyn_elf_start, size, "dyn", NULL);
+}
+
+int user_run_tls_embedded(void) {
+    user_install_dyn_runtime();
+    uint32_t size = (uint32_t)(_binary_tls_elf_end - _binary_tls_elf_start);
+    return user_run_image(_binary_tls_elf_start, size, "tls", NULL);
 }
 
 int user_run_image(const void* img, uint32_t img_size,

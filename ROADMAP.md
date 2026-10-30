@@ -15,11 +15,11 @@
 - 内核自检 **88/0**;`tools/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
 - `src/syscall.c` 已定义 **120+ 个 Linux i386 系统调用号**,覆盖进程/stdio、信号、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。
 - 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
-- 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run net`(RTL8139 + ICMP/UDP socket ABI)、`run tcp`(TCP 握手与回显)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。ISO 路径额外用 QMP `screendump` 验证 VBE 文本渲染。
+- 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run tls`(静态 TLS:initial-exec + global-dynamic)、`run net`(RTL8139 + ICMP/UDP socket ABI)、`run tcp`(TCP 握手与回显)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。ISO 路径额外用 QMP `screendump` 验证 VBE 文本渲染。
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash 与 COPY 已支持,TLS/IRELATIVE/版本化未做);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + 最小 TCP(无重传/拥塞控制);帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 只是桌面原型。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE 与静态 TLS 已支持,符号版本化未做,未用真实 glibc/musl `.so` 验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + 最小 TCP(无重传/拥塞控制);帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 只是桌面原型。
 
 ## 后续计划(建议顺序)
 
@@ -42,8 +42,9 @@
 - [x] `ET_DYN`/静态 PIE 加载:load bias、`PT_DYNAMIC`、`R_386_RELATIVE/GLOB_DAT/JMP_SLOT/32` 重定位
 - [x] 完整 auxv(`AT_PHDR/PHENT/PHNUM/PAGESZ/BASE/ENTRY`);`run pie` 实测 `PIE-RELOC-OK`
 - [x] `PT_INTERP` 解释器路径解析(MuFS `/lib/...` 优先,回退内嵌 blob),解释器映射到 `0x08200000`,`AT_BASE` 指向其 load bias
-- [x] 共享库(`ET_DYN .so`)映射 + 动态链接器 `ld-mu.so`(`DT_NEEDED` 递归装载、SysV hash **与 .gnu.hash** 符号解析、`R_386_RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY`);`run dyn` 实测 `DYN-OK`(libmu.so 用 GNU hash 构建)
-- [ ] 与真实 libc 生态的兼容(TLS 重定位、`R_386_IRELATIVE`、符号版本化)仍未做;遇到未知重定位类型会明确报错而不是继续执行
+- [x] 共享库(`ET_DYN .so`)映射 + 动态链接器 `ld-mu.so`(`DT_NEEDED` 递归装载、SysV hash **与 .gnu.hash** 符号解析、`R_386_RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY/IRELATIVE`);`run dyn` 实测 `DYN-OK`(libmu.so 用 GNU hash 构建)
+- [x] 静态 TLS:`PT_TLS` 解析 + 变体 II 布局(TP `0x08780000`,主程序块贴 TP、库向下)、`.tdata/.tbss` 复制清零、`gs:0` 自指针、`set_thread_area(243)` + 选择子 `0x33`;支持 `R_386_TLS_TPOFF/IE/GOTIE/LE/IE_32/LE_32/TPOFF32/DTPMOD32/DTPOFF32` 与 `%eax` 传参的 `__tls_get_addr`;`run tls` 实测 `TLS-OK`
+- [ ] 符号版本化(`.gnu.version/.gnu.version_r`)未实现;尚未用真实 glibc/musl `.so` 验证,遇到未知重定位类型会明确报错而不是继续执行
 
 ### P4 平台外设
 - [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`tools/test_ata.py` 两次启动验证持久化
@@ -155,7 +156,7 @@
 - [ ] 内核堆 Grow(耗尽时向 vmm 要新页)
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
 - [x] 网卡(RTL8139)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] TCP 重传/并发服务端、其他网卡;MuFS 仍是整槽布局,无块分配位图/碎片整理
-- [ ] 动态链接器兼容真实 libc 产物(`.gnu.hash`/TLS/`R_386_COPY`/版本化符号);当前 `ld-mu.so` 只覆盖自研 `.so`
+- [ ] 动态链接器兼容真实 libc 产物(版本化符号;`.gnu.hash`/TLS/`R_386_COPY`/`IRELATIVE` 已支持);当前 `ld-mu.so` 只在自研 `.so` 上验证
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)
 - [ ] panic 打印带 addr2line 说明(已加 -g)

@@ -38,6 +38,9 @@ const void* user_get_pie_image(uint32_t* size);
  * the embedded dynamically linked test program (`run dyn`). */
 void    user_install_dyn_runtime(void);
 int     user_run_dyn_embedded(void);
+/* Static TLS test: loads libtls.so and runs tls.elf (initial-exec +
+ * global-dynamic TLS models, see user/tlslib.c). */
+int     user_run_tls_embedded(void);
 
 /* Per-process fd table (fd 0/1/2 are stdin/stdout/stderr). An entry is a
  * RAM FS file, a directory (offset = next entry index), a virtual /dev
