@@ -161,10 +161,38 @@ if ($blobRc -ne 0) { throw "objcopy hello.elf failed" }
 Write-Host "      OK -> build\hello_elf.o" -ForegroundColor Green
 $step++
 
+# ======================== Position-independent (ET_DYN) user image =======
+# Same sources built with -fPIE and linked at 0. The kernel loader applies
+# the bias + .rel.dyn relocations (see src/elf.c, `run pie`).
+Write-Host ">>> [$step] Building hello-pie.elf (ET_DYN) ..." -ForegroundColor Cyan
+$PieCFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
+               "-fno-stack-protector", "-fPIE",
+               "-fno-tree-loop-distribute-patterns", "-nostdinc", "-nostdlib")
+& $GCC @PieCFlags -c "$UserDir\runtime.c" -o "$BuildDir\pie_runtime.o"
+if ($LASTEXITCODE -ne 0) { throw "GCC pie runtime.c failed" }
+& $GCC @PieCFlags -c "$UserDir\hello.c" -o "$BuildDir\pie_hello.o"
+if ($LASTEXITCODE -ne 0) { throw "GCC pie hello.c failed" }
+& $NASM -f elf32 "$UserDir\start.s" -o "$BuildDir\pie_start.o"
+if ($LASTEXITCODE -ne 0) { throw "NASM pie start.s failed" }
+& $NASM -f elf32 "$UserDir\syscall6.s" -o "$BuildDir\pie_syscall6.o"
+if ($LASTEXITCODE -ne 0) { throw "NASM pie syscall6.s failed" }
+& $GCC -m32 -nostdlib -pie -T "$UserDir\linker_pie.ld" `
+       "$BuildDir\pie_start.o" "$BuildDir\pie_runtime.o" "$BuildDir\pie_hello.o" `
+       "$BuildDir\pie_syscall6.o" `
+       -o "$BuildDir\hello-pie.elf" "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
+if ($LASTEXITCODE -ne 0) { throw "Link hello-pie.elf failed" }
+Push-Location $BuildDir
+& $OBJCOPY -I binary -O elf32-i386 -B i386 "hello-pie.elf" "hello_pie_elf.o"
+$pieRc = $LASTEXITCODE
+Pop-Location
+if ($pieRc -ne 0) { throw "objcopy hello-pie.elf failed" }
+Write-Host "      OK -> build\hello-pie.elf, build\hello_pie_elf.o" -ForegroundColor Green
+$step++
+
 # Link (via GCC driver so standard flags are handled consistently)
 Write-Host ">>> [$step] Linking kernel.elf ..." -ForegroundColor Cyan
 $AllObj = @("$BuildDir\boot.o", "$BuildDir\isr_stubs.o",
-            "$BuildDir\hello_elf.o") + $ObjFiles
+            "$BuildDir\hello_elf.o", "$BuildDir\hello_pie_elf.o") + $ObjFiles
 $LdArgs = @("-nostdlib", "-T", "$PSScriptRoot\linker.ld",
             "-Wl,--no-warn-rwx-segments") + $AllObj + @("-o", "$BuildDir\kernel.elf")
 & $GCC @LdArgs

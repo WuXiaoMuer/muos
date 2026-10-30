@@ -133,8 +133,12 @@ static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
 static void cmd_run(char**a,int n){
     /* Runs the embedded ELF at Ring3; returns when the process exits or
      * faults. `run fault` asks hello.c to touch an unmapped address, which
-     * demonstrates that a Ring3 fault kills only the process. */
-    user_run_embedded("hello", n>1?a[1]:NULL);
+     * demonstrates that a Ring3 fault kills only the process. `run pie`
+     * uses the ET_DYN (PIE) build so the loader applies relocations. */
+    if(n>1 && streq(a[1],"pie"))
+        user_run_pie_embedded("hello-pie", "pie");
+    else
+        user_run_embedded("hello", n>1?a[1]:NULL);
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
 }
 static void slog_u32(uint32_t v){ char b[12]; u32_to_dec(b,v); serial_write(b); }

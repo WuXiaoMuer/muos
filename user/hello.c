@@ -16,7 +16,8 @@ static int arg_is(const char* s, const char* t) {
     return *s == '\0' && *t == '\0';
 }
 
-/* ---- signal test state ---- */
+/* ---- PIE test state: an absolute pointer needs R_386_RELATIVE ---- */
+static const char* volatile pie_ptr = "PIE-RELOC-OK";
 static volatile int sig_count = 0;
 static volatile int sig_seen = 0;
 static void usr1_handler(int sig) {
@@ -66,6 +67,15 @@ int main(int argc, char** argv) {
             muos_puts("pipe-test: read="); muos_puts(rb); muos_puts("\n");
             muos_close(fds[0]); muos_close(fds[1]);
         }
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "pie")) {
+        /* Runs from the ET_DYN image: the kernel loaded the lowest
+         * segment at USER_BASE and applied its RELATIVE relocations. */
+        muos_puts((const char*)pie_ptr);    /* relocated pointer */
+        muos_puts("\n");
+        muos_puts(sig_count == 0 ? "PIE-OK\n" : "PIE-BAD\n");
         return 0;
     }
 

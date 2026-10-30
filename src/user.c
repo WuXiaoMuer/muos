@@ -16,6 +16,10 @@
 extern const uint8_t _binary_hello_elf_start[];
 extern const uint8_t _binary_hello_elf_end[];
 
+/* Same program built -fPIE and linked as ET_DYN at address 0. */
+extern const uint8_t _binary_hello_pie_elf_start[];
+extern const uint8_t _binary_hello_pie_elf_end[];
+
 /* Saved kernel ESP at user_enter (callee-saved regs + return address live
  * above it). Written by isr_stubs.s, read by user_return_to_kernel. */
 uint32_t user_kernel_esp_save = 0;
@@ -367,6 +371,13 @@ const void* user_get_image(uint32_t* size) {
     return _binary_hello_elf_start;
 }
 
+const void* user_get_pie_image(uint32_t* size) {
+    uint32_t n = (uint32_t)(_binary_hello_pie_elf_end -
+                            _binary_hello_pie_elf_start);
+    if (size) *size = n;
+    return _binary_hello_pie_elf_start;
+}
+
 bool_t user_is_active(void) {
     return active;
 }
@@ -460,7 +471,8 @@ static uint32_t push_string(uint32_t sp, const char* s) {
  *   argc, argv[], NULL, envp NULL, auxv AT_NULL, strings...
  * Real libcs (musl/glibc) walk envp and auxv; missing terminators make
  * them interpret the first string bytes as pointers. */
-static uint32_t build_user_stack(int argc, const char* const* argv) {
+static uint32_t build_user_stack(int argc, const char* const* argv,
+                                 const elf32_load_info_t* li) {
     uint32_t sp = USER_SIGTRAMP - 32;   /* top page is the sigreturn tramp */
     uint32_t addrs[16];
 
@@ -471,8 +483,21 @@ static uint32_t build_user_stack(int argc, const char* const* argv) {
         addrs[i] = sp;
     }
 
-    sp -= 4; *(uint32_t*)sp = 0;    /* auxv[1] (value) = 0 */
-    sp -= 4; *(uint32_t*)sp = 0;    /* auxv[0] (AT_NULL) = 0 */
+    /* Auxiliary vector in final order; pushed in reverse below. A real
+     * ld.so needs AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/AT_BASE. */
+    uint32_t aux[7][2] = {
+        {  3, li ? li->phdr  : 0 },     /* AT_PHDR */
+        {  4, li ? li->phent : 32 },    /* AT_PHENT */
+        {  5, li ? li->phnum : 0 },     /* AT_PHNUM */
+        {  6, 4096 },                   /* AT_PAGESZ */
+        {  7, 0 },                      /* AT_BASE (no interpreter) */
+        {  9, li ? li->entry : 0 },     /* AT_ENTRY */
+        {  0, 0 },                      /* AT_NULL */
+    };
+    for (int i = 6; i >= 0; i--) {
+        sp -= 4; *(uint32_t*)sp = aux[i][1];
+        sp -= 4; *(uint32_t*)sp = aux[i][0];
+    }
     sp -= 4; *(uint32_t*)sp = 0;    /* envp[0] = NULL */
     sp -= 4; *(uint32_t*)sp = 0;    /* argv[argc] = NULL */
     for (int i = argc - 1; i >= 0; i--) {
@@ -491,16 +516,18 @@ int user_exec_image(const void* img, uint32_t img_size, int argc,
     /* The top page is the read-only sigreturn trampoline. */
     memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);
 
-    uint32_t entry = 0, image_end = 0;
-    int rc = elf32_load(img, img_size, USER_BASE,
-                        USER_END - USER_STACK_RESERVE, &entry, &image_end);
+    elf32_load_info_t li;
+    int rc = elf32_load_ex(img, img_size, USER_BASE,
+                           USER_END - USER_STACK_RESERVE, &li);
     if (rc != 0) return rc;
+    if (li.has_interp) return -4;      /* no dynamic loader in this image set */
 
+    uint32_t entry = li.entry, image_end = li.image_end;
     brk_base = align_up_page(image_end);
     if (brk_base < USER_BASE + PAGE_SIZE) brk_base = USER_BASE + PAGE_SIZE;
     brk_current = brk_base;
 
-    uint32_t sp = build_user_stack(argc, argv);
+    uint32_t sp = build_user_stack(argc, argv, &li);
     if (sp <= brk_current + PAGE_SIZE) return -2;
 
     exit_code = 0;
@@ -514,6 +541,12 @@ int user_exec_image(const void* img, uint32_t img_size, int argc,
 int user_run_embedded(const char* arg0, const char* arg1) {
     uint32_t img_size = 0;
     const void* img = user_get_image(&img_size);
+    return user_run_image(img, img_size, arg0, arg1);
+}
+
+int user_run_pie_embedded(const char* arg0, const char* arg1) {
+    uint32_t img_size = 0;
+    const void* img = user_get_pie_image(&img_size);
     return user_run_image(img, img_size, arg0, arg1);
 }
 
@@ -564,9 +597,9 @@ int user_run_image_argv(const void* img, uint32_t img_size,
     /* Fresh process image every run (top page: read-only trampoline). */
     memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);
 
-    uint32_t entry = 0, image_end = 0;
-    int rc = elf32_load(img, img_size, USER_BASE,
-                        USER_END - USER_STACK_RESERVE, &entry, &image_end);
+    elf32_load_info_t li;
+    int rc = elf32_load_ex(img, img_size, USER_BASE,
+                           USER_END - USER_STACK_RESERVE, &li);
     if (rc != 0) {
         vga_setcolor(vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
         vga_print("[user] ELF rejected (err ");
@@ -578,12 +611,26 @@ int user_run_image_argv(const void* img, uint32_t img_size,
         proc_reap(self);
         return -1;
     }
+    if (li.has_interp) {
+        vga_setcolor(vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
+        vga_print("[user] PT_INTERP needs a dynamic loader: ");
+        vga_print(li.interp);
+        vga_putchar('\n');
+        vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+        serial_write("[user] PT_INTERP rejected: ");
+        serial_write(li.interp);
+        serial_write("\n");
+        mm_switch_pd(prev_pd);
+        proc_reap(self);
+        return -1;
+    }
 
+    uint32_t entry = li.entry, image_end = li.image_end;
     brk_base = align_up_page(image_end);
     if (brk_base < USER_BASE + PAGE_SIZE) brk_base = USER_BASE + PAGE_SIZE;
     brk_current = brk_base;
 
-    uint32_t user_sp = build_user_stack(argc, argv);
+    uint32_t user_sp = build_user_stack(argc, argv, &li);
     if (user_sp <= brk_current + PAGE_SIZE) {
         vga_print("[user] image leaves no room for the stack\n");
         mm_switch_pd(prev_pd);

@@ -27,6 +27,9 @@ int     user_run_image(const void* image, uint32_t size,
 int     user_run_image_argv(const void* image, uint32_t size,
                             int argc, const char* const* argv);
 int     user_run_embedded(const char* arg0, const char* arg1);
+/* ET_DYN (PIE) image: loaded with a bias + RELATIVE relocations applied. */
+int     user_run_pie_embedded(const char* arg0, const char* arg1);
+const void* user_get_pie_image(uint32_t* size);
 
 /* Per-process fd table (fd 0/1/2 are stdin/stdout/stderr). An entry is a
  * RAM FS file, a directory (offset = next entry index), a virtual /dev
