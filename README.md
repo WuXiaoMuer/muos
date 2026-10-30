@@ -8,7 +8,7 @@
 - **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,在 0x08048000 起的 8MB 用户窗口内运行 C 程序;每个进程有独立 8MB 物理块与页目录(CR3 切换),100Hz 抢占轮转;ELF 可来自内核内嵌(`run`)、RAM FS(`exec hello.elf`)或 Multiboot 模块;支持 ET_EXEC 与 ET_DYN(PIE,`run pie`);用户态故障只杀进程,不 panic 内核
 - **进程与信号**:`fork/execve/wait4/waitid`、`clone` 线程(`CLONE_VM/FILES/THREAD/SETTLS`,共享地址空间)、信号 pending/blocked 掩码与 `signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline、默认终止动作、`alarm`;阻塞 `wait4/waitid/poll/read` 在管道/键盘/定时器事件上唤醒
 - **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;多级 RAM FS(`mkdir/rmdir`、子目录路径解析)与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块;`/dev/hda` 提供 ATA PIO 块设备(跨启动持久化)
-- **ATA 磁盘 + MuFS**:primary master PIO / 28-bit LBA,`/dev/hda` 字节级读写(部分扇区读改写);扇区 0 超级块、元数据表、16×64KB 数据槽,所有文件变更写穿、`fsync/sync` 全量刷新、开机自动挂载(无盘时退回纯 RAM FS);`build/test_ata.py` 两次启动验证文件内容与裸扇区数据都保留
+- **ATA 磁盘 + MuFS**:primary master PIO / 28-bit LBA,`/dev/hda` 字节级读写(部分扇区读改写);扇区 0 超级块、元数据表、16×64KB 数据槽,所有文件变更写穿、`fsync/sync` 全量刷新、开机自动挂载(无盘时退回纯 RAM FS);`tools/test_ata.py` 两次启动验证文件内容与裸扇区数据都保留
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
@@ -50,16 +50,19 @@ muos/
 │                    hello 演示文件 syscall、uname、mmap、brk、信号、线程、阻塞 poll、PIE、ATA
 ├── include/         头文件(与 src 配对,muos_ 前缀 include guard)
 ├── build.ps1        一键构建 / 运行 / ISO / 清理(含用户程序构建与 ELF 嵌入)
-├── make_iso.py      Python + pycdlib 自制可启动 ISO
+├── tools/           构建/测试工具(make_iso.py、qmp_shell.py、test_busybox.py、
+│                    test_ata.py、verify_release.py、screendump.py)
+├── make_iso.py      Python + pycdlib 自制可启动 ISO(位于 tools\make_iso.py)
 ├── setup-tools.ps1  自动下载 NASM / QEMU 到 tools\
 ├── linker.ld        链接脚本(内核加载到 1MB)
-├── run.bat          双击:构建 + QEMU 快速启动
-├── run_iso.bat      双击:构建 + ISO 启动
+├── run.ps1          构建并启动 QEMU(默认 ISO/VBE,支持 -Kernel/-Disk/-NoBuild)
+├── run.bat          双击:构建 + QEMU 快速启动(文本模式)
+├── run_iso.bat      双击:构建 + ISO 启动(VBE)
 ├── clean.bat        清理构建产物
 └── CODE_LOGIC.md    代码逻辑详解(启动/中断/内存/用户态/Shell)
 ```
 
-工具目录(均被 gitignore,不影响仓库体积):`toolchain\` 交叉编译器、`tools\` NASM/QEMU。
+`tools\` 下的构建/测试脚本随仓库入库;`toolchain\` 与下载的 NASM/QEMU 二进制不入库。
 
 ## 快速开始
 
@@ -67,20 +70,44 @@ muos/
 # 环境初始化(自动下载 NASM + QEMU 到 tools\)
 .\setup-tools.ps1
 
-# 构建 build\kernel.elf
+# 构建 build\kernel.elf(增量 + 并行,默认按 CPU 核数编译)
 .\build.ps1
 
-# 构建 + QEMU 运行(最快路径);进入 Shell 后输入 run 运行内嵌 Ring3 C 程序
+# 限制并行编译进程数
+.\build.ps1 -Jobs 4
+
+# 构建 + QEMU 运行(最快路径,VGA 文本模式);进入 Shell 后输入 run 运行内嵌 Ring3 C 程序
 .\build.ps1 -Run
 
-# 构建 + 生成 muos.iso + 光盘启动(需要 python + pycdlib:pip install pycdlib)
+# 构建 + 生成 muos.iso + 光盘启动(VBE 帧缓冲 + 网卡,pixel 桌面需要这条路径)
 .\build.ps1 -Iso -Run
 
-# 清理
+# 日常启动脚本(默认 ISO:VBE + RTL8139,pixel 可用;会先做增量构建)
+.\run.ps1
+.\run.ps1 -Kernel        # 等价于 build.ps1 -Run(无 VBE)
+.\run.ps1 -Disk          # 额外挂一个 build\ata_disk.img(ATA/MuFS 测试)
+.\run.ps1 -NoBuild       # 不构建,直接启动已有产物
+
+# 清理(只删构建产物,工具脚本在 tools\ 下不受影响)
 .\build.ps1 -Clean
 ```
 
-工具查找顺序:PATH → 仓库内 `toolchain\` / `tools\` → 常见安装位置(含 `X:\qemu`)。也可双击 `run.bat` / `run_iso.bat`。
+工具查找顺序:PATH → 仓库内 `toolchain\` / `tools\` → 常见安装位置(含 `X:\qemu`)。`run.bat` 走 `-Run`(文本模式),`run_iso.bat` 走 `-Iso -Run`(VBE,`pixel` 必须用后者或 `.\run.ps1`)。
+
+### 自动测试
+
+```powershell
+# 通过 QMP 驱动内核 Shell(支持 run/exec 命令,自动等待 exit/fault 标记)
+python tools\test_busybox.py "run net" "run tcp" "run dyn"
+# 两次启动验证 ATA 与 MuFS 持久化
+python tools\test_ata.py
+# kernel + ISO 两条路径的发布冒烟
+python tools\verify_release.py
+# 启动 ISO、打开 pixel 桌面并抓屏(输出 build\pixel.ppm)
+python tools\screendump.py
+```
+
+`test_busybox.py` 若发现 `build\busybox`(静态 i386 BusyBox ELF)会把它作为 `-initrd` 加载,否则只跑内核 Shell 中的内嵌测试程序。
 
 ### 交叉编译器
 

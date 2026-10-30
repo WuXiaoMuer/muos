@@ -125,7 +125,7 @@ static void cursor_draw(int x, int y) {
 
 void gui_run(void) {
     if (!fb_active()) {
-        vga_print("pixel UI needs the VBE framebuffer (boot muos.iso)\n");
+        vga_print("pixel UI needs VBE: run run_iso.bat or .\\run.ps1 (ISO boot)\n");
         return;
     }
     for (uint16_t r = 0; r < VGA_HEIGHT; r++)

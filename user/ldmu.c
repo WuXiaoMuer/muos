@@ -411,6 +411,7 @@ static void load_needed(obj_t* o, int depth) {
 
 /* ---------------- entry ---------------- */
 
+static void jump_to(u32 entry, u32* sp) __attribute__((noreturn));
 static void jump_to(u32 entry, u32* sp) {
     __asm__ volatile ("mov %0, %%esp\n\txor %%ebp, %%ebp\n\tjmp *%1"
                       :: "r"(sp), "r"(entry) : "memory");

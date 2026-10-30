@@ -260,9 +260,9 @@ USER_SIGTRAMP = 0x08847000
 
 ## 九、构建系统
 
-- **build.ps1**:`-Clean/-Run/-Iso` 组合;工具探测顺序 PATH → toolchain\ → tools\ → 常见安装位置;编内核 `-m32 -ffreestanding -O2 -g -Wall -Wextra -fno-tree-loop-distribute-patterns -nostdinc`;链接经 `i686-elf-gcc -nostdlib -T linker.ld`(GCC 驱动而非裸 ld)。
+- **build.ps1**:`-Clean/-Run/-Iso/-Jobs` 组合;工具探测顺序 PATH → toolchain\ → tools\ → 常见安装位置;编内核 `-m32 -ffreestanding -O2 -g -Wall -Wextra -fno-tree-loop-distribute-patterns -nostdinc`;链接经 `i686-elf-gcc -nostdlib -T linker.ld`(GCC 驱动而非裸 ld)。构建器按 `include/*.h` 最新时间戳做增量判断(`Test-ObjectFresh`),未过期的 `.o` 直接跳过;剩余 C 文件用 .NET `Process` 并行编译(默认 CPU 核数,可 `-Jobs N` 限制),失败时打印该进程的 stderr。
 - 用户程序:`user/*.c` 用同款交叉编译器、`-fno-pic -fno-pie -nostdlib` 编译,`user/linker.ld` 链接到 0x08048000,`objcopy -I binary -O elf32-i386 -B i386` 生成 `hello_elf.o` 参与内核链接。
-- **make_iso.py**:PROJECT 取脚本所在目录;objcopy 出 flat kernel.bin,bootloader 在偏移 4092 补丁内核大小;pycdlib 打 El Torito ISO。
+- **tools/make_iso.py**:PROJECT 取脚本所在目录;objcopy 出 flat kernel.bin,bootloader 在偏移 4092 补丁内核大小;pycdlib 打 El Torito ISO。测试驱动统一在 `tools/qmp_shell.py`(QMP 按键映射 + 等待 shell/exit/fault 标记)。
 - ISO 路径实测:`-cdrom` 启动 → 自检全 PASS(修复前该路径直接把魔数当指令执行)。
 
 ## 十、关键全局量

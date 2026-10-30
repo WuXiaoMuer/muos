@@ -528,7 +528,6 @@ int main(int argc, char** argv) {
         /* Two children spin in Ring3 (no syscalls) so the 100Hz timer
          * preempts them and interleaves their output. The parent blocks in
          * waitpid while both run. */
-        int pids[2] = { -1, -1 };
         for (int k = 0; k < 2; k++) {
             int pid = muos_fork();
             if (pid == 0) {
@@ -542,7 +541,6 @@ int main(int argc, char** argv) {
                 muos_puts("\n");
                 muos_exit(10 + k);
             }
-            pids[k] = pid;
         }
 
         int ok = 1;

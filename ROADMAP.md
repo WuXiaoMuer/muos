@@ -12,13 +12,13 @@
 
 ## 当前进度快照(2026-10-30)
 
-- 内核自检 **88/0**;`build/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
+- 内核自检 **88/0**;`tools/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
 - `src/syscall.c` 已定义 **120+ 个 Linux i386 系统调用号**,覆盖进程/stdio、信号、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。
 - 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
 - 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run net`(RTL8139 + ICMP/UDP socket ABI)、`run tcp`(TCP 握手与回显)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。ISO 路径额外用 QMP `screendump` 验证 VBE 文本渲染。
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
-- 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`build/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
+- 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
 - 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash 与 COPY 已支持,TLS/IRELATIVE/版本化未做);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + 最小 TCP(无重传/拥塞控制);帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 只是桌面原型。
 
 ## 后续计划(建议顺序)
@@ -46,7 +46,7 @@
 - [ ] 与真实 libc 生态的兼容(TLS 重定位、`R_386_IRELATIVE`、符号版本化)仍未做;遇到未知重定位类型会明确报错而不是继续执行
 
 ### P4 平台外设
-- [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`build/test_ata.py` 两次启动验证持久化
+- [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`tools/test_ata.py` 两次启动验证持久化
 - [x] 持久化文件系统 MuFS:扇区 0 超级块、扇区 2–8 文件/目录元数据表、扇区 16 起 16×64KB 数据槽;每次变更写穿(元数据表 + 涉及扇区),`fsync/sync` 全量刷新,开机 `fs_persist_mount` 挂载或首次格式化;`run fsata` → 重启 `run fsread` 验证
 - [x] 网络:PCI 枚举 + RTL8139(轮询 ISR,32K RX 环)+ ARP/IPv4/ICMP echo/UDP + DHCP 客户端;`run net` 实测 ping 网关与 DNS 查询成功
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/sendto(369)/recvfrom(371)/shutdown(373)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽

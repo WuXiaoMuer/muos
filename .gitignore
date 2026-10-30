@@ -20,5 +20,7 @@ Thumbs.db
 
 # Large toolchain binaries (over 100MB)
 /toolchain/
+/tools/nasm/
+/tools/qemu/
 
 i686-elf-tools-windows.zip

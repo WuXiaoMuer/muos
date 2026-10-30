@@ -2,7 +2,8 @@
 param(
     [switch]$Run,
     [switch]$Iso,
-    [switch]$Clean
+    [switch]$Clean,
+    [int]$Jobs = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -89,22 +90,52 @@ $CFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
              "-I$PSScriptRoot\include")
 
 $step = 1
+$cores = [Environment]::ProcessorCount
+if ($Jobs -le 0) { $Jobs = $cores }
+$headerStamp = (Get-ChildItem "$PSScriptRoot\include\*.h" | Measure-Object -Property LastWriteTime -Maximum).Maximum
+
+function Test-ObjectFresh($obj, $src, $stamp) {
+    if (-not (Test-Path $obj)) { return $false }
+    $t = (Get-Item $obj).LastWriteTime
+    if ($t -lt (Get-Item $src).LastWriteTime) { return $false }
+    if ($stamp -and $t -lt $stamp) { return $false }
+    return $true
+}
+
+function Test-OutputFresh($out, $inputs) {
+    if (-not (Test-Path $out)) { return $false }
+    $t = (Get-Item $out).LastWriteTime
+    foreach ($i in $inputs) {
+        $item = Get-Item $i -ErrorAction SilentlyContinue
+        if ($item -and $item.LastWriteTime -gt $t) { return $false }
+    }
+    return $true
+}
 
 # NASM: boot.s
-Write-Host ">>> [$step] Compiling src\boot.s ..." -ForegroundColor Cyan
-& $NASM -f elf32 "$SrcDir\boot.s" -o "$BuildDir\boot.o"
-if ($LASTEXITCODE -ne 0) { throw "NASM boot.s failed" }
-Write-Host "      OK -> build\boot.o" -ForegroundColor Green
+if (Test-ObjectFresh "$BuildDir\boot.o" "$SrcDir\boot.s" $headerStamp) {
+    Write-Host ">>> [$step] src\boot.s up to date" -ForegroundColor DarkGray
+} else {
+    Write-Host ">>> [$step] Compiling src\boot.s ..." -ForegroundColor Cyan
+    & $NASM -f elf32 "$SrcDir\boot.s" -o "$BuildDir\boot.o"
+    if ($LASTEXITCODE -ne 0) { throw "NASM boot.s failed" }
+    Write-Host "      OK -> build\boot.o" -ForegroundColor Green
+}
 $step++
 
 # NASM: isr_stubs.s
-Write-Host ">>> [$step] Compiling src\isr_stubs.s ..." -ForegroundColor Cyan
-& $NASM -f elf32 -w+other -o "$BuildDir\isr_stubs.o" "$SrcDir\isr_stubs.s"
-if ($LASTEXITCODE -ne 0) { throw "NASM isr_stubs.s failed" }
-Write-Host "      OK -> build\isr_stubs.o" -ForegroundColor Green
+if (Test-ObjectFresh "$BuildDir\isr_stubs.o" "$SrcDir\isr_stubs.s" $headerStamp) {
+    Write-Host ">>> [$step] src\isr_stubs.s up to date" -ForegroundColor DarkGray
+} else {
+    Write-Host ">>> [$step] Compiling src\isr_stubs.s ..." -ForegroundColor Cyan
+    & $NASM -f elf32 -w+other -o "$BuildDir\isr_stubs.o" "$SrcDir\isr_stubs.s"
+    if ($LASTEXITCODE -ne 0) { throw "NASM isr_stubs.s failed" }
+    Write-Host "      OK -> build\isr_stubs.o" -ForegroundColor Green
+}
 $step++
 
-# GCC: all C files
+# GCC: all C files. Up-to-date objects are skipped; the rest are compiled
+# in parallel batches ($Jobs processes at a time, default = CPU count).
 $CFiles = @(
     "kernel", "vga", "serial", "gdt", "idt", "isr", "pic",
     "pit", "keyboard", "mouse", "mm", "kheap", "string", "fs", "editor",
@@ -113,16 +144,62 @@ $CFiles = @(
 )
 
 $ObjFiles = @()
+foreach ($name in $CFiles) { $ObjFiles += "$BuildDir\$name.o" }
+
+$todo = @()
 foreach ($name in $CFiles) {
     $src = "$SrcDir\$name.c"
     $obj = "$BuildDir\$name.o"
-    Write-Host ">>> [$step] Compiling src\$name.c ..." -ForegroundColor Cyan
-    & $GCC @CFlags -c $src -o $obj
-    if ($LASTEXITCODE -ne 0) { throw "GCC $name.c failed" }
-    Write-Host "      OK -> build\$name.o" -ForegroundColor Green
-    $ObjFiles += $obj
-    $step++
+    if (-not (Test-ObjectFresh $obj $src $headerStamp)) {
+        $todo += [pscustomobject]@{ Name = $name; Src = $src; Obj = $obj }
+    }
 }
+
+if ($todo.Count -eq 0) {
+    Write-Host ">>> [$step] C sources up to date ($($CFiles.Count) objects)" -ForegroundColor DarkGray
+} else {
+    Write-Host ">>> [$step] Compiling $($todo.Count)/$($CFiles.Count) C files (jobs=$Jobs) ..." -ForegroundColor Cyan
+    for ($i = 0; $i -lt $todo.Count; $i += $Jobs) {
+        $last = [Math]::Min($i + $Jobs - 1, $todo.Count - 1)
+        $batch = $todo[$i..$last]
+        $running = @()
+        foreach ($t in $batch) {
+            $argsList = $CFlags + @("-c", $t.Src, "-o", $t.Obj)
+            $argStr = ($argsList | ForEach-Object {
+                if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+            }) -join ' '
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $GCC
+            $psi.Arguments = $argStr
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardError = $true
+            $psi.RedirectStandardOutput = $true
+
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $running += [pscustomobject]@{
+                Name = $t.Name; Proc = $proc; Err = $errTask; Out = $outTask
+            }
+        }
+        foreach ($r in $running) {
+            $r.Proc.WaitForExit()
+            $errText = $r.Err.Result
+            $outText = $r.Out.Result
+            if ($r.Proc.ExitCode -ne 0) {
+                if ($errText) { Write-Host $errText }
+                if ($outText) { Write-Host $outText }
+                throw "GCC $($r.Name).c failed"
+            }
+            Write-Host "      OK -> build\$($r.Name).o" -ForegroundColor Green
+        }
+    }
+}
+$step++
 
 # ======================== Ring3 user program ========================
 # The user ELF is built with the same cross compiler but linked at
@@ -132,35 +209,64 @@ $UserDir    = "$PSScriptRoot\user"
 $UserCFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
                 "-fno-stack-protector", "-fno-pic", "-fno-pie",
                 "-fno-tree-loop-distribute-patterns", "-nostdinc", "-nostdlib")
+$userStamp = (Get-ChildItem "$UserDir\*.h", "$PSScriptRoot\include\*.h" |
+              Measure-Object -Property LastWriteTime -Maximum).Maximum
 
 Write-Host ">>> [$step] Compiling user runtime + hello.c ..." -ForegroundColor Cyan
-& $GCC @UserCFlags -c "$UserDir\runtime.c" -o "$BuildDir\user_runtime.o"
-if ($LASTEXITCODE -ne 0) { throw "GCC user runtime.c failed" }
-& $GCC @UserCFlags -c "$UserDir\hello.c" -o "$BuildDir\user_hello.o"
-if ($LASTEXITCODE -ne 0) { throw "GCC user hello.c failed" }
-& $NASM -f elf32 "$UserDir\syscall6.s" -o "$BuildDir\user_syscall6.o"
-if ($LASTEXITCODE -ne 0) { throw "NASM user syscall6.s failed" }
-Write-Host "      OK -> build\user_runtime.o, build\user_hello.o, build\user_syscall6.o" -ForegroundColor Green
+if (Test-ObjectFresh "$BuildDir\user_runtime.o" "$UserDir\runtime.c" $userStamp) {
+    Write-Host "      user_runtime.o up to date" -ForegroundColor DarkGray
+} else {
+    & $GCC @UserCFlags -c "$UserDir\runtime.c" -o "$BuildDir\user_runtime.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC user runtime.c failed" }
+}
+if (Test-ObjectFresh "$BuildDir\user_hello.o" "$UserDir\hello.c" $userStamp) {
+    Write-Host "      user_hello.o up to date" -ForegroundColor DarkGray
+} else {
+    & $GCC @UserCFlags -c "$UserDir\hello.c" -o "$BuildDir\user_hello.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC user hello.c failed" }
+}
+if (Test-ObjectFresh "$BuildDir\user_syscall6.o" "$UserDir\syscall6.s" $userStamp) {
+    Write-Host "      user_syscall6.o up to date" -ForegroundColor DarkGray
+} else {
+    & $NASM -f elf32 "$UserDir\syscall6.s" -o "$BuildDir\user_syscall6.o"
+    if ($LASTEXITCODE -ne 0) { throw "NASM user syscall6.s failed" }
+}
+Write-Host "      OK -> user objects ready" -ForegroundColor Green
 $step++
 
 Write-Host ">>> [$step] Linking hello.elf (0x08048000) ..." -ForegroundColor Cyan
-& $NASM -f elf32 "$UserDir\start.s" -o "$BuildDir\user_start.o"
-if ($LASTEXITCODE -ne 0) { throw "NASM user start.s failed" }
-& $GCC -m32 -nostdlib -no-pie -T "$UserDir\linker.ld" `
-       "$BuildDir\user_start.o" "$BuildDir\user_runtime.o" "$BuildDir\user_hello.o" `
-       "$BuildDir\user_syscall6.o" `
-       -o "$BuildDir\hello.elf" "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
-if ($LASTEXITCODE -ne 0) { throw "Link hello.elf failed" }
-Write-Host "      OK -> build\hello.elf" -ForegroundColor Green
+if (Test-ObjectFresh "$BuildDir\user_start.o" "$UserDir\start.s" $userStamp) {
+    Write-Host "      user_start.o up to date" -ForegroundColor DarkGray
+} else {
+    & $NASM -f elf32 "$UserDir\start.s" -o "$BuildDir\user_start.o"
+    if ($LASTEXITCODE -ne 0) { throw "NASM user start.s failed" }
+}
+if (Test-OutputFresh "$BuildDir\hello.elf" @(
+        "$BuildDir\user_start.o", "$BuildDir\user_runtime.o",
+        "$BuildDir\user_hello.o", "$BuildDir\user_syscall6.o",
+        "$UserDir\linker.ld")) {
+    Write-Host "      hello.elf up to date" -ForegroundColor DarkGray
+} else {
+    & $GCC -m32 -nostdlib -no-pie -T "$UserDir\linker.ld" `
+           "$BuildDir\user_start.o" "$BuildDir\user_runtime.o" "$BuildDir\user_hello.o" `
+           "$BuildDir\user_syscall6.o" `
+           -o "$BuildDir\hello.elf" "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
+    if ($LASTEXITCODE -ne 0) { throw "Link hello.elf failed" }
+    Write-Host "      OK -> build\hello.elf" -ForegroundColor Green
+}
 $step++
 
 Write-Host ">>> [$step] Embedding hello.elf as a kernel blob ..." -ForegroundColor Cyan
-Push-Location $BuildDir
-& $OBJCOPY -I binary -O elf32-i386 -B i386 "hello.elf" "hello_elf.o"
-$blobRc = $LASTEXITCODE
-Pop-Location
-if ($blobRc -ne 0) { throw "objcopy hello.elf failed" }
-Write-Host "      OK -> build\hello_elf.o" -ForegroundColor Green
+if (Test-OutputFresh "$BuildDir\hello_elf.o" @("$BuildDir\hello.elf")) {
+    Write-Host "      hello_elf.o up to date" -ForegroundColor DarkGray
+} else {
+    Push-Location $BuildDir
+    & $OBJCOPY -I binary -O elf32-i386 -B i386 "hello.elf" "hello_elf.o"
+    $blobRc = $LASTEXITCODE
+    Pop-Location
+    if ($blobRc -ne 0) { throw "objcopy hello.elf failed" }
+    Write-Host "      OK -> build\hello_elf.o" -ForegroundColor Green
+}
 $step++
 
 # ======================== Position-independent (ET_DYN) user image =======
@@ -170,25 +276,45 @@ Write-Host ">>> [$step] Building hello-pie.elf (ET_DYN) ..." -ForegroundColor Cy
 $PieCFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
                "-fno-stack-protector", "-fPIE",
                "-fno-tree-loop-distribute-patterns", "-nostdinc", "-nostdlib")
-& $GCC @PieCFlags -c "$UserDir\runtime.c" -o "$BuildDir\pie_runtime.o"
-if ($LASTEXITCODE -ne 0) { throw "GCC pie runtime.c failed" }
-& $GCC @PieCFlags -c "$UserDir\hello.c" -o "$BuildDir\pie_hello.o"
-if ($LASTEXITCODE -ne 0) { throw "GCC pie hello.c failed" }
-& $NASM -f elf32 "$UserDir\start.s" -o "$BuildDir\pie_start.o"
-if ($LASTEXITCODE -ne 0) { throw "NASM pie start.s failed" }
-& $NASM -f elf32 "$UserDir\syscall6.s" -o "$BuildDir\pie_syscall6.o"
-if ($LASTEXITCODE -ne 0) { throw "NASM pie syscall6.s failed" }
-& $GCC -m32 -nostdlib -pie -T "$UserDir\linker_pie.ld" `
-       "$BuildDir\pie_start.o" "$BuildDir\pie_runtime.o" "$BuildDir\pie_hello.o" `
-       "$BuildDir\pie_syscall6.o" `
-       -o "$BuildDir\hello-pie.elf" "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
-if ($LASTEXITCODE -ne 0) { throw "Link hello-pie.elf failed" }
-Push-Location $BuildDir
-& $OBJCOPY -I binary -O elf32-i386 -B i386 "hello-pie.elf" "hello_pie_elf.o"
-$pieRc = $LASTEXITCODE
-Pop-Location
-if ($pieRc -ne 0) { throw "objcopy hello-pie.elf failed" }
-Write-Host "      OK -> build\hello-pie.elf, build\hello_pie_elf.o" -ForegroundColor Green
+if (-not (Test-ObjectFresh "$BuildDir\pie_runtime.o" "$UserDir\runtime.c" $userStamp)) {
+    & $GCC @PieCFlags -c "$UserDir\runtime.c" -o "$BuildDir\pie_runtime.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC pie runtime.c failed" }
+}
+if (-not (Test-ObjectFresh "$BuildDir\pie_hello.o" "$UserDir\hello.c" $userStamp)) {
+    & $GCC @PieCFlags -c "$UserDir\hello.c" -o "$BuildDir\pie_hello.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC pie hello.c failed" }
+}
+if (-not (Test-ObjectFresh "$BuildDir\pie_start.o" "$UserDir\start.s" $userStamp)) {
+    & $NASM -f elf32 "$UserDir\start.s" -o "$BuildDir\pie_start.o"
+    if ($LASTEXITCODE -ne 0) { throw "NASM pie start.s failed" }
+}
+if (-not (Test-ObjectFresh "$BuildDir\pie_syscall6.o" "$UserDir\syscall6.s" $userStamp)) {
+    & $NASM -f elf32 "$UserDir\syscall6.s" -o "$BuildDir\pie_syscall6.o"
+    if ($LASTEXITCODE -ne 0) { throw "NASM pie syscall6.s failed" }
+}
+$pieInputs = @("$BuildDir\pie_start.o", "$BuildDir\pie_runtime.o",
+               "$BuildDir\pie_hello.o", "$BuildDir\pie_syscall6.o",
+               "$UserDir\linker_pie.ld")
+if (Test-OutputFresh "$BuildDir\hello-pie.elf" $pieInputs) {
+    Write-Host "      hello-pie.elf up to date" -ForegroundColor DarkGray
+} else {
+    & $GCC -m32 -nostdlib -pie -T "$UserDir\linker_pie.ld" `
+           "$BuildDir\pie_start.o" "$BuildDir\pie_runtime.o" "$BuildDir\pie_hello.o" `
+           "$BuildDir\pie_syscall6.o" `
+           -o "$BuildDir\hello-pie.elf" "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
+    if ($LASTEXITCODE -ne 0) { throw "Link hello-pie.elf failed" }
+    Write-Host "      OK -> build\hello-pie.elf" -ForegroundColor Green
+}
+if (Test-OutputFresh "$BuildDir\hello_pie_elf.o" @("$BuildDir\hello-pie.elf")) {
+    Write-Host "      hello_pie_elf.o up to date" -ForegroundColor DarkGray
+} else {
+    Push-Location $BuildDir
+    & $OBJCOPY -I binary -O elf32-i386 -B i386 "hello-pie.elf" "hello_pie_elf.o"
+    $pieRc = $LASTEXITCODE
+    Pop-Location
+    if ($pieRc -ne 0) { throw "objcopy hello-pie.elf failed" }
+    Write-Host "      OK -> build\hello_pie_elf.o" -ForegroundColor Green
+}
 $step++
 
 # ======================== Dynamic linking set ========================
@@ -200,51 +326,82 @@ $SoCFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
               "-fno-tree-loop-distribute-patterns", "-nostdinc", "-nostdlib")
 
 Write-Host ">>> [$step] Building libmu.so (shared library) ..." -ForegroundColor Cyan
-& $GCC @SoCFlags -c "$UserDir\libmu.c" -o "$BuildDir\libmu_pic.o"
-if ($LASTEXITCODE -ne 0) { throw "GCC libmu.c failed" }
-& $LD -m elf_i386 -shared -T "$UserDir\linker_so.ld" `
-      "$BuildDir\libmu_pic.o" -o "$BuildDir\libmu.so" `
-      --hash-style=gnu --build-id=none
-if ($LASTEXITCODE -ne 0) { throw "Link libmu.so failed" }
-Write-Host "      OK -> build\libmu.so" -ForegroundColor Green
+if (-not (Test-ObjectFresh "$BuildDir\libmu_pic.o" "$UserDir\libmu.c" $userStamp)) {
+    & $GCC @SoCFlags -c "$UserDir\libmu.c" -o "$BuildDir\libmu_pic.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC libmu.c failed" }
+}
+if (-not (Test-OutputFresh "$BuildDir\libmu.so" @("$BuildDir\libmu_pic.o",
+        "$UserDir\linker_so.ld"))) {
+    & $LD -m elf_i386 -shared -T "$UserDir\linker_so.ld" `
+          "$BuildDir\libmu_pic.o" -o "$BuildDir\libmu.so" `
+          --hash-style=gnu --build-id=none --no-warn-rwx-segments
+    if ($LASTEXITCODE -ne 0) { throw "Link libmu.so failed" }
+    Write-Host "      OK -> build\libmu.so" -ForegroundColor Green
+} else {
+    Write-Host "      libmu.so up to date" -ForegroundColor DarkGray
+}
 $step++
 
 Write-Host ">>> [$step] Building ld-mu.so (dynamic linker) ..." -ForegroundColor Cyan
-& $GCC @SoCFlags -c "$UserDir\ldmu.c" -o "$BuildDir\ldmu_pic.o"
-if ($LASTEXITCODE -ne 0) { throw "GCC ldmu.c failed" }
-& $NASM -f elf32 "$UserDir\ld_start.s" -o "$BuildDir\ld_start.o"
-if ($LASTEXITCODE -ne 0) { throw "NASM ld_start.s failed" }
-& $LD -m elf_i386 -shared -T "$UserDir\linker_so.ld" `
-      "$BuildDir\ldmu_pic.o" "$BuildDir\ld_start.o" -o "$BuildDir\ld-mu.so" `
-      --hash-style=sysv --build-id=none
-if ($LASTEXITCODE -ne 0) { throw "Link ld-mu.so failed" }
-Write-Host "      OK -> build\ld-mu.so" -ForegroundColor Green
+if (-not (Test-ObjectFresh "$BuildDir\ldmu_pic.o" "$UserDir\ldmu.c" $userStamp)) {
+    & $GCC @SoCFlags -c "$UserDir\ldmu.c" -o "$BuildDir\ldmu_pic.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC ldmu.c failed" }
+}
+if (-not (Test-ObjectFresh "$BuildDir\ld_start.o" "$UserDir\ld_start.s" $userStamp)) {
+    & $NASM -f elf32 "$UserDir\ld_start.s" -o "$BuildDir\ld_start.o"
+    if ($LASTEXITCODE -ne 0) { throw "NASM ld_start.s failed" }
+}
+if (-not (Test-OutputFresh "$BuildDir\ld-mu.so" @("$BuildDir\ldmu_pic.o",
+        "$BuildDir\ld_start.o", "$UserDir\linker_so.ld"))) {
+    & $LD -m elf_i386 -shared -T "$UserDir\linker_so.ld" `
+          "$BuildDir\ldmu_pic.o" "$BuildDir\ld_start.o" -o "$BuildDir\ld-mu.so" `
+          --hash-style=sysv --build-id=none --no-warn-rwx-segments
+    if ($LASTEXITCODE -ne 0) { throw "Link ld-mu.so failed" }
+    Write-Host "      OK -> build\ld-mu.so" -ForegroundColor Green
+} else {
+    Write-Host "      ld-mu.so up to date" -ForegroundColor DarkGray
+}
 $step++
 
 Write-Host ">>> [$step] Building dyn.elf (PT_INTERP + DT_NEEDED libmu.so) ..." -ForegroundColor Cyan
-& $GCC @PieCFlags -c "$UserDir\dyn.c" -o "$BuildDir\pie_dyn.o"
-if ($LASTEXITCODE -ne 0) { throw "GCC dyn.c failed" }
-& $GCC -m32 -nostdlib -pie -T "$UserDir\linker_dyn.ld" `
-       "$BuildDir\pie_start.o" "$BuildDir\pie_runtime.o" "$BuildDir\pie_dyn.o" `
-       "$BuildDir\pie_syscall6.o" `
-       -L"$BuildDir" -lmu `
-       -o "$BuildDir\dyn.elf" `
-       "-Wl,--dynamic-linker=/lib/ld-mu.so" "-Wl,--hash-style=sysv" `
-       "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
-if ($LASTEXITCODE -ne 0) { throw "Link dyn.elf failed" }
-Write-Host "      OK -> build\dyn.elf" -ForegroundColor Green
+if (-not (Test-ObjectFresh "$BuildDir\pie_dyn.o" "$UserDir\dyn.c" $userStamp)) {
+    & $GCC @PieCFlags -c "$UserDir\dyn.c" -o "$BuildDir\pie_dyn.o"
+    if ($LASTEXITCODE -ne 0) { throw "GCC dyn.c failed" }
+}
+if (-not (Test-OutputFresh "$BuildDir\dyn.elf" @(
+        "$BuildDir\pie_start.o", "$BuildDir\pie_runtime.o",
+        "$BuildDir\pie_dyn.o", "$BuildDir\pie_syscall6.o",
+        "$BuildDir\libmu.so", "$UserDir\linker_dyn.ld"))) {
+    & $GCC -m32 -nostdlib -pie -T "$UserDir\linker_dyn.ld" `
+           "$BuildDir\pie_start.o" "$BuildDir\pie_runtime.o" "$BuildDir\pie_dyn.o" `
+           "$BuildDir\pie_syscall6.o" `
+           -L"$BuildDir" -lmu `
+           -o "$BuildDir\dyn.elf" `
+           "-Wl,--dynamic-linker=/lib/ld-mu.so" "-Wl,--hash-style=sysv" `
+           "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
+    if ($LASTEXITCODE -ne 0) { throw "Link dyn.elf failed" }
+    Write-Host "      OK -> build\dyn.elf" -ForegroundColor Green
+} else {
+    Write-Host "      dyn.elf up to date" -ForegroundColor DarkGray
+}
 $step++
 
 Write-Host ">>> [$step] Embedding dynamic-linking blobs ..." -ForegroundColor Cyan
 Push-Location $BuildDir
-& $OBJCOPY -I binary -O elf32-i386 -B i386 "ld-mu.so" "ld_mu_so.o"
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy ld-mu.so failed" }
-& $OBJCOPY -I binary -O elf32-i386 -B i386 "libmu.so" "libmu_so.o"
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy libmu.so failed" }
-& $OBJCOPY -I binary -O elf32-i386 -B i386 "dyn.elf" "dyn_elf.o"
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy dyn.elf failed" }
+if (-not (Test-OutputFresh "ld_mu_so.o" @("ld-mu.so"))) {
+    & $OBJCOPY -I binary -O elf32-i386 -B i386 "ld-mu.so" "ld_mu_so.o"
+    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy ld-mu.so failed" }
+}
+if (-not (Test-OutputFresh "libmu_so.o" @("libmu.so"))) {
+    & $OBJCOPY -I binary -O elf32-i386 -B i386 "libmu.so" "libmu_so.o"
+    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy libmu.so failed" }
+}
+if (-not (Test-OutputFresh "dyn_elf.o" @("dyn.elf"))) {
+    & $OBJCOPY -I binary -O elf32-i386 -B i386 "dyn.elf" "dyn_elf.o"
+    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy dyn.elf failed" }
+}
 Pop-Location
-Write-Host "      OK -> build\ld_mu_so.o, build\libmu_so.o, build\dyn_elf.o" -ForegroundColor Green
+Write-Host "      OK -> dynamic blobs ready" -ForegroundColor Green
 $step++
 
 # Link (via GCC driver so standard flags are handled consistently)
@@ -255,9 +412,13 @@ $AllObj = @("$BuildDir\boot.o", "$BuildDir\isr_stubs.o",
             "$BuildDir\dyn_elf.o") + $ObjFiles
 $LdArgs = @("-nostdlib", "-T", "$PSScriptRoot\linker.ld",
             "-Wl,--no-warn-rwx-segments") + $AllObj + @("-o", "$BuildDir\kernel.elf")
-& $GCC @LdArgs
-if ($LASTEXITCODE -ne 0) { throw "Link failed" }
-Write-Host "      OK -> build\kernel.elf" -ForegroundColor Green
+if (Test-OutputFresh "$BuildDir\kernel.elf" ($AllObj + @("$PSScriptRoot\linker.ld"))) {
+    Write-Host "      kernel.elf up to date" -ForegroundColor DarkGray
+} else {
+    & $GCC @LdArgs
+    if ($LASTEXITCODE -ne 0) { throw "Link failed" }
+    Write-Host "      OK -> build\kernel.elf" -ForegroundColor Green
+}
 
 Write-Host ""
 Write-Host "[Build SUCCESS] build\kernel.elf generated" -ForegroundColor Green
@@ -271,9 +432,15 @@ if ($Iso) {
         Write-Host "[ERROR] python not found in PATH." -ForegroundColor Red
         exit 1
     }
-    & $python "$PSScriptRoot\make_iso.py"
-    if ($LASTEXITCODE -ne 0) { throw "ISO build failed" }
-    Write-Host "      OK -> muos.iso" -ForegroundColor Green
+    if (Test-OutputFresh "$PSScriptRoot\muos.iso" @(
+            "$BuildDir\kernel.elf", "$SrcDir\boot_cd.s",
+            "$PSScriptRoot\tools\make_iso.py")) {
+        Write-Host "      muos.iso up to date" -ForegroundColor DarkGray
+    } else {
+        & $python "$PSScriptRoot\tools\make_iso.py"
+        if ($LASTEXITCODE -ne 0) { throw "ISO build failed" }
+        Write-Host "      OK -> muos.iso" -ForegroundColor Green
+    }
     Write-Host ""
 }
 
