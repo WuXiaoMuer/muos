@@ -7,6 +7,12 @@
 #define PAGE_SHIFT      12
 #define PAGE_MASK       0xFFFFF000
 
+/* Higher-half layout: kernel virtual = physical + KERNEL_VBASE; the image
+ * is linked at KERNEL_BASE and loaded at KERNEL_PHYS_BASE. */
+#define KERNEL_VBASE      0xC0000000u
+#define KERNEL_BASE       0xC0100000u
+#define KERNEL_PHYS_BASE  0x00100000u
+
 /* Page directory/table entry flags */
 #define PDE_PRESENT     (1 << 0)
 #define PDE_WRITABLE    (1 << 1)

@@ -1,0 +1,35 @@
+MuOS — licensing notice
+=======================
+
+The repository as a whole is licensed under the GNU General Public License,
+version 3 (see LICENSE). This notice does not change that.
+
+Limited MIT licence for one commit
+----------------------------------
+
+I, WuXiaoMuer (GitHub: https://github.com/WuXiaoMuer), am the sole author of
+the original code introduced in commit
+
+    b68a7dd63e4e12796007618a3c39728566fa3b94
+    "Add Ring3 ELF execution and desktop input"
+
+For that code only, I additionally grant permission to use, copy, modify,
+merge, publish, distribute, sublicense and/or sell copies, under the terms of
+the MIT License, with attribution to:
+
+    WuXiaoMuer — https://github.com/WuXiaoMuer/muos
+
+This grant exists so that the implementation can be indexed and reused as a
+worked reference by third-party projects whose licences are incompatible with
+GPL-3.0 (for example the XERJ Corpus Hub, which is Apache-2.0). It is
+deliberately narrow:
+
+- Scope: only the original code authored by me in the commit above. No other
+  commit, file or part of this repository is covered.
+- Excluded: third-party components vendored in the repository (for example
+  tools/nasm) remain under their own licences and are not sublicensed here.
+- Unchanged: anyone who takes the repository as a whole still receives it
+  under GPL-3.0 only. This notice adds a permissive option for one commit's
+  original code; it does not relicense the project.
+
+Date: 2026-10-30

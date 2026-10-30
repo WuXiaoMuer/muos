@@ -79,8 +79,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
      * RAM that the page tables and kernel heap would otherwise overwrite. */
     modules_init(mb);
 
-    /* Align kernel_end to page boundary */
-    uint32_t kernel_end = ((uint32_t)&_kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    /* Kernel_end must be a *physical* address for the bitmap allocator
+     * (the image is linked higher-half, so subtract the base bias). */
+    uint32_t kernel_end = (((uint32_t)&_kernel_end - KERNEL_VBASE) +
+                           PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     mm_init(mb, kernel_end);
     vga_print("[OK] Physical memory: "); vga_print_dec(mm_get_total_pages() * 4);
     vga_print(" KB total, "); vga_print_dec(mm_get_free_pages() * 4);

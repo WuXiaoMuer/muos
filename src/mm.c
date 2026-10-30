@@ -181,8 +181,14 @@ void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
         pt[pfn & 0x3FF] = (pfn * PAGE_SIZE) | PAGE_KERNEL;
     }
 
-    /* Higher-half kernel mapping (3GB+) and user-space layout are
-     * deferred until the Ring3/ABI work (see ROADMAP.md). */
+    /* Higher-half alias: 0xC0000000 + phys maps to the same physical
+     * pages, so kernel code/data linked at 0xC0100000+ stays reachable
+     * after switching to this page directory. RAM is capped at 1GB,
+     * which is exactly 256 PDEs (768..1023). */
+    for (uint32_t pde = 0; pde < 256; pde++) {
+        if (!(page_directory[pde] & PDE_PRESENT)) continue;
+        page_directory[KERNEL_VBASE >> 22 | pde] = page_directory[pde];
+    }
 }
 
 void mm_enable_paging(void) {

@@ -4,7 +4,7 @@
 
 - **完整启动链**:Multiboot1(QEMU `-kernel`)+ 自研 El Torito 光盘引导
 - **硬件抽象**:GDT / IDT(256 项全覆盖)/ PIC / PIT / PS/2 键盘 + PS/2 鼠标 / 串口 / VGA 文本模式
-- **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、全 RAM 恒等映射分页、内核堆(kmalloc/kfree/kcalloc)
+- **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、**higher-half 内核**(链接 0xC0100000 / 物理 0x100000,引导期自举页表,全 RAM 恒等映射 + 0xC0000000 别名)、内核堆(kmalloc/kfree/kcalloc)
 - **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,在 0x08048000 起的 8MB 用户窗口内运行 C 程序;每个进程有独立 8MB 物理块与页目录(CR3 切换),100Hz 抢占轮转;ELF 可来自内核内嵌(`run`)、RAM FS(`exec hello.elf`)或 Multiboot 模块;支持 ET_EXEC 与 ET_DYN(PIE,`run pie`);用户态故障只杀进程,不 panic 内核
 - **进程与信号**:`fork/execve/wait4/waitid`、`clone` 线程(`CLONE_VM/FILES/THREAD/SETTLS`,共享地址空间)、信号 pending/blocked 掩码与 `signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline、默认终止动作、`alarm`;阻塞 `wait4/waitid/poll/read` 在管道/键盘/定时器事件上唤醒
 - **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;多级 RAM FS(`mkdir/rmdir`、子目录路径解析)与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块;`/dev/hda` 提供 ATA PIO 块设备(跨启动持久化)
@@ -101,6 +101,8 @@ qemu-system-i386 -kernel build\kernel.elf -m 256M
 | 光盘 `-cdrom` | El Torito → boot_cd.s | 自研引导扇区:实模式 → A20 → 平坦 GDT → 保护模式 → 拷贝 flat kernel 到 0x100000 → 跳转 |
 
 **布局约束**:内核入口 `start` 必须位于镜像第一个字节(boot.s 用 `jmp real_start` 跨过内联的 multiboot 头)。ISO 路径把 flat binary 拷到 0x100000 后直接跳过去,若 multiboot 头排在最前就会把魔数当指令执行。Multiboot1 规范只要求头在镜像前 8KB 内,`jmp` 跨头方案同时满足两条路径。
+
+**Higher-half**:内核链接在 0xC0100000、物理装载在 0x100000(`AT(ADDR - 0xC0000000)`),ELF 入口 `entry_phys = 0x100000`。`boot.s` 在关分页的物理地址上先建自举页目录(identity 0..8MB + `PDE[768]` 映射物理 0..4MB),打开分页后用绝对地址跳到高半区;`mm_init` 再把全部 RAM 别名到 0xC0000000(1GB 上限恰好是 256 个 PDE)。内核代码、静态数据、页表/heap 都在高地址运行。
 
 ISO 路径没有 multiboot 信息(EBX=0),内存管理回退到 mem_upper 默认值(32MB)——见 ROADMAP。
 
@@ -248,6 +250,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 | fork 子进程不并发,只在 waitpid 时运行 | 早期只有单地址空间,两个 8MB 沙箱无法同时映射 | 每进程 8MB 物理块 + 私有页目录(PDE 32–34)+ CR3 切换;tick 抢占调度 |
 | 信号返回后进程崩溃/栈被踩 | 早期打算把 trampoline 也压进用户栈,handler 的向下栈增长会覆盖它 | 窗口最后一页映射只读 trampoline(vDSO 方案);sigframe 存在 handler 栈之上 |
 | `clone` 线程一启动就 `ret` 到野地址 | 子线程的 esp 没有返回地址,直接复用父栈 | 汇编 `muos_thread_start` 在子栈上先放参数,子线程 `call fn(arg)` 后 exit |
+| higher-half 内核一启动就三重故障 | e_entry 写成 0xC0100000,而装载器/CPU 关分页时跳到虚拟地址;或只映射了高半区却没保留 identity | `ENTRY(entry_phys)` 让 e_entry=0x100000;boot.s 保留 0..8MB identity 映射,再用绝对地址跳高半区;mm_init 建立全 RAM 的 0xC0000000 别名 |
 | shell 管道子进程 `mov %gs:0` Page Fault | `user_enter_regs` 把 GS 重置为 0x23,丢失 0x33 TLS 选择子 | 保存/恢复子进程 FS/GS 选择子,并按进程保存 GDT TLS base |
 | `sh -c ls` 报 `ls: not found` | BusyBox 通过 PATH 执行外部 applet,但没有 `/bin/busybox` | 虚拟 `/bin/*`、`/usr/bin/*`、`/sbin/*` 全部映射到 Multiboot module 0 |
 
@@ -257,7 +260,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 88 项)。
 
-**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化**。下一步:持久化文件系统、网卡/socket ABI、VBE 帧缓冲、完整动态链接器(见 ROADMAP P4/P3 剩余项)。
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)**。下一步:持久化文件系统、网卡/socket ABI、VBE 帧缓冲、完整动态链接器(见 ROADMAP P4/P3 剩余项)。
 
 ## 参考资源
 

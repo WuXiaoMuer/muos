@@ -21,17 +21,24 @@ isr_stubs.s                              vga serial rtc ata         task.c test.
 ### 2.1 boot.s(QEMU -kernel 路径)
 
 ```asm
-start:          jmp real_start      ; 入口 = 镜像第一个字节
+start:          jmp real_start      ; 入口 = 镜像第一个字节(物理 0x100000)
 align 4                             ; Multiboot1 头:magic/flags/checksum
                 dd 0x1BADB002 ...   ; (在前 8KB 内,满足规范)
 real_start:     cli
-                mov esp, stack_top  ; 16KB 内核栈
-                push ebx            ; multiboot_info*(QEMU/GRUB 填好)
-                push eax            ; 0x2BADB002 魔数
+                mov esi, eax        ; 保存 multiboot magic
+                ; 建自举页目录:PT0/PT1 identity 0..8MB,PDE[768]->PT0
+                ; 填 PT、PDE[0]/[1]/[768],mov cr3, 打开 CR0.PG|PE
+                mov eax, high_entry
+                jmp eax             ; 绝对跳转到 0xC01xxxxx 继续
+high_entry:     mov esp, stack_top  ; 16KB 内核栈(高地址)
+                push ebx            ; multiboot_info
+                push esi            ; 魔数
                 call kernel_main
 ```
 
 **为什么入口必须在第一个字节**:ISO 路径把 flat binary 拷到 0x100000 后直接 `jmp 0x100000`,若 multiboot 头排在最前,魔数 `02 B0 AD 1B` 会被当指令执行(旧版的真实故障)。`jmp` 跨头让两条路径共用同一镜像布局。
+
+**higher-half 的入口约定**:链接地址 0xC0100000 但 ELF `e_entry` 必须是物理地址,链接脚本用 `entry_phys = ADDR(.text) - 0xC0000000`;boot.s 在低地址(identity 映射)执行完自举后,用绝对地址跳到高半区,后续所有 C 代码/静态数据都运行在 0xC0xxxxxx。
 
 ### 2.2 boot_cd.s(El Torito 光盘路径)
 
@@ -88,10 +95,11 @@ mm_init 末尾:for pfn in [0, total_pages):
     PTE[pfn&0x3FF] = pfn*4096 | PRESENT|WRITABLE
 ```
 
-- **自举为什么可行**:mm_init 执行时 CR0.PG 尚未开启,直接写物理地址无需映射;first-fit 按地址升序发帧,每张新页表都落在已建好映射的低 4MB 内,无鸡生蛋问题。
+- **自举为什么可行**:mm_init 在 boot.s 已打开自举分页之后运行;自举页表 identity 映射 0..8MB,而 first-fit 从内核镜像之后(≈1.4MB)升序发帧,页目录 + 全部页表都在 8MB 内,写完再切到新页目录(它把全 RAM identity + 0xC0000000 映射)。
 - 这消除了旧版"分配器发放 4MB 以上帧但分页只映射前 4MB"的失配——任何越线访问立刻 Page Fault(当年任务栈交接崩溃的真实根因,详见 §六)。
 - `mm_map_page` 返回 `bool_t`(拒绝重复映射/分配失败),`mm_virt_to_phys`/`mm_unmap_page` 是未来用户态的基础原语。
-- higher-half(3GB+)映射留到 Ring3 里程碑。
+- **higher-half 别名**:映射完 identity 后,把 PDE[0..255] 原样复制到 PDE[768..1023](`0xC0000000 + phys` 指向同一物理页)。内核镜像链接在 0xC0100000,物理装载在 0x100000;boot.s 用自举页目录(identity 0..8MB + PDE[768] -> 物理 0..4MB)完成这段切换。RAM 上限 1GB 正好用满 256 个别名 PDE。
+- 物理内存仍可通过 identity 地址直接访问(进程块 `p->mem`、页表、内核堆都返回物理地址),因此用户窗口占用的物理区间继续用 `mm_reserve_range` 预留。
 
 ### 4.4 内核堆(kheap.c)
 
@@ -119,7 +127,7 @@ mm_init 末尾:for pfn in [0, total_pages):
 
 ### 7.1 沙箱为什么是固定地址
 
-内核仍是全 RAM 恒等映射(VA=PA),用户窗口占用的物理区间必须从分配器里整段预留,避免与内核页冲突:
+内核代码/数据跑在 higher-half,但物理内存仍保留全 RAM 恒等映射用于直接访问;用户窗口占用的物理区间必须从分配器里整段预留,避免与内核页冲突:
 
 ```
 USER_BASE  = 0x08048000 (经典 Linux i386 ET_EXEC 地址)
@@ -253,10 +261,12 @@ USER_SIGTRAMP = 0x08847000
 | `frame_switched` | proc.c | 调度器是否已改写中断帧 |
 | `present / sectors / model` | ata.c | ATA 主盘探测结果 |
 | `_binary_hello_pie_elf_start/end` | 链接器 | 内嵌 ET_DYN(PIE)镜像起止 |
+| `KERNEL_VBASE / KERNEL_BASE / KERNEL_PHYS_BASE` | mm.h | higher-half 虚拟基址、链接地址、物理装载地址 |
+| `entry_phys / _kernel_end` | linker.ld | ELF 入口物理地址、内核虚拟结束地址 |
 
 ## 十一、已知局限(真实清单)
 
-1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,但无 higher-half、无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
+1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
 3. 动态链接只做到静态 PIE + 自身重定位;`PT_INTERP` 只检测并拒绝,没有 ld.so、共享库映射与 `DT_NEEDED` 符号解析;`MAP_SHARED` 不写回
 4. 磁盘只有 ATA PIO 块设备(`/dev/hda`),没有持久化文件系统(重启后 RAM FS 丢失);无网卡/socket ABI;无 VBE 帧缓冲,桌面仍是 80×25 文本模式(需要 GRUB 或 BIOS VBE 引导阶段)

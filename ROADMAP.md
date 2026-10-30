@@ -17,7 +17,8 @@
 - 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
 - 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
-- 仍有限制:higher-half(0xC0000000)未做;无完整动态链接器(仅支持静态 PIE + 重定位,PT_INTERP 只检测并拒绝);磁盘只到块设备层,无持久化文件系统;无网卡/socket ABI;无帧缓冲图形。
+- 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
+- 仍有限制:无完整动态链接器(仅支持静态 PIE + 重定位,PT_INTERP 只检测并拒绝);磁盘只到块设备层,无持久化文件系统;无网卡/socket ABI;无帧缓冲图形。
 
 ## 后续计划(建议顺序)
 
@@ -30,7 +31,7 @@
 
 ### P2 进程模型升级(结构性)
 - [x] 每进程页目录 + 独立 8MB 物理块(CR3 切换,块/页目录按引用计数共享)
-- [ ] higher-half 内核(0xC0000000):仍需改 linker.ld 与全量映射策略
+- [x] higher-half 内核:链接 0xC0100000,`AT()` 指定物理装载 0x100000;boot.s 自举页目录(identity 0..8MB + 0xC0000000),mm_init 把全部 RAM 再别名到 0xC0000000(上限 1GB = 256 个 PDE)
 - [x] 抢占调度:Ring3 进程 100Hz 轮转,`waitpid` 阻塞让出 CPU(内核 shell 不参与调度)
 - [x] `clone` 线程(`CLONE_VM/CLONE_FS/CLONE_FILES/CLONE_THREAD/CLONE_SETTLS`)、每线程内核栈与 TLS
 - [x] 信号投递:pending/blocked 掩码、`signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline(或 libc restorer)、默认终止动作(SIGKILL/SIGTERM 等)、`alarm`
@@ -62,7 +63,7 @@
 
 目标:内核搬到 3GB+ 高地址,进程跑在 Ring 3,具备真正的上下文切换。
 
-- [ ] higher-half 内核:linker.ld 改虚拟地址 0xC0000000,低 1GB 留给用户空间;启用全局页
+- [x] higher-half 内核:linker.ld 虚拟地址 0xC0100000、`AT()` 物理 LMA 0x100000;boot.s 自举页表;mm_init 建立全 RAM 的 0xC0000000 别名(内核代码/数据/静态区都跑在高地址)
 - [x] 每进程页目录;内核映射区在所有页目录中共享(拷贝内核 PDE;用户窗口 PDE 32–34 私有)
 - [x] TSS(仅 ESP0/SS0,单 CPU 不需要任务门);GDT 中加载
 - [x] 系统调用入口桩:`cli → int 0x80 → 切换内核栈(从 TSS)→ 保存用户寄存器`
@@ -146,7 +147,7 @@
 
 - [ ] fs 截断告警(fs_write 返回实际写入量,调用方检查)
 - [ ] 内核堆 Grow(耗尽时向 vmm 要新页)
-- [ ] higher-half 内核(0xC0000000),当前用户窗口 PDE 私有、其余 PDE 共享内核恒等映射
+- [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
 - [ ] 持久化文件系统(挂在 `/dev/hda` 上)、网卡与 socket ABI、VBE 帧缓冲(见 P4 说明)
 - [ ] 完整动态链接器:共享库装载/符号解析/`DT_NEEDED`;当前只有静态 PIE + 自身重定位
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
