@@ -1661,9 +1661,13 @@ static uint32_t do_ftruncate64(uint32_t fd, uint32_t lo, uint32_t hi) {
     return do_ftruncate(fd, lo);
 }
 
-/* RAM FS writes are already in memory; sync is a successful no-op. */
+/* File data lives in RAM and is written through to MuFS as it changes;
+ * fsync also flushes the whole namespace to the disk when one is present. */
 static uint32_t do_fsync(uint32_t fd) {
-    return user_fd_kind((int)fd) < 0 ? err(ERR_EBADF) : 0;
+    int kind = user_fd_kind((int)fd);
+    if (kind < 0) return err(ERR_EBADF);
+    if (kind == USER_FD_FILE) fs_sync();
+    return 0;
 }
 
 /* ---- rlimits ---- */
@@ -3089,7 +3093,8 @@ void syscall_handler(registers_t* regs) {
             ret = do_fsync(regs->ebx);
             break;
         case SYS_sync:
-            ret = 0;   /* every write already lives in memory */
+            fs_sync();      /* flush the persistent image when a disk exists */
+            ret = 0;
             break;
         case SYS_getrlimit:
         case SYS_ugetrlimit:

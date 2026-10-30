@@ -224,7 +224,8 @@ USER_SIGTRAMP = 0x08847000
 ## 八、Shell / FS / 桌面
 
 - **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault]` 运行内嵌 ELF,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
-- **fs.c**:RAM 文件系统,16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。文件槽位带 `refs` 与 `deleted` 标志:unlink 时若仍有 fd 打开则清空名字但保留数据,最后一个 `fs_unref` 才释放槽位;`fs_rename_dir` 整棵子树改名(先校验全部新名字长度、拒绝目标已存在/移入自身)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
+- **fs.c**:16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。文件槽位带 `refs` 与 `deleted` 标志:unlink 时若仍有 fd 打开则清空名字但保留数据,最后一个 `fs_unref` 才释放槽位;`fs_rename_dir` 整棵子树改名(先校验全部新名字长度、拒绝目标已存在/移入自身)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
+- **MuFS 持久化(同一文件底部)**:磁盘布局 = 扇区 0 超级块(`MUFS` 魔数/版本/generation)、扇区 2–5 文件元数据表(16×88B)、扇区 6–8 目录元数据表(16×68B)、扇区 16 起 16 个 64KB 数据槽。`fs_persist_mount()` 在 `fs_init` 后调用:魔数/版本/槽参数匹配则读入命名空间与文件体,否则格式化为空;之后每个变更点(`create/write(_at)/truncate/delete/rename*/mkdir/rmdir/set_times/unref 释放`)调用 `persist_meta()` 并只写涉及的数据扇区(`persist_slot/persist_slot_range`)。`fs_sync()` 递增 generation、重写超级块 + 全部元数据 + 全部已用槽;`fsync(118)/sync(36)` 调用它。无盘时 `persist_active=false`,全部是内存操作。
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
 - **win7.c**:文本模式 Win7 风格桌面——行 0 标题、1..23 桌面、24 任务栏;窗口按 z-order 绘制(活动窗口最后),鼠标点击/标题栏拖拽/最小化/最大化/关闭,开始菜单鼠标/键盘双操作,桌面图标可见;任务栏显示实时内存与 CMOS RTC `HH:MM:SS`。`gui`/`win7`/`desktop` 命令共用此实现;`run` 之外的 Text Editor/Calculator 可从菜单或图标启动(Calculator 聚焦时直接吃数字/运算符)。
 - **mouse.c + rtc.c**:PS/2 鼠标初始化(0xA8/命令字节/0xF6/0xF4)与 3 字节包解析(9 位 dx/dy、溢出位、按键),映射为 80×25 文本单元;`rtc_read_time` 处理 UIP、BCD/12 小时制,失败时任务栏回退 `UP:MM`。
@@ -263,15 +264,17 @@ USER_SIGTRAMP = 0x08847000
 | `_binary_hello_pie_elf_start/end` | 链接器 | 内嵌 ET_DYN(PIE)镜像起止 |
 | `KERNEL_VBASE / KERNEL_BASE / KERNEL_PHYS_BASE` | mm.h | higher-half 虚拟基址、链接地址、物理装载地址 |
 | `entry_phys / _kernel_end` | linker.ld | ELF 入口物理地址、内核虚拟结束地址 |
+| `persist_active / persist_gen` | fs.c | MuFS 挂载状态与 generation |
+| `meta_buf / dmeta_buf` | fs.c | 写穿的元数据暂存表 |
 
 ## 十一、已知局限(真实清单)
 
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
 3. 动态链接只做到静态 PIE + 自身重定位;`PT_INTERP` 只检测并拒绝,没有 ld.so、共享库映射与 `DT_NEEDED` 符号解析;`MAP_SHARED` 不写回
-4. 磁盘只有 ATA PIO 块设备(`/dev/hda`),没有持久化文件系统(重启后 RAM FS 丢失);无网卡/socket ABI;无 VBE 帧缓冲,桌面仍是 80×25 文本模式(需要 GRUB 或 BIOS VBE 引导阶段)
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);无网卡/socket ABI;无 VBE 帧缓冲,桌面仍是 80×25 文本模式(需要 GRUB 或 BIOS VBE 引导阶段)
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
-6. RAM FS 无持久化;有 16 级目录槽但路径/名称上限 64 字符;时间戳仅存于 RAM FS,重启丢失;write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
+6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
 8. 桌面仍是 80×25 文本模式,无图形帧缓冲、字体渲染与动画;窗口内容除 Calculator 外主要是状态展示
 9. 单处理器(PIC,非 APIC);用户进程由 IRQ0 抢占,内核 shell 本身仍在启动栈上协作运行

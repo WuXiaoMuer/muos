@@ -70,6 +70,61 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "fsata")) {
+        /* Persistent file through the VFS: create/write/fsync, read back,
+         * then verify after a reboot with `run fsread`. */
+        int ok = 1;
+        const char msg[] = "PERSIST-FILE";
+        int len = (int)sizeof(msg) - 1;
+        int fd = muos_open("persist.txt",
+                           MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        muos_puts("fsata: create="); muos_putdec(fd); muos_puts("\n");
+        ok = ok && fd >= 0;
+        if (fd >= 0) {
+            int n = muos_write(fd, msg, len);
+            muos_puts("fsata: write="); muos_putdec(n); muos_puts("\n");
+            ok = ok && n == len;
+            int rc = muos_fsync(fd);
+            muos_puts("fsata: fsync="); muos_putdec(rc); muos_puts("\n");
+            ok = ok && rc == 0;
+            muos_close(fd);
+        }
+        fd = muos_open("persist.txt", 0);
+        char rb[16];
+        int rn = -1;
+        if (fd >= 0) {
+            rn = muos_read(fd, rb, len);
+            muos_close(fd);
+        }
+        int same = (rn == len) ? 1 : 0;
+        for (int i = 0; same && i < len; i++) if (rb[i] != msg[i]) same = 0;
+        muos_puts("fsata: readback="); muos_putdec(rn);
+        muos_puts(same ? " data-ok\n" : " data-bad\n");
+        ok = ok && same;
+        muos_puts(ok ? "FS-PERSIST-OK\n" : "FS-PERSIST-BAD\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "fsread")) {
+        /* Second boot: the file created by `run fsata` must still exist. */
+        int ok = 1;
+        const char want[] = "PERSIST-FILE";
+        int len = (int)sizeof(want) - 1;
+        char buf[16];
+        int fd = muos_open("persist.txt", 0);
+        muos_puts("fsread: open="); muos_putdec(fd); muos_puts("\n");
+        ok = ok && fd >= 0;
+        if (fd >= 0) {
+            int n = muos_read(fd, buf, len);
+            muos_puts("fsread: read="); muos_putdec(n); muos_puts("\n");
+            ok = ok && n == len;
+            for (int i = 0; ok && i < len; i++) if (buf[i] != want[i]) ok = 0;
+            muos_close(fd);
+        }
+        muos_puts(ok ? "FS-PERSIST-OK\n" : "FS-PERSIST-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "ata")) {
         /* Raw ATA sectors through /dev/hda: write a marker through the
          * block device, read it back, then verify after a reboot. */

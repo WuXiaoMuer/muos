@@ -131,12 +131,20 @@ static void cmd_help(void){
     vga_print("  version gui win7 desktop test reboot halt crash\n");
 }
 static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
+static void slog_u32(uint32_t v);
 static void cmd_disk(void){
     if(!ata_present()){ vga_print("No ATA disk on the primary bus\n"); return; }
     vga_print(" /dev/hda: ");
     vga_print(ata_model());
     vga_print("\n  sectors="); vga_print_dec(ata_sector_count());
     vga_print(" ("); vga_print_dec(ata_sector_count()/2); vga_print(" KB)\n");
+    if(fs_persist_active()){
+        vga_print("  MuFS mounted, generation=");
+        vga_print_dec(fs_persist_generation()); vga_putchar('\n');
+        serial_write("[disk] MuFS gen=");
+        slog_u32(fs_persist_generation());
+        serial_write("\n");
+    }
     serial_write("[disk] "); serial_write(ata_model()); serial_write("\n");
 }
 static void cmd_run(char**a,int n){
@@ -342,18 +350,26 @@ static void execute(void){
 void shell_run(void){
     serial_write("[shell] ready\n");
     fs_init();
-    fs_create("readme.txt");
-    fs_write(fs_open("readme.txt"), "Welcome to MuOS 7!\nType 'help' for commands.\nType 'win7' for desktop.", 69);
-    fs_create("notes.txt");
-    fs_write(fs_open("notes.txt"), "MuOS 7 - x86 Microkernel\nBuilt with GCC 15 + NASM", 49);
+    fs_persist_mount();          /* MuFS on /dev/hda; no-op without a disk */
+
+    /* Seed the demo files only on a fresh namespace so that edits made on
+     * a persistent MuFS survive the next boot. */
+    if (fs_count() == 0) {
+        fs_create("readme.txt");
+        fs_write(fs_open("readme.txt"), "Welcome to MuOS 7!\nType 'help' for commands.\nType 'win7' for desktop.", 69);
+        fs_create("notes.txt");
+        fs_write(fs_open("notes.txt"), "MuOS 7 - x86 Microkernel\nBuilt with GCC 15 + NASM", 49);
+    }
 
     /* Seed the RAM FS with the embedded Ring3 ELF so `exec hello.elf`
-     * proves the loader also works on a filesystem image. */
+     * proves the loader also works on a filesystem image. Always refresh
+     * it so a persisted stale binary can never shadow the current one. */
     uint32_t elf_size = 0;
     const void* elf = user_get_image(&elf_size);
-    int elf_fd = fs_create("hello.elf");
-    if (elf_fd >= 0 && elf_size > 0) {
-        fs_write(elf_fd, (const char*)elf, elf_size);
+    int elf_slot = fs_open("hello.elf");
+    if (elf_slot < 0) elf_slot = fs_create("hello.elf");
+    if (elf_slot >= 0 && elf_size > 0) {
+        fs_write(elf_slot, (const char*)elf, elf_size);
     }
 
     vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));

@@ -8,7 +8,7 @@
 - **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,在 0x08048000 起的 8MB 用户窗口内运行 C 程序;每个进程有独立 8MB 物理块与页目录(CR3 切换),100Hz 抢占轮转;ELF 可来自内核内嵌(`run`)、RAM FS(`exec hello.elf`)或 Multiboot 模块;支持 ET_EXEC 与 ET_DYN(PIE,`run pie`);用户态故障只杀进程,不 panic 内核
 - **进程与信号**:`fork/execve/wait4/waitid`、`clone` 线程(`CLONE_VM/FILES/THREAD/SETTLS`,共享地址空间)、信号 pending/blocked 掩码与 `signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline、默认终止动作、`alarm`;阻塞 `wait4/waitid/poll/read` 在管道/键盘/定时器事件上唤醒
 - **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;多级 RAM FS(`mkdir/rmdir`、子目录路径解析)与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块;`/dev/hda` 提供 ATA PIO 块设备(跨启动持久化)
-- **ATA 磁盘**:primary master PIO / 28-bit LBA,`/dev/hda` 字节级读写(部分扇区读改写);`build/test_ata.py` 两次启动验证 `PERSIST-DATA` 仍可读回(尚无磁盘文件系统)
+- **ATA 磁盘 + MuFS**:primary master PIO / 28-bit LBA,`/dev/hda` 字节级读写(部分扇区读改写);扇区 0 超级块、元数据表、16×64KB 数据槽,所有文件变更写穿、`fsync/sync` 全量刷新、开机自动挂载(无盘时退回纯 RAM FS);`build/test_ata.py` 两次启动验证文件内容与裸扇区数据都保留
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
@@ -122,8 +122,9 @@ muos> run sig             # 信号:handler+sigreturn、阻塞掩码、SIGTERM/SI
 muos> run thread          # clone(CLONE_VM) 两个线程共享全局变量,waitpid 回收
 muos> run blkpoll         # 真阻塞 poll:子进程写管道唤醒 / PIT 超时唤醒
 muos> run pie             # ET_DYN(PIE) 镜像:内核 bias + R_386_RELATIVE 重定位
+muos> run fsata           # MuFS 持久文件:创建/写/fsync/回读(重启后 run fsread)
 muos> run ata             # /dev/hda 写入并回读 PERSIST-DATA
-muos> disk                # ATA 型号与扇区数
+muos> disk                # ATA 型号、扇区数与 MuFS generation
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```
 
@@ -196,7 +197,8 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 - BusyBox 静态包约 1MB,OS 模块只接受外部 `-initrd`,不放进 64KB RAM FS。
 - RAM FS 已支持多级目录(`mkdir/rmdir`、`mkdir -p`、跨目录 `cp/mv`),虚拟 `/dev`、`/proc`、`/etc`、`/bin` 只读;`*at` 族支持 dirfd 相对路径,目录 `rename` 整棵子树改名。进程是**每进程地址空间 + 抢占并发**:fork 复制 8MB 物理块,子进程立即运行;`clone(CLONE_VM)` 支持线程,`kill` 真实投递信号(含 SIGTERM/SIGKILL 默认终止)。
 - BusyBox shell 已能通过虚拟 `/bin/<applet>` → BusyBox 模块执行外部 applet,并跑通管道:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`(管道读端为空时会阻塞,直到写端写入或关闭)。`pipe/pipe2` 是 8 个 4KB 环形缓冲,管道写满会截断返回部分写入。
-- 时间戳来自 CMOS RTC 并保存在 RAM FS 内,重启后随 RAM FS 一起丢失;`date`/`ls -l`/`stat` 显示真实时间,`touch`/`utimensat` 会实际修改 atime/mtime。
+- 时间戳来自 CMOS RTC。无磁盘时文件系统是纯 RAM(重启丢失);带 `-drive` 时 MuFS 把命名空间与文件数据写到盘上,`date`/`ls -l`/`stat` 显示真实时间,`touch`/`utimensat` 会实际修改 atime/mtime 并持久化。
+- MuFS 布局:扇区 0 超级块(`MUFS` 魔数 + 版本 + generation),扇区 2–8 文件/目录元数据表,扇区 16 起每槽 128 扇区(64KB)。每次 `create/write/truncate/delete/rename/mkdir` 都写穿元数据表,数据只写涉及的扇区;`fsync(118)/sync(36)` 触发全量刷新。磁盘首次使用时自动格式化。
 - 首次运行会分配 257 页连续内存做模块副本;256MB 内存下正常。
 
 ## 自检套件
@@ -260,7 +262,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 88 项)。
 
-**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)**。下一步:持久化文件系统、网卡/socket ABI、VBE 帧缓冲、完整动态链接器(见 ROADMAP P4/P3 剩余项)。
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)** → **MuFS 持久化文件系统(ATA 写穿 + 开机挂载)**。下一步:网卡/socket ABI、VBE 帧缓冲、完整动态链接器(见 ROADMAP P4/P3 剩余项)。
 
 ## 参考资源
 

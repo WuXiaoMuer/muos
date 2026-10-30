@@ -69,4 +69,13 @@ void        fs_set_times(int fd, uint32_t atime, uint32_t mtime);
 int         fs_read_at(int fd, uint32_t offset, char* buf, uint32_t len);
 int         fs_write_at(int fd, uint32_t offset, const char* data, uint32_t len);
 
+/* ---- MuFS on ATA (persistent backing store) ----
+ * Boot-time mount reads the namespace + file data from /dev/hda; every
+ * mutation is written through (metadata tables + affected data sectors).
+ * Without a disk the RAM FS behaves exactly as before. */
+void    fs_persist_mount(void);      /* mount, or format an empty image */
+int     fs_sync(void);               /* flush everything to disk */
+bool_t  fs_persist_active(void);
+uint32_t fs_persist_generation(void);
+
 #endif

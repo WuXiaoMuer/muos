@@ -1,9 +1,15 @@
 #include "fs.h"
 #include "string.h"
 #include "rtc.h"
+#include "ata.h"
 
 static fs_file_t files[FS_MAX_FILES];
 static fs_dir_t  dirs[FS_MAX_DIRS];
+
+/* MuFS write-through helpers (defined at the bottom of this file). */
+static void persist_meta(void);
+static void persist_slot(int i);
+static void persist_slot_range(int i, uint32_t offset, uint32_t len);
 
 static bool_t has_slash(const char* s) {
     for (; *s; s++) if (*s == '/') return true;
@@ -96,6 +102,8 @@ int fs_create(const char* path) {
             files[i].deleted = 0;
             files[i].refs = 0;
             files[i].atime = files[i].mtime = files[i].ctime = rtc_now();
+            persist_meta();
+            persist_slot(i);
             return i;
         }
     }
@@ -114,6 +122,7 @@ int fs_mkdir(const char* path) {
             strncpy(dirs[i].name, path, FS_MAX_NAME - 1);
             dirs[i].name[FS_MAX_NAME - 1] = '\0';
             dirs[i].used = 1;
+            persist_meta();
             return 0;
         }
     }
@@ -142,6 +151,7 @@ int fs_rmdir(const char* path) {
         if (dirs[i].used && strcmp(dirs[i].name, path) == 0) {
             dirs[i].used = 0;
             dirs[i].name[0] = '\0';
+            persist_meta();
             return 0;
         }
     }
@@ -213,6 +223,8 @@ int fs_write(int fd, const char* data, uint32_t len) {
     memcpy(files[fd].data, data, len);
     files[fd].size = len;
     files[fd].mtime = files[fd].ctime = rtc_now();
+    persist_meta();
+    persist_slot(fd);
     return (int)len;
 }
 
@@ -238,6 +250,7 @@ int fs_delete(const char* name) {
                 files[i].deleted = 0;
                 files[i].atime = files[i].mtime = files[i].ctime = 0;
             }
+            persist_meta();
             return 0;
         }
     }
@@ -266,6 +279,7 @@ int fs_unref(int slot) {
         files[slot].size = 0;
         files[slot].deleted = 0;
         files[slot].atime = files[slot].mtime = files[slot].ctime = 0;
+        persist_meta();
     }
     return 0;
 }
@@ -285,6 +299,7 @@ int fs_rename(int slot, const char* new_name) {
     strncpy(files[slot].name, new_name, FS_MAX_NAME - 1);
     files[slot].name[FS_MAX_NAME - 1] = '\0';
     files[slot].ctime = rtc_now();
+    persist_meta();
     return 0;
 }
 
@@ -349,6 +364,7 @@ int fs_rename_dir(const char* old_path, const char* new_path) {
         memcpy(files[i].name, tmp, nl + rest + 1);
         files[i].ctime = rtc_now();
     }
+    persist_meta();
     return 0;
 }
 
@@ -405,6 +421,8 @@ int fs_fd_truncate(int fd) {
     if (fd < 0 || fd >= FS_MAX_FILES || !files[fd].used) return -1;
     files[fd].size = 0;
     files[fd].mtime = files[fd].ctime = rtc_now();
+    persist_meta();
+    persist_slot(fd);
     return 0;
 }
 
@@ -418,6 +436,8 @@ int fs_truncate(int fd, uint32_t len) {
         memset(files[fd].data + files[fd].size, 0, len - files[fd].size);
     files[fd].size = len;
     files[fd].mtime = files[fd].ctime = rtc_now();
+    persist_meta();
+    persist_slot(fd);
     return 0;
 }
 
@@ -441,6 +461,7 @@ void fs_set_times(int fd, uint32_t atime, uint32_t mtime) {
     files[fd].atime = atime;
     files[fd].mtime = mtime;
     files[fd].ctime = rtc_now();
+    persist_meta();
 }
 
 int fs_read_at(int fd, uint32_t offset, char* buf, uint32_t len) {
@@ -460,5 +481,183 @@ int fs_write_at(int fd, uint32_t offset, const char* data, uint32_t len) {
     if (len) memcpy(files[fd].data + offset, data, len);
     if (offset + len > files[fd].size) files[fd].size = offset + len;
     files[fd].mtime = files[fd].ctime = rtc_now();
+    persist_meta();
+    persist_slot_range(fd, offset, len);
     return (int)len;
 }
+
+/* ===================== MuFS persistence on ATA =====================
+ * On-disk layout (512-byte sectors):
+ *   0      superblock (magic/version/generation)
+ *   2..5   file metadata table (16 × 88 bytes)
+ *   6..8   directory metadata table (16 × 68 bytes)
+ *   16..   data area, slot i = 64KB at LBA 16 + i*128
+ * Mutations write metadata through immediately and, for data, only the
+ * touched sector range. `fs_sync()` rewrites the whole image. */
+
+#define MUFS_MAGIC        "MUFS"
+#define MUFS_VERSION      1u
+#define MUFS_SB_LBA       0
+#define MUFS_META_LBA     2
+#define MUFS_DIR_LBA      6
+#define MUFS_DATA_LBA     16
+#define MUFS_SLOT_SECTORS 128          /* 64KB per file slot */
+
+typedef struct {
+    char     magic[4];
+    uint32_t version;
+    uint32_t slot_sectors;
+    uint32_t file_slots;
+    uint32_t dir_slots;
+    uint32_t generation;
+    uint32_t reserved[7];
+} __attribute__((packed)) mufs_sb_t;
+
+typedef struct {
+    char     name[FS_MAX_NAME];
+    uint32_t size;
+    uint32_t used;
+    uint32_t deleted;
+    uint32_t atime;
+    uint32_t mtime;
+    uint32_t ctime;
+} __attribute__((packed)) mufs_file_meta_t;
+
+typedef struct {
+    char     name[FS_MAX_NAME];
+    uint32_t used;
+} __attribute__((packed)) mufs_dir_meta_t;
+
+static bool_t persist_active = false;
+static uint32_t persist_gen = 0;
+static mufs_file_meta_t meta_buf[FS_MAX_FILES];
+static mufs_dir_meta_t  dmeta_buf[FS_MAX_DIRS];
+
+static uint32_t slot_lba(int i) {
+    return MUFS_DATA_LBA + (uint32_t)i * MUFS_SLOT_SECTORS;
+}
+
+/* Rewrite the two metadata tables (3 + 3 sectors). */
+static void persist_meta(void) {
+    if (!persist_active) return;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        memcpy(meta_buf[i].name, files[i].name, FS_MAX_NAME);
+        meta_buf[i].size = files[i].size;
+        meta_buf[i].used = files[i].used;
+        meta_buf[i].deleted = files[i].deleted;
+        meta_buf[i].atime = files[i].atime;
+        meta_buf[i].mtime = files[i].mtime;
+        meta_buf[i].ctime = files[i].ctime;
+    }
+    ata_write_bytes(MUFS_META_LBA * 512, meta_buf, (uint32_t)sizeof(meta_buf));
+
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        memcpy(dmeta_buf[i].name, dirs[i].name, FS_MAX_NAME);
+        dmeta_buf[i].used = dirs[i].used;
+    }
+    ata_write_bytes(MUFS_DIR_LBA * 512, dmeta_buf, (uint32_t)sizeof(dmeta_buf));
+}
+
+/* Write the whole file body of one slot (size rounded to sectors). */
+static void persist_slot(int i) {
+    if (!persist_active || i < 0 || i >= FS_MAX_FILES) return;
+    uint32_t n = (files[i].size + 511u) & ~511u;
+    if (n == 0) return;
+    ata_write_bytes(slot_lba(i) * 512, files[i].data, n);
+}
+
+/* Write only the sectors touched by one write_at. */
+static void persist_slot_range(int i, uint32_t offset, uint32_t len) {
+    if (!persist_active || i < 0 || i >= FS_MAX_FILES || len == 0) return;
+    uint32_t first = offset & ~511u;
+    uint32_t end = (offset + len + 511u) & ~511u;
+    if (end > FS_MAX_SIZE) end = FS_MAX_SIZE;
+    if (end <= first) return;
+    ata_write_bytes(slot_lba(i) * 512 + first, files[i].data + first, end - first);
+}
+
+void fs_persist_mount(void) {
+    persist_active = false;
+    persist_gen = 0;
+    if (!ata_present()) return;
+
+    mufs_sb_t sb;
+    if (ata_read_bytes(MUFS_SB_LBA * 512, &sb, sizeof(sb)) == (int)sizeof(sb) &&
+        memcmp(sb.magic, MUFS_MAGIC, 4) == 0 &&
+        sb.version == MUFS_VERSION &&
+        sb.slot_sectors == MUFS_SLOT_SECTORS &&
+        sb.file_slots == FS_MAX_FILES && sb.dir_slots == FS_MAX_DIRS) {
+        if (ata_read_bytes(MUFS_META_LBA * 512, meta_buf,
+                           (uint32_t)sizeof(meta_buf)) != (int)sizeof(meta_buf))
+            return;
+        if (ata_read_bytes(MUFS_DIR_LBA * 512, dmeta_buf,
+                           (uint32_t)sizeof(dmeta_buf)) != (int)sizeof(dmeta_buf))
+            return;
+
+        for (int i = 0; i < FS_MAX_FILES; i++) {
+            memcpy(files[i].name, meta_buf[i].name, FS_MAX_NAME);
+            files[i].name[FS_MAX_NAME - 1] = '\0';
+            files[i].used = meta_buf[i].used;
+            files[i].deleted = meta_buf[i].deleted;
+            files[i].refs = 0;
+            files[i].size = meta_buf[i].size;
+            if (files[i].size > FS_MAX_SIZE) files[i].size = FS_MAX_SIZE;
+            files[i].atime = meta_buf[i].atime;
+            files[i].mtime = meta_buf[i].mtime;
+            files[i].ctime = meta_buf[i].ctime;
+            if (files[i].used && files[i].size) {
+                ata_read_bytes(slot_lba(i) * 512, files[i].data, files[i].size);
+            }
+        }
+        for (int i = 0; i < FS_MAX_DIRS; i++) {
+            memcpy(dirs[i].name, dmeta_buf[i].name, FS_MAX_NAME);
+            dirs[i].name[FS_MAX_NAME - 1] = '\0';
+            dirs[i].used = dmeta_buf[i].used;
+        }
+        persist_gen = sb.generation;
+        persist_active = true;
+        return;
+    }
+
+    /* No valid image: format an empty namespace. */
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        memset(&files[i], 0, sizeof(files[i]));
+        memset(&meta_buf[i], 0, sizeof(meta_buf[i]));
+    }
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        memset(&dirs[i], 0, sizeof(dirs[i]));
+        memset(&dmeta_buf[i], 0, sizeof(dmeta_buf[i]));
+    }
+    memset(&sb, 0, sizeof(sb));
+    memcpy(sb.magic, MUFS_MAGIC, 4);
+    sb.version = MUFS_VERSION;
+    sb.slot_sectors = MUFS_SLOT_SECTORS;
+    sb.file_slots = FS_MAX_FILES;
+    sb.dir_slots = FS_MAX_DIRS;
+    sb.generation = 1;
+    persist_gen = 1;
+    persist_active = true;
+    ata_write_bytes(MUFS_SB_LBA * 512, &sb, sizeof(sb));
+    persist_meta();
+}
+
+int fs_sync(void) {
+    if (!persist_active) return 0;
+
+    persist_gen++;
+    mufs_sb_t sb;
+    memset(&sb, 0, sizeof(sb));
+    memcpy(sb.magic, MUFS_MAGIC, 4);
+    sb.version = MUFS_VERSION;
+    sb.slot_sectors = MUFS_SLOT_SECTORS;
+    sb.file_slots = FS_MAX_FILES;
+    sb.dir_slots = FS_MAX_DIRS;
+    sb.generation = persist_gen;
+    ata_write_bytes(MUFS_SB_LBA * 512, &sb, sizeof(sb));
+    persist_meta();
+    for (int i = 0; i < FS_MAX_FILES; i++) persist_slot(i);
+    return 0;
+}
+
+bool_t fs_persist_active(void) { return persist_active; }
+uint32_t fs_persist_generation(void) { return persist_gen; }

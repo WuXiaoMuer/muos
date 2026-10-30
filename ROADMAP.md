@@ -18,7 +18,8 @@
 - 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
-- 仍有限制:无完整动态链接器(仅支持静态 PIE + 重定位,PT_INTERP 只检测并拒绝);磁盘只到块设备层,无持久化文件系统;无网卡/socket ABI;无帧缓冲图形。
+- 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`build/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
+- 仍有限制:无完整动态链接器(仅支持静态 PIE + 重定位,PT_INTERP 只检测并拒绝);无网卡/socket ABI;无帧缓冲图形。
 
 ## 后续计划(建议顺序)
 
@@ -45,7 +46,7 @@
 
 ### P4 平台外设
 - [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`build/test_ata.py` 两次启动验证持久化
-- [ ] 在块设备上建立持久化文件系统(MuFS:超级块 + 文件表 + 目录),当前 RAM FS 重启即失
+- [x] 持久化文件系统 MuFS:扇区 0 超级块、扇区 2–8 文件/目录元数据表、扇区 16 起 16×64KB 数据槽;每次变更写穿(元数据表 + 涉及扇区),`fsync/sync` 全量刷新,开机 `fs_persist_mount` 挂载或首次格式化;`run fsata` → 重启 `run fsread` 验证
 - [ ] 网络(NE2000/RTL8139)+ ARP/IP/UDP + socket ABI
 - [ ] 图形帧缓冲:当前 multiboot `-kernel` 与自研 ISO 引导均未设置 VBE 线性帧缓冲,需引入 GRUB/VBE 引导阶段或 BIOS 模式切换
 
@@ -148,7 +149,7 @@
 - [ ] fs 截断告警(fs_write 返回实际写入量,调用方检查)
 - [ ] 内核堆 Grow(耗尽时向 vmm 要新页)
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
-- [ ] 持久化文件系统(挂在 `/dev/hda` 上)、网卡与 socket ABI、VBE 帧缓冲(见 P4 说明)
+- [ ] 网卡与 socket ABI、VBE 帧缓冲(见 P4 说明);MuFS 仍是整槽布局,无块分配位图/碎片整理
 - [ ] 完整动态链接器:共享库装载/符号解析/`DT_NEEDED`;当前只有静态 PIE + 自身重定位
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)
