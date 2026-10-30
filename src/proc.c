@@ -113,6 +113,7 @@ bool_t proc_fdstate_alloc(proc_t* p) {
 void proc_reap(proc_t* p) {
     if (!p || !p->used) return;
     proc_snapshot_free(p);
+    if (p->fds_retained && p->fd_state) user_fd_state_release(p->fd_state);
     if (p->fd_state) kfree(p->fd_state);
     if (p->kstack) mm_free_pages(p->kstack, kernel_stack_pages());
     if (current_proc == p) current_proc = proc_find(1);

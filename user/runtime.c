@@ -220,6 +220,10 @@ unsigned muos_times(void* out) {
     return (unsigned)syscall1(43, (int)out);
 }
 
+int muos_waitid(int idtype, int id, void* infop, int options) {
+    return syscall4(284, idtype, id, (int)infop, options);
+}
+
 int muos_munmap(unsigned addr, unsigned len) {
     return syscall2(91, (int)addr, (int)len);
 }

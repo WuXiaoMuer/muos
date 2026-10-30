@@ -37,6 +37,7 @@ typedef struct {
 
     /* Saved user-process state */
     void*    fd_state;
+    bool_t   fds_retained;   /* fd_state counts file/pipe references */
     char     cwd[USER_FD_PATH_MAX];
     uint32_t brk_base, brk_cur;
     uint32_t tls_base, tls_limit, tls_flags;   /* GDT slot 6 per process */

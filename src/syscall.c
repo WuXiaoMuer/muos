@@ -62,6 +62,10 @@
 #define SYS_getgroups 80
 #define SYS_gettimeofday 78
 #define SYS_wait4    114
+#define SYS_waitid   284
+#define SIGCHLD       17
+#define CLD_EXITED     1
+#define WNOHANG        1
 #define SYS_clone    120
 #define SYS_sigaltstack 186
 #define SYS_stat     106
@@ -185,6 +189,7 @@
 #define ERR_ECHILD    10
 #define ERR_EAGAIN    11
 #define ERR_EACCES    13
+#define ERR_EBUSY     16
 #define ERR_EEXIST    17
 #define ERR_ENOMEM    12
 #define ERR_EFAULT    14
@@ -718,14 +723,35 @@ static uint32_t vfs_vfile_text(int id, uint32_t pid, char* out, uint32_t max) {
             break;
         }
         case VFS_VF_STAT: {
-            pos = sb_add(out, pos, max,
-                         "cpu  0 0 0 0 0 0 0 0 0 0\n"
-                         "intr 0\nctxt 0\nbtime ");
-            pos = sb_dec(out, pos, max, rtc_now());
+            uint32_t ticks = pit_get_ticks();
+            uint32_t user_t = ticks / 4;
+            uint32_t sys_t = ticks / 4;
+            uint32_t idle_t = ticks - user_t - sys_t;
+            uint32_t running = 0;
+            int n = proc_count();
+            for (int i = 0; i < n; i++) {
+                proc_t* p = proc_get_index(i);
+                if (p && (p->state == PROC_RUNNING || p->state == PROC_READY))
+                    running++;
+            }
+            for (int line = 0; line < 2; line++) {
+                pos = sb_add(out, pos, max, line ? "cpu0 " : "cpu  ");
+                pos = sb_dec(out, pos, max, user_t);
+                pos = sb_add(out, pos, max, " 0 ");
+                pos = sb_dec(out, pos, max, sys_t);
+                pos = sb_add(out, pos, max, " ");
+                pos = sb_dec(out, pos, max, idle_t);
+                pos = sb_add(out, pos, max, " 0 0 0 0 0 0\n");
+            }
+            pos = sb_add(out, pos, max, "intr ");
+            pos = sb_dec(out, pos, max, ticks);
+            pos = sb_add(out, pos, max, "\nctxt 0\nbtime ");
+            pos = sb_dec(out, pos, max, rtc_now() - ticks / 100);
             pos = sb_add(out, pos, max, "\nprocesses ");
             pos = sb_dec(out, pos, max, (uint32_t)proc_count());
-            pos = sb_add(out, pos, max,
-                         "\nprocs_running 1\nprocs_blocked 0\n");
+            pos = sb_add(out, pos, max, "\nprocs_running ");
+            pos = sb_dec(out, pos, max, running);
+            pos = sb_add(out, pos, max, "\nprocs_blocked 0\n");
             break;
         }
         case VFS_VF_MAPS:
@@ -1216,7 +1242,7 @@ static uint32_t do_statx(uint32_t dirfd, uint32_t path_ptr, uint32_t buf) {
 /* ---- statfs / sysinfo (enough for df and free) ---- */
 
 static uint32_t fs_free_slots(void) {
-    int used = fs_count();
+    int used = fs_used_slots();   /* unlinked-but-open slots are not free */
     return used >= 0 && used < FS_MAX_FILES ? (uint32_t)(FS_MAX_FILES - used) : 0;
 }
 
@@ -1670,20 +1696,33 @@ static uint32_t do_rename_bufs(const char* obuf, const char* nbuf) {
     vfs_ent_t oe, ne;
     uint32_t rc = vfs_lookup(obuf, &oe);
     if ((int32_t)rc < 0) return rc;
-    if (oe.type == VFS_T_DIR) return err(ERR_EISDIR);
-    if (oe.type != VFS_T_FILE) return err(ERR_EPERM);
+    if (oe.type != VFS_T_FILE && oe.type != VFS_T_DIR) return err(ERR_EPERM);
+    if (oe.type == VFS_T_DIR && oe.id != VFS_DIR_REAL) return err(ERR_EPERM);
 
-    rc = vfs_lookup(nbuf, &ne);
-    if ((int32_t)rc < 0 && (uint32_t)(-(int32_t)rc) != ERR_ENOENT) return rc;
-    if ((int32_t)rc == 0) {
+    uint32_t nrc = vfs_lookup(nbuf, &ne);
+    if ((int32_t)nrc < 0 && (uint32_t)(-(int32_t)nrc) != ERR_ENOENT) return nrc;
+
+    const char* oname = oe.path + 1;
+    const char* nname = ne.path + 1;   /* normalized for ENOENT too */
+    if (!*nname) return err(ERR_EBUSY);
+
+    if (oe.type == VFS_T_DIR) {
+        if ((int32_t)nrc == 0) {
+            if (ne.type != VFS_T_DIR || ne.id != VFS_DIR_REAL)
+                return err(ERR_ENOTDIR);
+            if (!fs_dir_is_empty(ne.path + 1)) return err(ERR_ENOTEMPTY);
+            if (fs_rmdir(ne.path + 1) != 0) return err(ERR_EINVAL);
+        }
+        return fs_rename_dir(oname, nname) == 0 ? 0 : err(ERR_EINVAL);
+    }
+
+    if ((int32_t)nrc == 0) {
         if (ne.type == VFS_T_DIR) return err(ERR_EISDIR);
         if (ne.type != VFS_T_FILE) return err(ERR_EPERM);
         if (ne.slot == oe.slot) return 0;    /* same file already */
         fs_delete(ne.path + 1);              /* rename replaces the target */
     }
 
-    const char* nname = ne.path + 1;
-    if (!*nname) return err(ERR_ENOTDIR);
     if (strlen(nname) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
     if (!fs_parent_is_dir(nname)) return err(ERR_ENOTDIR);
     if (fs_is_dir(nname)) return err(ERR_EISDIR);
@@ -1910,7 +1949,9 @@ static bool_t fd_read_ready(int fd) {
             return true;
         case USER_FD_PIPE_READ: {
             int id = user_fd_pipe_id(fd);
-            return (id >= 0 && pipe_fill(id) > 0) ? true : false;
+            /* A pipe with no writers is at EOF, which is readable. */
+            return (id >= 0 && (pipe_fill(id) > 0 || pipe_writers(id) == 0))
+                   ? true : false;
         }
         default:
             return false;
@@ -1941,11 +1982,7 @@ typedef struct {
     int16_t revents;
 } pollfd_t;
 
-static uint32_t do_poll(uint32_t fds_ptr, uint32_t nfds, uint32_t timeout) {
-    (void)timeout;   /* treated as 0: report readiness without sleeping */
-    if (nfds > SELECT_MAX_FDS) return err(ERR_EINVAL);
-    if (nfds && !user_ptr_ok(fds_ptr, nfds * 8)) return err(ERR_EFAULT);
-
+static uint32_t poll_scan(uint32_t fds_ptr, uint32_t nfds) {
     uint32_t ready = 0;
     for (uint32_t i = 0; i < nfds; i++) {
         pollfd_t p;
@@ -1958,6 +1995,10 @@ static uint32_t do_poll(uint32_t fds_ptr, uint32_t nfds, uint32_t timeout) {
             } else {
                 if ((p.events & POLLIN) && fd_read_ready(p.fd)) rev |= POLLIN;
                 if ((p.events & POLLOUT) && fd_write_ready(p.fd)) rev |= POLLOUT;
+                if (user_fd_kind(p.fd) == USER_FD_PIPE_READ) {
+                    int id = user_fd_pipe_id(p.fd);
+                    if (id >= 0 && pipe_writers(id) == 0) rev |= POLLHUP;
+                }
             }
         }
         p.revents = rev;
@@ -1965,6 +2006,27 @@ static uint32_t do_poll(uint32_t fds_ptr, uint32_t nfds, uint32_t timeout) {
         if (rev) ready++;
     }
     return ready;
+}
+
+/* poll reports readiness immediately; a positive timeout parks the CPU on
+ * `sti; hlt` and re-scans each PIT tick. Negative timeouts return at once
+ * because a scheduler that could wake the process does not exist yet. */
+static uint32_t do_poll(uint32_t fds_ptr, uint32_t nfds, uint32_t timeout) {
+    if (nfds > SELECT_MAX_FDS) return err(ERR_EINVAL);
+    if (nfds && !user_ptr_ok(fds_ptr, nfds * 8)) return err(ERR_EFAULT);
+
+    uint32_t ready = poll_scan(fds_ptr, nfds);
+    if (ready || timeout == 0 || (int32_t)timeout < 0) return ready;
+
+    uint32_t ms = timeout > 0x7FFFFFFFu ? 0x7FFFFFFFu : timeout;
+    uint32_t ticks = (ms + 9u) / 10u;          /* ms -> 100Hz ticks */
+    uint32_t start = pit_get_ticks();
+    while ((uint32_t)(pit_get_ticks() - start) < ticks) {
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+        ready = poll_scan(fds_ptr, nfds);
+        if (ready) return ready;
+    }
+    return 0;
 }
 
 static bool_t fdset_test(uint32_t set_ptr, uint32_t fd) {
@@ -2140,6 +2202,8 @@ static uint32_t do_fork(registers_t* regs) {
     }
     memcpy(child->mem, (void*)USER_BASE, USER_SIZE);
     user_fd_state_save(child->fd_state);
+    user_fd_state_retain(child->fd_state);  /* child snapshot holds its own refs */
+    child->fds_retained = true;
 
     strncpy(child->cwd, user_cwd_get(), USER_FD_PATH_MAX - 1);
     child->cwd[USER_FD_PATH_MAX - 1] = '\0';
@@ -2197,6 +2261,9 @@ static bool_t proc_run_child(proc_t* parent, proc_t* child) {
 
     int code = user_last_exit_code();
     bool_t faulted = user_last_faulted();
+    /* Keep the child's final fd table (opens/closes done while it ran) so
+     * proc_reap releases exactly the refs this snapshot still holds. */
+    user_fd_state_save(child->fd_state);
     child->state = PROC_ZOMBIE;
     child->exit_code = faulted ? 139 : code;
     child->has_ctx = false;
@@ -2237,6 +2304,41 @@ static uint32_t do_wait4(uint32_t pid_arg, uint32_t status_ptr, uint32_t options
         if (options & 1) return 0;                 /* WNOHANG */
         if (!proc_run_child(parent, child)) return err(ERR_ENOMEM);
     }
+}
+
+/* waitid(284): i386 siginfo_t is 128 bytes; SIGCHLD events start with
+ * si_pid at offset 12. The kernel fills the exit case only. */
+static uint32_t do_waitid(uint32_t idtype, uint32_t id, uint32_t infop,
+                          uint32_t options, uint32_t rusage) {
+    (void)rusage;
+    if (!user_ptr_ok(infop, 128)) return err(ERR_EFAULT);
+    memset((void*)infop, 0, 128);
+
+    proc_t* parent = proc_current();
+    if (!parent || parent->pid == 1) return err(ERR_ECHILD);
+
+    /* idtype: 0 = P_ALL, 1 = P_PID, 2 = P_PGID (no pgid filtering). */
+    int32_t want = (idtype == 1) ? (int32_t)id : -1;
+    proc_t* child = find_child(want);
+    if (!child) return err(ERR_ECHILD);
+
+    if (child->state != PROC_ZOMBIE) {
+        if (options & WNOHANG) return 0;
+        if (!child->has_ctx) return err(ERR_ECHILD);
+        if (!proc_run_child(parent, child)) return err(ERR_ENOMEM);
+    }
+
+    uint32_t cpid = child->pid;
+    int code = child->exit_code;
+    char* si = (char*)infop;
+    put_u32(si, 0, SIGCHLD);
+    put_u32(si, 4, 0);                      /* si_errno */
+    put_u32(si, 8, CLD_EXITED);             /* si_code */
+    put_u32(si, 12, cpid);                  /* si_pid */
+    put_u32(si, 16, 0);                     /* si_uid */
+    put_u32(si, 20, (uint32_t)(code & 0xFF));  /* si_status */
+    proc_reap(child);
+    return 0;
 }
 
 static uint32_t do_execve(registers_t* regs, uint32_t path_ptr, uint32_t argv_ptr) {
@@ -2575,6 +2677,10 @@ void syscall_handler(registers_t* regs) {
         case SYS_waitpid:
         case SYS_wait4:
             ret = do_wait4(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_waitid:
+            ret = do_waitid(regs->ebx, regs->ecx, regs->edx,
+                            regs->esi, regs->edi);
             break;
         case SYS_execve:
             ret = do_execve(regs, regs->ebx, regs->ecx);

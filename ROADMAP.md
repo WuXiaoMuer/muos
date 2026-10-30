@@ -21,11 +21,11 @@
 ## 后续计划(建议顺序)
 
 ### P1 收尾 ABI 小缺口(低风险,继续按真实二进制驱动)
-- [ ] 目录 `rename/renameat`(源为目录时整棵子树改名)
-- [ ] fs fd 引用计数(防 `open` 后 unlink 造成悬空槽位)
-- [ ] `waitid(284)`、`clock_nanosleep(407)` 等剩余常用调用
-- [ ] `/proc/stat` 全量 CPU/内存字段,支撑 `vmstat/top`
-- [ ] `poll` 的 `POLLHUP`(pipe 写端全关)与阻塞等待语义
+- [x] 目录 `rename/renameat`(源为目录时整棵子树改名,拒绝移入自身)
+- [x] fs fd 引用计数(`unlink` 后数据保留到最后一个 fd 关闭,`dup/fork` 快照计数)
+- [x] `waitid(284)`(SIGCHLD/CLD_EXITED siginfo,支持 WNOHANG)
+- [x] `/proc/stat` 全量字段(`cpu/cpu0/intr/ctxt/btime/processes/procs_running/blocked`),BusyBox `top -b -n 1` 实测通过
+- [ ] `poll` 的真正阻塞等待(有界超时已用 `sti; hlt` 实现;无限等待需等调度器)
 
 ### P2 进程模型升级(结构性)
 - [ ] 每进程页目录 + higher-half 内核(0xC0000000)

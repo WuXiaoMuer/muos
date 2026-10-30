@@ -12,6 +12,8 @@ typedef struct {
     char   data[FS_MAX_SIZE];
     uint32_t size;
     uint32_t used;    /* 1 = in use */
+    uint32_t deleted; /* unlinked but still open: name cleared, data kept */
+    uint32_t refs;    /* open fd count referencing this slot */
     uint32_t atime;   /* UTC seconds since 1970 */
     uint32_t mtime;
     uint32_t ctime;
@@ -44,7 +46,14 @@ int  fs_read(int fd, char* buf, uint32_t maxlen);
 int  fs_delete(const char* path);
 int  fs_open(const char* path);
 int  fs_rename(int slot, const char* new_name);   /* 0 = ok, -1 = bad/duplicate */
+int  fs_rename_dir(const char* old_path, const char* new_path);
 int  fs_count(void);
+int  fs_used_slots(void);   /* occupied slots, unlinked-but-open included */
+
+/* Open-file lifetime: an unlinked file stays alive until the last fd
+ * releases it, so existing readers/writers never dangle. */
+int  fs_ref(int slot);
+int  fs_unref(int slot);
 const char* fs_name(int idx);
 uint32_t fs_size(int idx);   /* size of the idx-th *existing* file (ls) */
 

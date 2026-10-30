@@ -150,14 +150,14 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 - fd 表在 user.c 统一管理 0..10:启动时 0/1/2 是 `USER_FD_STDIN/STDOUT/STDERR`,其余条目可为 RAM FS 文件、目录、`/dev` 节点、`/proc` 快照或已关闭(FREE)。新 fd 从 3 起分配;`dup(41)` 复制任意条目,`dup2(63)` 可把文件/设备重定向到 0..2(或反向),`dd` 的 `dup2(if_fd,0)` 由此可用。
 - 路径解析 `vfs_normalize`:以进程 cwd(`user_cwd_get/set`,启动时 `/`)为基准处理绝对/相对路径、`.`、`..`(越界停在 `/`),输出规范绝对路径。命名空间:`/` 是 RAM FS(支持多级目录,路径去掉前导 `/` 后存于 fs.c),另有虚拟 `/dev`、`/proc`、`/etc`、`/bin`。
 - `*at` 族共用 `at_resolve_raw`:绝对路径直接透传;`AT_FDCWD(-100)` 保留相对路径交给 `vfs_normalize`;目录 fd 则把 `user_fd_dir_path(fd)` 与相对路径拼成绝对路径(非目录 fd 返回 ENOTDIR,坏 fd 返回 EBADF)。`at_path` 额外拒绝空路径(ENOENT)。`do_fstatat` 单独处理空路径 + `AT_EMPTY_PATH`(stat dirfd),`do_unlinkat` 的 `AT_REMOVEDIR` 转 rmdir;`do_readlinkat` 对已存在目标返回 EINVAL(无符号链接);`fchmodat` 对真实文件/目录返回成功(RAM FS 无 mode 位)。
-- 虚拟文件:`/dev/null` 读 EOF/写丢弃,`/dev/zero` 读零/写丢弃,`/dev/console` 接键盘与 VGA+串口;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/proc/<pid>/{stat,status,comm,cmdline}` 与 `/etc/mtab` 在 `open` 时由内核生成快照存入 fd,`/proc/meminfo` 取 mm 页统计,`uptime` 取 PIT 100Hz;`/proc/<pid>/stat` 输出 Linux 的 52 字段(尾部保留空格),BusyBox `ps` 可解析。
+- 虚拟文件:`/dev/null` 读 EOF/写丢弃,`/dev/zero` 读零/写丢弃,`/dev/console` 接键盘与 VGA+串口;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/proc/<pid>/{stat,status,comm,cmdline}` 与 `/etc/mtab` 在 `open` 时由内核生成快照存入 fd,`/proc/meminfo` 取 mm 页统计,`uptime` 取 PIT 100Hz;`/proc/<pid>/stat` 输出 Linux 的 52 字段(尾部保留空格),BusyBox `ps` 可解析。`/proc/stat` 输出 `cpu`/`cpu0` 十个时间字段(由 PIT tick 近似切分 user/system/idle)、`intr`、`ctxt`、`btime`、`processes`、`procs_running/blocked` 与 `softirq`,`top -b -n 1` 可显示 CPU 利用率。
 - `getdents/getdents64` 按目录 fd 的绝对路径枚举 `.`、`..`、RAM FS 文件以及 `dev/proc/etc` 虚拟子目录,分别按 i386 `linux_dirent`(10 字节头)与 `linux_dirent64`(19 字节头)打包;`d_off` 写下一项序号,缓冲区不足时保留偏移。
 - `stat` 族:`stat64` 写 96 字节 i386 布局,旧 `stat` 写 64 字节布局;目录 `S_IFDIR|0755`/nlink 2,文件 `S_IFREG|0644`,设备 `S_IFCHR|0666`,`/proc` 快照 `S_IFREG|0444`,`st_dev=1`;三类时间来自 RAM FS 的 atime/mtime/ctime。`statx(383)` 写 256 字节 `struct statx`(mask=STATX_BASIC_STATS),空路径且 `AT_EMPTY_PATH` 时改为 stat dirfd。
 - `statfs/fstatfs(99/100)` 与 `statfs64/fstatfs64(268/269)` 按 16×64KB 容量与空闲槽位填充,`df`/`stat -f` 可用;`sysinfo(116)` 回报 uptime/内存/任务数。`/proc/mounts` 输出 `/dev/root / ext2` 等真实设备行,BusyBox `df` 会跳过 `rootfs` 伪设备。
 - `write/read` 按 fd 类型分发:`STDIN`/`DEV_CONSOLE` 读复用 `keyboard_getchar`(内部 `sti; hlt; cli`),`STDOUT/STDERR/DEV_CONSOLE` 写 VGA+串口,`FILE` 走 `fs_read_at/fs_write_at`,`VFILE` 读内核快照、写返回 EACCES,`DEV_NULL/DEV_ZERO` 分别 EOF/零填充与丢弃写入。所有用户缓冲区先用 `user_ptr_ok` 校验。
 - `writev/readv` 按 iovec 顺序复用 `do_write/do_read`,部分成功时返回已处理字节数。musl 的 stdio 缓冲正是用 `writev` 刷出——这是 BusyBox `ls` 能打印的关键。
 - `sendfile64(239)` 从 in_fd(可选用户 offset 指针)读入内核缓冲并写 out_fd,更新偏移;BusyBox 的 fd 拷贝优先用它,失败再退回 read/write。
-- `poll/select` 是**非阻塞就绪检查**:单地址空间顺序模型下睡眠会锁死整机,因此超时按已到期处理。`fd_read_ready`:文件/VFILE/目录/`/dev/null|zero` 恒真,pipe 读端看 `pipe_fill>0`,stdin/console 看 `keyboard_haschar()`;`fd_write_ready`:文件/stdio/console/null/zero 恒真,pipe 写端看缓冲区未满。`poll(168)` 逐项填 `revents`(只回填请求的 `POLLIN/POLLOUT`,坏 fd 给 `POLLNVAL`),`select/_newselect` 按 32 位 fd_set 字就地置位/清零,`pselect6/ppoll` 忽略 sigmask/timespec;`select` 的 nfds 上限 1024,`poll` 的 nfds 上限同为 1024。
+- `poll/select` 是**就绪检查**:`fd_read_ready`:文件/VFILE/目录/`/dev/null|zero` 恒真,pipe 读端看 `pipe_fill>0` 或无写端(EOF),stdin/console 看 `keyboard_haschar()`;`fd_write_ready`:文件/stdio/console/null/zero 恒真,pipe 写端看缓冲区未满。`poll(168)` 逐项填 `revents`(请求的 `POLLIN/POLLOUT`、pipe 无写端时附加 `POLLHUP`、坏 fd 给 `POLLNVAL`);正超时用 `sti; hlt` 每 tick 重扫,负超时立即返回(无调度器可唤醒)。`select/_newselect` 按 32 位 fd_set 字就地置位/清零,`pselect6/ppoll` 忽略 sigmask/timespec;nfds 上限 1024。
 - `mmap` 是沙箱内模拟:匿名取 bump 区,文件映射把 RAM FS/`/proc` 快照按页拷入并零填充,`mmap2` 的 ebp 页号乘 4096,`MAP_FIXED` 校验页对齐与顶部 64KB 栈保留区;映射不写回,`munmap/mprotect` 为空操作。`truncate/ftruncate` 调用 `fs_truncate`(增长零填充、缩小只改 size),64 位变体在 hi 非零时返回 EFBIG;`fsync/fdatasync/sync` 因 RAM FS 已在内核内存中直接成功。
 - `nanosleep` 在无调度器时把秒/纳秒换算成 100Hz PIT tick,用 `sti; hlt; cli` 等待(整机停在该进程,中断仍可唤醒);换算全程 32 位避免 `__udivdi3`。`times(43)` 返回启动以来 tick,`getrusage(77)` 校验 who 后清空 72 字节结构,`chown` 族复用 `do_chmod`/`do_fchmod` 只校验目标存在与类型,`readlink(85)` 对非符号链接返回 EINVAL。
 - `uname` 按 Linux i386 的 6×65 字节 utsname 填充 MuOS/muos/1.2.0/i386;`unlink/rename` 真正修改 RAM FS;`utimes/futimesat/utimensat` 会写入 atime/mtime(支持 `UTIME_NOW/OMIT`),`fs_set_times` 同时刷新 ctime。
@@ -201,7 +201,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 ## 八、Shell / FS / 桌面
 
 - **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault]` 运行内嵌 ELF,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
-- **fs.c**:RAM 文件系统,16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。fd 仍是槽位下标(无句柄/引用保护——`fs_open` 后文件可被删)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
+- **fs.c**:RAM 文件系统,16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。文件槽位带 `refs` 与 `deleted` 标志:unlink 时若仍有 fd 打开则清空名字但保留数据,最后一个 `fs_unref` 才释放槽位;`fs_rename_dir` 整棵子树改名(先校验全部新名字长度、拒绝目标已存在/移入自身)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
 - **win7.c**:文本模式 Win7 风格桌面——行 0 标题、1..23 桌面、24 任务栏;窗口按 z-order 绘制(活动窗口最后),鼠标点击/标题栏拖拽/最小化/最大化/关闭,开始菜单鼠标/键盘双操作,桌面图标可见;任务栏显示实时内存与 CMOS RTC `HH:MM:SS`。`gui`/`win7`/`desktop` 命令共用此实现;`run` 之外的 Text Editor/Calculator 可从菜单或图标启动(Calculator 聚焦时直接吃数字/运算符)。
 - **mouse.c + rtc.c**:PS/2 鼠标初始化(0xA8/命令字节/0xF6/0xF4)与 3 字节包解析(9 位 dx/dy、溢出位、按键),映射为 80×25 文本单元;`rtc_read_time` 处理 UIP、BCD/12 小时制,失败时任务栏回退 `UP:MM`。
@@ -238,7 +238,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 ## 十一、已知局限(真实清单)
 
 1. 用户态是**固定 8MB 单地址空间 + 顺序快照进程模型**:无 higher-half、无每进程页目录、无抢占调度;子进程只在父 `waitpid` 时运行,不是真正并发(ROADMAP 阶段 1 剩余项)
-2. 系统调用仍缺真正并发:`clone` 只支持非线程 fork,`kill` 不投递信号,无抢占调度/线程;`*at` 族、文件 mmap、truncate/fsync、getrlimit/prlimit64 与 poll/select(非阻塞就绪)已实现,仍缺 `/proc/stat` 全量字段与目录 rename(ROADMAP 阶段 2/4)
+2. 系统调用仍缺真正并发:`clone` 只支持非线程 fork,`kill` 不投递信号,无抢占调度/线程;`*at` 族、文件 mmap、truncate/fsync、getrlimit/prlimit64、poll/select(HUP + 有界超时)、`waitid`、目录 rename 与 fd 引用计数已实现,仍缺真正阻塞 poll/select 与完整 `/proc` 统计(ROADMAP 阶段 2/4)
 3. ELF 可从内核内嵌、RAM FS(`exec`)或 Multiboot module(`execmod`)加载;`fork+execve+waitpid`、虚拟 `/bin/*`、`pipe2`、shell 管道与多级 RAM FS 已跑通,但仍无磁盘/网络/图形
 4. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 5. fs 无句柄保护、无持久化;有 16 级目录槽但路径/名称上限 64 字符;时间戳仅存于 RAM FS,重启丢失;write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层

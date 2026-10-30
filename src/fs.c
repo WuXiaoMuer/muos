@@ -13,7 +13,8 @@ static bool_t has_slash(const char* s) {
 static bool_t file_exists(const char* path) {
     if (!*path) return false;
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (files[i].used && strcmp(files[i].name, path) == 0) return true;
+        if (files[i].used && !files[i].deleted &&
+            strcmp(files[i].name, path) == 0) return true;
     }
     return false;
 }
@@ -54,6 +55,8 @@ void fs_init(void) {
         files[i].used = 0;
         files[i].size = 0;
         files[i].name[0] = '\0';
+        files[i].deleted = 0;
+        files[i].refs = 0;
         files[i].atime = files[i].mtime = files[i].ctime = 0;
     }
     for (int i = 0; i < FS_MAX_DIRS; i++) {
@@ -90,6 +93,8 @@ int fs_create(const char* path) {
             files[i].name[FS_MAX_NAME - 1] = '\0';
             files[i].size = 0;
             files[i].used = 1;
+            files[i].deleted = 0;
+            files[i].refs = 0;
             files[i].atime = files[i].mtime = files[i].ctime = rtc_now();
             return i;
         }
@@ -119,7 +124,7 @@ bool_t fs_dir_is_empty(const char* path) {
     if (!dir_exists(path)) return false;
     uint32_t n = strlen(path);
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (!files[i].used) continue;
+        if (!files[i].used || files[i].deleted) continue;
         if (strncmp(files[i].name, path, n) == 0 && files[i].name[n] == '/')
             return false;
     }
@@ -166,7 +171,8 @@ int fs_dir_count(const char* path) {
         if (dirs[i].used && child_name(path, dirs[i].name, &name)) n++;
     }
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (files[i].used && child_name(path, files[i].name, &name)) n++;
+        if (files[i].used && !files[i].deleted &&
+            child_name(path, files[i].name, &name)) n++;
     }
     return n;
 }
@@ -187,7 +193,7 @@ bool_t fs_dir_get(const char* path, int idx, fs_dirent_t* out) {
         }
     }
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (!files[i].used) continue;
+        if (!files[i].used || files[i].deleted) continue;
         if (!child_name(path, files[i].name, &name)) continue;
         if (idx-- == 0) {
             strncpy(out->name, name, FS_MAX_NAME - 1);
@@ -221,11 +227,17 @@ int fs_read(int fd, char* buf, uint32_t maxlen) {
 
 int fs_delete(const char* name) {
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (files[i].used && strcmp(files[i].name, name) == 0) {
-            files[i].used = 0;
-            files[i].size = 0;
+        if (files[i].used && !files[i].deleted && strcmp(files[i].name, name) == 0) {
+            /* Keep the data alive while open fds still point at this slot. */
             files[i].name[0] = '\0';
-            files[i].atime = files[i].mtime = files[i].ctime = 0;
+            files[i].deleted = 1;
+            files[i].ctime = rtc_now();
+            if (files[i].refs == 0) {
+                files[i].used = 0;
+                files[i].size = 0;
+                files[i].deleted = 0;
+                files[i].atime = files[i].mtime = files[i].ctime = 0;
+            }
             return 0;
         }
     }
@@ -234,20 +246,40 @@ int fs_delete(const char* name) {
 
 int fs_open(const char* name) {
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (files[i].used && strcmp(files[i].name, name) == 0)
-            return i;
+        if (files[i].used && !files[i].deleted &&
+            strcmp(files[i].name, name) == 0) return i;
     }
     return -1;
 }
 
-int fs_rename(int slot, const char* new_name) {
+int fs_ref(int slot) {
     if (slot < 0 || slot >= FS_MAX_FILES || !files[slot].used) return -1;
+    files[slot].refs++;
+    return 0;
+}
+
+int fs_unref(int slot) {
+    if (slot < 0 || slot >= FS_MAX_FILES || !files[slot].used) return -1;
+    if (files[slot].refs > 0) files[slot].refs--;
+    if (files[slot].refs == 0 && files[slot].deleted) {
+        files[slot].used = 0;
+        files[slot].size = 0;
+        files[slot].deleted = 0;
+        files[slot].atime = files[slot].mtime = files[slot].ctime = 0;
+    }
+    return 0;
+}
+
+int fs_rename(int slot, const char* new_name) {
+    if (slot < 0 || slot >= FS_MAX_FILES || !files[slot].used ||
+        files[slot].deleted) return -1;
     char parent[FS_MAX_NAME];
     const char* base = NULL;
     if (!split_parent(new_name, parent, &base)) return -1;
     if (!dir_exists(parent) || dir_exists(new_name)) return -1;
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (i != slot && files[i].used && strcmp(files[i].name, new_name) == 0)
+        if (i != slot && files[i].used && !files[i].deleted &&
+            strcmp(files[i].name, new_name) == 0)
             return -1;
     }
     strncpy(files[slot].name, new_name, FS_MAX_NAME - 1);
@@ -256,7 +288,79 @@ int fs_rename(int slot, const char* new_name) {
     return 0;
 }
 
+/* True when name is `prefix` itself or a path below it; *tail is the offset
+ * of the '/' or the terminating NUL. */
+static bool_t name_under(const char* name, const char* prefix, uint32_t plen,
+                         uint32_t* tail) {
+    if (strncmp(name, prefix, plen) != 0) return false;
+    if (name[plen] != '/' && name[plen] != '\0') return false;
+    *tail = plen;
+    return true;
+}
+
+/* Rename a whole directory subtree. The target must not exist and must not
+ * be inside the source; all new names are validated before any mutation. */
+int fs_rename_dir(const char* old_path, const char* new_path) {
+    if (!old_path || !*old_path || !new_path || !*new_path) return -1;
+    if (!dir_exists(old_path)) return -1;
+    uint32_t ol = strlen(old_path);
+    uint32_t nl = strlen(new_path);
+    if (ol >= FS_MAX_NAME || nl >= FS_MAX_NAME) return -1;
+
+    char parent[FS_MAX_NAME];
+    const char* base = NULL;
+    if (!split_parent(new_path, parent, &base)) return -1;
+    if (!dir_exists(parent)) return -1;
+    if (file_exists(new_path) || dir_exists(new_path)) return -1;
+    if (strncmp(new_path, old_path, ol) == 0 &&
+        (new_path[ol] == '/' || new_path[ol] == '\0')) return -1;
+
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (!dirs[i].used) continue;
+        uint32_t tail = 0;
+        if (!name_under(dirs[i].name, old_path, ol, &tail)) continue;
+        if (nl + strlen(dirs[i].name + tail) >= FS_MAX_NAME) return -1;
+    }
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (!files[i].used || files[i].deleted) continue;
+        uint32_t tail = 0;
+        if (!name_under(files[i].name, old_path, ol, &tail)) continue;
+        if (nl + strlen(files[i].name + tail) >= FS_MAX_NAME) return -1;
+    }
+
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (!dirs[i].used) continue;
+        uint32_t tail = 0;
+        if (!name_under(dirs[i].name, old_path, ol, &tail)) continue;
+        char tmp[FS_MAX_NAME];
+        uint32_t rest = strlen(dirs[i].name + tail);
+        memcpy(tmp, new_path, nl);
+        memcpy(tmp + nl, dirs[i].name + tail, rest + 1);
+        memcpy(dirs[i].name, tmp, nl + rest + 1);
+    }
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (!files[i].used || files[i].deleted) continue;
+        uint32_t tail = 0;
+        if (!name_under(files[i].name, old_path, ol, &tail)) continue;
+        char tmp[FS_MAX_NAME];
+        uint32_t rest = strlen(files[i].name + tail);
+        memcpy(tmp, new_path, nl);
+        memcpy(tmp + nl, files[i].name + tail, rest + 1);
+        memcpy(files[i].name, tmp, nl + rest + 1);
+        files[i].ctime = rtc_now();
+    }
+    return 0;
+}
+
 int fs_count(void) {
+    int n = 0;
+    for (int i = 0; i < FS_MAX_FILES; i++)
+        if (files[i].used && !files[i].deleted) n++;
+    return n;
+}
+
+/* Slots actually occupied (including unlinked-but-open files). */
+int fs_used_slots(void) {
     int n = 0;
     for (int i = 0; i < FS_MAX_FILES; i++)
         if (files[i].used) n++;
@@ -266,7 +370,7 @@ int fs_count(void) {
 const char* fs_name(int idx) {
     int count = 0;
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (files[i].used) {
+        if (files[i].used && !files[i].deleted) {
             if (count == idx) return files[i].name;
             count++;
         }
@@ -277,7 +381,7 @@ const char* fs_name(int idx) {
 uint32_t fs_size(int idx) {
     int count = 0;
     for (int i = 0; i < FS_MAX_FILES; i++) {
-        if (files[i].used) {
+        if (files[i].used && !files[i].deleted) {
             if (count == idx) return files[i].size;
             count++;
         }

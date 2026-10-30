@@ -81,6 +81,122 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "p1")) {
+        /* P1 ABI close-out: directory rename, unlink-while-open, pipe HUP,
+         * bounded poll timeout and waitid. */
+        int ok = 1;
+        int rc;
+        char buf[64];
+        unsigned si[32];
+        muos_pollfd_t pf;
+
+        muos_unlinkat(MUOS_AT_FDCWD, "p1new/f.txt", 0);
+        muos_unlinkat(MUOS_AT_FDCWD, "p1old/f.txt", 0);
+        muos_unlinkat(MUOS_AT_FDCWD, "p1new", MUOS_AT_REMOVEDIR);
+        muos_unlinkat(MUOS_AT_FDCWD, "p1old", MUOS_AT_REMOVEDIR);
+        muos_unlinkat(MUOS_AT_FDCWD, "p1file", 0);
+
+        rc = muos_mkdirat(MUOS_AT_FDCWD, "p1old", 0755);
+        ok = ok && rc == 0;
+        int dfd = muos_openat(MUOS_AT_FDCWD, "p1old", MUOS_O_DIRECTORY);
+        int fd = -1;
+        if (dfd >= 0) fd = muos_openat(dfd, "f.txt",
+                                       MUOS_O_CREAT | MUOS_O_WRONLY);
+        if (fd >= 0) {
+            const char msg[] = "DIR-RENAME";
+            muos_write(fd, msg, sizeof(msg) - 1);
+            muos_close(fd);
+        }
+        if (dfd >= 0) muos_close(dfd);
+
+        rc = muos_renameat(MUOS_AT_FDCWD, "p1old", MUOS_AT_FDCWD, "p1new");
+        muos_puts("p1: dir-rename="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        fd = muos_open("/p1new/f.txt", 0);
+        int got = 0;
+        if (fd >= 0) {
+            got = muos_read(fd, buf, sizeof(buf));
+            muos_close(fd);
+        }
+        muos_puts("p1: renamed-content="); muos_putdec(got); muos_puts("\n");
+        ok = ok && got == 10;             /* "DIR-RENAME" */
+        rc = muos_open("/p1old/f.txt", 0);
+        ok = ok && rc == -2;
+        muos_unlinkat(MUOS_AT_FDCWD, "p1new/f.txt", 0);
+        muos_unlinkat(MUOS_AT_FDCWD, "p1new", MUOS_AT_REMOVEDIR);
+
+        /* unlink while an fd is open: the data must stay readable */
+        fd = muos_open("p1file", MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        ok = ok && fd >= 0;
+        if (fd >= 0) {
+            const char msg[] = "OPEN-DATA";
+            muos_write(fd, msg, sizeof(msg) - 1);
+            muos_lseek(fd, 0, 0);
+            rc = muos_unlinkat(MUOS_AT_FDCWD, "p1file", 0);
+            muos_puts("p1: unlink-open="); muos_putdec(rc); muos_puts("\n");
+            ok = ok && rc == 0;
+
+            int n = muos_read(fd, buf, sizeof(buf));
+            int same = 1;
+            for (int i = 0; i < 9; i++) if (buf[i] != msg[i]) same = 0;
+            muos_puts("p1: open-read="); muos_putdec(n);
+            muos_puts(same ? " data-ok\n" : " data-bad\n");
+            ok = ok && n == 9 && same;
+            muos_close(fd);
+        }
+        rc = muos_open("/p1file", 0);
+        ok = ok && rc == -2;
+
+        /* pipe with no writers: POLLHUP and EOF read */
+        int pfds[2] = { -1, -1 };
+        if (muos_pipe(pfds) == 0) {
+            muos_close(pfds[1]);
+            pf.fd = pfds[0]; pf.events = MUOS_POLLIN; pf.revents = 0;
+            rc = muos_poll(&pf, 1, 0);
+            muos_puts("p1: hup="); muos_putdec(rc);
+            muos_puts(" revents="); muos_puthex((unsigned)pf.revents);
+            muos_puts("\n");
+            ok = ok && rc == 1 && (pf.revents & MUOS_POLLHUP);
+            int n = muos_read(pfds[0], buf, sizeof(buf));
+            ok = ok && n == 0;
+            muos_close(pfds[0]);
+        }
+
+        /* bounded poll timeout really waits on the PIT */
+        pfds[0] = pfds[1] = -1;
+        if (muos_pipe(pfds) == 0) {
+            pf.fd = pfds[0]; pf.events = MUOS_POLLIN; pf.revents = 0;
+            unsigned t0 = muos_times(0);
+            rc = muos_poll(&pf, 1, 30);
+            unsigned t1 = muos_times(0);
+            muos_puts("p1: timeout="); muos_putdec(rc);
+            muos_puts(" ticks="); muos_putdec((int)(t1 - t0)); muos_puts("\n");
+            ok = ok && rc == 0 && (t1 - t0) >= 2 && (t1 - t0) <= 8;
+            muos_close(pfds[0]); muos_close(pfds[1]);
+        }
+
+        /* waitid: SIGCHLD siginfo with pid and exit status */
+        int pid = muos_fork();
+        if (pid == 0) {
+            muos_exit(7);
+        } else if (pid > 0) {
+            for (unsigned i = 0; i < 32; i++) si[i] = 0;
+            rc = muos_waitid(1, pid, si, 0);
+            muos_puts("p1: waitid="); muos_putdec(rc);
+            muos_puts(" sig="); muos_putdec((int)si[0]);
+            muos_puts(" pid="); muos_putdec((int)si[3]);
+            muos_puts(" status="); muos_putdec((int)si[5]); muos_puts("\n");
+            ok = ok && rc == 0 && si[0] == 17 && si[2] == 1 &&
+                 si[3] == (unsigned)pid && si[5] == 7;
+        } else {
+            ok = 0;
+        }
+
+        muos_puts(ok ? "P1-API-OK\n" : "P1-API-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "extra")) {
         /* nanosleep, readlink, chown family, getrusage and times. */
         int ok = 1;

@@ -6,6 +6,7 @@ typedef struct {
     uint32_t read_pos;
     uint32_t write_pos;
     uint32_t count;
+    int writers;          /* open write-end descriptors (0 => read side HUP) */
     char buf[PIPE_BUF_SIZE];
 } pipe_t;
 
@@ -33,6 +34,17 @@ bool_t pipe_valid(int id) {
 uint32_t pipe_fill(int id) {
     if (!pipe_valid(id)) return 0;
     return pipes[id].count;
+}
+
+void pipe_writer_add(int id, int delta) {
+    if (!pipe_valid(id)) return;
+    pipes[id].writers += delta;
+    if (pipes[id].writers < 0) pipes[id].writers = 0;
+}
+
+int pipe_writers(int id) {
+    if (!pipe_valid(id)) return 0;
+    return pipes[id].writers;
 }
 
 int pipe_read(int id, char* buf, uint32_t len) {

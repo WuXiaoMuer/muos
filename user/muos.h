@@ -65,6 +65,7 @@ typedef struct {
 
 #define MUOS_POLLIN   0x001
 #define MUOS_POLLOUT  0x004
+#define MUOS_POLLHUP  0x010
 #define MUOS_POLLNVAL 0x020
 
 int muos_poll(muos_pollfd_t* fds, int nfds, int timeout);
@@ -80,6 +81,7 @@ int  muos_fchown(int fd, int uid, int gid);
 int  muos_fchownat(int dirfd, const char* path, int uid, int gid, int flags);
 int  muos_getrusage(int who, void* out /* 72 bytes */);
 unsigned muos_times(void* out /* 16 bytes or 0 */);
+int  muos_waitid(int idtype, int id, void* infop /* 128 bytes */, int options);
 
 void muos_puts(const char* s);
 void muos_putdec(int value);

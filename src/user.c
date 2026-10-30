@@ -6,6 +6,8 @@
 #include "serial.h"
 #include "string.h"
 #include "proc.h"
+#include "fs.h"
+#include "pipe.h"
 
 /* Embedded user image: built by build.ps1 into build/hello.elf and linked
  * into the kernel as a raw binary blob (see the objcopy step). */
@@ -65,8 +67,21 @@ static int fd_alloc_raw(void) {
     return -1;
 }
 
+/* Adjust the shared file/pipe reference counters for one fd entry. Unlinked
+ * files stay alive while any fd (including a forked snapshot) holds a ref. */
+static void fd_entry_ref(int delta, const user_fd_t* e) {
+    if (!e) return;
+    if (e->kind == USER_FD_FILE && e->fs_slot >= 0) {
+        if (delta > 0) fs_ref(e->fs_slot);
+        else           fs_unref(e->fs_slot);
+    } else if (e->kind == USER_FD_PIPE_WRITE) {
+        pipe_writer_add(e->pipe_id, delta);
+    }
+}
+
 void user_fds_reset(void) {
     for (int i = 0; i < USER_FD_MAX; i++) {
+        fd_entry_ref(-1, &user_fds[i]);
         memset(&user_fds[i], 0, sizeof(user_fds[i]));
         user_fds[i].fs_slot = -1;
     }
@@ -81,6 +96,7 @@ int user_fd_alloc(int fs_slot) {
     int fd = fd_alloc_kind(USER_FD_FILE);
     if (fd < 0) return -1;
     user_fds[fd].fs_slot = fs_slot;
+    fs_ref(fs_slot);
     return fd;
 }
 
@@ -112,6 +128,7 @@ int user_fd_alloc_pipe(int pipe_id, bool_t write_end) {
     int fd = fd_alloc_kind(write_end ? USER_FD_PIPE_WRITE : USER_FD_PIPE_READ);
     if (fd < 0) return -1;
     user_fds[fd].pipe_id = pipe_id;
+    if (write_end) pipe_writer_add(pipe_id, +1);
     return fd;
 }
 
@@ -155,6 +172,7 @@ int user_fd_dup(int oldfd) {
     int ni = fd_alloc_raw();
     if (ni < 0) return -1;
     user_fds[ni] = user_fds[oi];
+    fd_entry_ref(+1, &user_fds[ni]);
     return ni;
 }
 
@@ -164,7 +182,9 @@ bool_t user_fd_dup2(int oldfd, int newfd) {
     if (oi < 0 || ni < 0) return false;
     if (user_fds[oi].kind == USER_FD_FREE) return false;
     if (oi == ni) return true;
+    fd_entry_ref(-1, &user_fds[ni]);      /* release the replaced target */
     user_fds[ni] = user_fds[oi];
+    fd_entry_ref(+1, &user_fds[ni]);
     return true;
 }
 
@@ -190,6 +210,7 @@ bool_t user_fd_set_offset(int fd, uint32_t offset) {
 void user_fd_close(int fd) {
     int i = fd_index(fd);
     if (i < 0) return;
+    fd_entry_ref(-1, &user_fds[i]);
     memset(&user_fds[i], 0, sizeof(user_fds[i]));
     user_fds[i].fs_slot = -1;
 }
@@ -215,6 +236,18 @@ void user_fd_state_save(void* dst) {
 
 void user_fd_state_restore(const void* src) {
     if (src) memcpy(user_fds, src, sizeof(user_fds));
+}
+
+void user_fd_state_retain(void* state) {
+    user_fd_t* s = (user_fd_t*)state;
+    if (!s) return;
+    for (int i = 0; i < USER_FD_MAX; i++) fd_entry_ref(+1, &s[i]);
+}
+
+void user_fd_state_release(void* state) {
+    user_fd_t* s = (user_fd_t*)state;
+    if (!s) return;
+    for (int i = 0; i < USER_FD_MAX; i++) fd_entry_ref(-1, &s[i]);
 }
 
 void user_get_brk_state(uint32_t* base, uint32_t* cur) {

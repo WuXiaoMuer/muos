@@ -11,5 +11,7 @@ int  pipe_read(int id, char* buf, uint32_t len);
 int  pipe_write(int id, const char* buf, uint32_t len);
 bool_t pipe_valid(int id);
 uint32_t pipe_fill(int id);
+void pipe_writer_add(int id, int delta);
+int  pipe_writers(int id);
 
 #endif

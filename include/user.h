@@ -73,6 +73,8 @@ bool_t   user_cwd_set(const char* path);
 uint32_t user_fd_state_bytes(void);
 void     user_fd_state_save(void* dst);
 void     user_fd_state_restore(const void* src);
+void     user_fd_state_retain(void* state);    /* count this snapshot's refs */
+void     user_fd_state_release(void* state);   /* drop this snapshot's refs */
 void     user_get_brk_state(uint32_t* base, uint32_t* cur);
 bool_t   user_restore_brk_state(uint32_t base, uint32_t cur);
 int      user_last_exit_code(void);
