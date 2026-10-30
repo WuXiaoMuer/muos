@@ -19,7 +19,7 @@
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE 与静态 TLS 已支持,符号版本化未做,未用真实 glibc/musl `.so` 验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(单段在途重传/RTO 退避/慢开始+拥塞避免,无发送队列,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32 已支持 8.3 文件写入但未接入 VFS、不支持长名创建;ext2 仍只读;MuFS 有元数据写前日志,但无块分配位图/碎片整理;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 只是桌面原型。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持,仍未用真实 glibc/musl `.so` 端到端验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免,无乱序重排,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32 支持 8.3/长名创建与写入但未接入 VFS;ext2 仍只读;MuFS 有元数据写前日志但无块分配位图/碎片整理;无按需分页;UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
 
 ## 后续计划(建议顺序)
 
