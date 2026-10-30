@@ -224,6 +224,26 @@ int muos_waitid(int idtype, int id, void* infop, int options) {
     return syscall4(284, idtype, id, (int)infop, options);
 }
 
+int muos_kill(int pid, int sig) {
+    return syscall2(37, pid, sig);
+}
+
+int muos_signal(int sig, void (*handler)(int)) {
+    return syscall2(48, sig, (int)handler);
+}
+
+int muos_sigprocmask(int how, const unsigned* set, unsigned* old) {
+    return syscall3(126, how, (int)set, (int)old);
+}
+
+int muos_alarm(unsigned seconds) {
+    return syscall1(27, (int)seconds);
+}
+
+int muos_gettid(void) {
+    return syscall0(224);
+}
+
 int muos_munmap(unsigned addr, unsigned len) {
     return syscall2(91, (int)addr, (int)len);
 }

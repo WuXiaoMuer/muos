@@ -31,6 +31,8 @@ extern uint32_t _kernel_end;
 /* Timer IRQ handler */
 static void timer_handler(registers_t* regs) {
     pit_tick();
+    /* Alarms and blocked-poll timeouts for every process. */
+    proc_tick_all();
     /* Round-robin preemption between Ring3 processes (no-op in kernel). */
     proc_sched_tick(regs);
 }

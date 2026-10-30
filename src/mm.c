@@ -354,9 +354,12 @@ bool_t mm_user_map_range(uint32_t start, uint32_t end) {
 /* ---- per-process user address spaces ---- */
 
 /* Build a page directory that shares every kernel mapping but maps the
- * process's 8MB block at USER_BASE with user permissions. */
-uint32_t mm_create_user_pd(uint32_t block_phys) {
+ * process's 8MB block at USER_BASE with user permissions. The last page
+ * of the block is replaced by a read-only sigreturn trampoline page so
+ * signal delivery has a fixed user-space return path (like the vDSO). */
+uint32_t mm_create_user_pd(uint32_t block_phys, uint32_t tramp_phys) {
     if (!block_phys || (block_phys & (PAGE_SIZE - 1))) return 0;
+    if (!tramp_phys || (tramp_phys & (PAGE_SIZE - 1))) return 0;
 
     uint32_t* pd = (uint32_t*)mm_alloc_page();
     if (!pd) return 0;
@@ -367,7 +370,7 @@ uint32_t mm_create_user_pd(uint32_t block_phys) {
     for (uint32_t d = first_pde; d <= last_pde; d++) pd[d] = 0;
 
     uint32_t pages = USER_SIZE / PAGE_SIZE;
-    for (uint32_t i = 0; i < pages; i++) {
+    for (uint32_t i = 0; i + 1 < pages; i++) {
         uint32_t va = USER_BASE + i * PAGE_SIZE;
         uint32_t pde = va >> 22;
         uint32_t pti = (va >> 12) & 0x3FF;
@@ -383,6 +386,20 @@ uint32_t mm_create_user_pd(uint32_t block_phys) {
         uint32_t* pt = (uint32_t*)(pd[pde] & PAGE_MASK);
         pt[pti] = (block_phys + i * PAGE_SIZE) | PAGE_KERNEL | PTE_USER;
     }
+
+    /* Last page: sigreturn trampoline, user-readable but not writable. */
+    uint32_t tva = USER_SIGTRAMP;
+    uint32_t tpde = tva >> 22;
+    uint32_t tpti = (tva >> 12) & 0x3FF;
+    if (!(pd[tpde] & PDE_PRESENT)) {
+        uint32_t* pt = (uint32_t*)mm_alloc_page();
+        if (!pt) { mm_free_user_pd((uint32_t)pd); return 0; }
+        for (uint32_t j = 0; j < 1024; j++) pt[j] = 0;
+        pd[tpde] = (uint32_t)pt | PAGE_KERNEL | PDE_USER;
+    }
+    uint32_t* tpt = (uint32_t*)(pd[tpde] & PAGE_MASK);
+    tpt[tpti] = tramp_phys | PTE_PRESENT | PTE_USER;
+
     return (uint32_t)pd;
 }
 

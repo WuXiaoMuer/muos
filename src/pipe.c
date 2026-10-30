@@ -1,5 +1,6 @@
 #include "pipe.h"
 #include "string.h"
+#include "proc.h"
 
 typedef struct {
     bool_t used;
@@ -40,6 +41,7 @@ void pipe_writer_add(int id, int delta) {
     if (!pipe_valid(id)) return;
     pipes[id].writers += delta;
     if (pipes[id].writers < 0) pipes[id].writers = 0;
+    proc_notify_pipe(id);      /* last writer closed => POLLHUP, EOF */
 }
 
 int pipe_writers(int id) {
@@ -56,6 +58,7 @@ int pipe_read(int id, char* buf, uint32_t len) {
     }
     p->read_pos = (p->read_pos + len) % PIPE_BUF_SIZE;
     p->count -= len;
+    proc_notify_pipe(id);      /* readers freed space: POLLOUT waiters */
     return (int)len;
 }
 
@@ -69,5 +72,6 @@ int pipe_write(int id, const char* buf, uint32_t len) {
     }
     p->write_pos = (p->write_pos + len) % PIPE_BUF_SIZE;
     p->count += len;
+    proc_notify_pipe(id);      /* new data: POLLIN waiters */
     return (int)len;
 }

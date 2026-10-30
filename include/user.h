@@ -12,6 +12,9 @@
 #define USER_SIZE  0x00800000u           /* 8MB sandbox */
 #define USER_END   (USER_BASE + USER_SIZE)
 #define USER_STACK_RESERVE 0x00010000u   /* 64KB kept free for the stack */
+/* Last page of the sandbox: kernel-provided `mov eax,173; int 0x80`
+ * sigreturn trampoline (the Linux vDSO trick), read-only to user code. */
+#define USER_SIGTRAMP (USER_END - 0x1000u)
 
 bool_t  user_is_active(void);
 bool_t  user_ptr_ok(uint32_t ptr, uint32_t len);
@@ -64,6 +67,20 @@ int      user_fd_slot(int fd);
 uint32_t user_fd_offset(int fd);
 bool_t   user_fd_set_offset(int fd, uint32_t offset);
 void     user_fd_close(int fd);
+
+/* poll events (mirror of the Linux i386 values) */
+#define USER_POLLIN   0x001
+#define USER_POLLOUT  0x004
+#define USER_POLLERR  0x008
+#define USER_POLLHUP  0x010
+#define USER_POLLNVAL 0x020
+
+/* Readiness of one fd in a *saved* fd-table snapshot. Lets the scheduler
+ * wake a blocked process whose live table is not loaded. Returns the
+ * revents mask (0 = not ready, USER_POLLNVAL = bad fd). */
+int      user_fd_state_events(void* state, int fd, int events);
+int      user_fd_state_kind(void* state, int fd);
+int      user_fd_state_pipe(void* state, int fd);
 
 /* Single-process cwd used for relative path resolution ("/" at launch). */
 const char* user_cwd_get(void);

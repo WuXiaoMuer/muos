@@ -83,6 +83,16 @@ int  muos_getrusage(int who, void* out /* 72 bytes */);
 unsigned muos_times(void* out /* 16 bytes or 0 */);
 int  muos_waitid(int idtype, int id, void* infop /* 128 bytes */, int options);
 
+/* Signals and threads */
+int  muos_kill(int pid, int sig);
+int  muos_signal(int sig, void (*handler)(int));
+int  muos_sigprocmask(int how, const unsigned* set, unsigned* old);
+int  muos_alarm(unsigned seconds);
+int  muos_gettid(void);
+/* clone a thread: fn(arg) runs on stack_top (16-byte aligned by the
+ * helper); returns the thread id to the caller and 0 inside the thread. */
+int  muos_thread_start(void (*fn)(void*), void* arg, void* stack_top);
+
 void muos_puts(const char* s);
 void muos_putdec(int value);
 void muos_puthex(unsigned value);

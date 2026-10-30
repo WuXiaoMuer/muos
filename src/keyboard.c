@@ -4,6 +4,7 @@
 #include "irq.h"
 #include "pic.h"
 #include "mouse.h"
+#include "proc.h"
 
 /* Keyboard state tracking */
 static bool_t lshift   = false;
@@ -79,6 +80,7 @@ static void kbd_buf_put(char c) {
         kbd_buffer[kbd_head] = c;
         __asm__ volatile ("" ::: "memory");
         kbd_head = next;
+        proc_notify_console();      /* wake pollers blocked on stdin */
     }
 }
 

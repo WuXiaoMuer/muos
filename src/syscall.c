@@ -105,6 +105,35 @@
 #define SYS_get_thread_area 244
 #define SYS_exit_group      252
 #define SYS_set_tid_address 258
+#define SYS_gettid          224
+
+/* Signals (Linux i386 numbers and struct layouts). */
+#define SYS_alarm           27
+#define SYS_signal          48
+#define SYS_sigaction       67
+#define SYS_sigreturn      119
+#define SYS_sigprocmask    126
+#define SYS_sigsuspend     130
+#define SYS_rt_sigreturn   173
+#define SYS_rt_sigprocmask 175
+#define SYS_rt_sigsuspend  179
+#define SA_RESTORER        0x04000000
+#define SIG_BLOCK    0
+#define SIG_UNBLOCK  1
+#define SIG_SETMASK  2
+#define SIG_NUM_MAX  32
+
+/* clone(2) flags (Linux i386 values). */
+#define CLONE_VM             0x00000100
+#define CLONE_FS             0x00000200
+#define CLONE_FILES          0x00000400
+#define CLONE_SIGHAND        0x00000800
+#define CLONE_THREAD         0x00010000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_SETTID   0x01000000
+
+#define TLS_DESC_LIMIT 0xFFFFFu     /* 4GB flat segment limit field */
 /* 32-bit time64 ABI used by modern musl for clock_gettime. */
 #define SYS_clock_gettime64 403
 #define SYS_pipe2           331
@@ -182,6 +211,7 @@
 #define RUSAGE_SIZE     72
 
 #define ERR_EPERM      1
+#define ERR_EINTR      4
 #define ERR_ENOENT     2
 #define ERR_ESRCH      3
 #define ERR_ENOEXEC    8
@@ -291,7 +321,8 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
     }
 }
 
-static uint32_t do_read(uint32_t fd, uint32_t buf, uint32_t count) {
+static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
+                        uint32_t count) {
     if (count == 0) return 0;
     if (!user_ptr_ok(buf, count)) return err(ERR_EFAULT);
 
@@ -325,11 +356,27 @@ static uint32_t do_read(uint32_t fd, uint32_t buf, uint32_t count) {
             return count;
         case USER_FD_STDIN:
         case USER_FD_DEV_CONSOLE:
+            if (!keyboard_haschar()) {
+                proc_t* p = proc_current();
+                if (p && p->pid != 1 &&
+                    proc_block_current_ext(regs, PROC_WAIT_READ, buf,
+                                           (int32_t)count, 0, false,
+                                           (int32_t)fd))
+                    return 0;     /* the console IRQ completes the read */
+            }
             return read_keyboard_char(buf);
         case USER_FD_PIPE_READ: {
             int id = user_fd_pipe_id((int)fd);
             if (id < 0) return err(ERR_EBADF);
             int n = pipe_read(id, (char*)buf, count);
+            if (n == 0 && pipe_writers(id) > 0) {
+                proc_t* p = proc_current();
+                if (p && p->pid != 1 &&
+                    proc_block_current_ext(regs, PROC_WAIT_READ, buf,
+                                           (int32_t)count, 0, false,
+                                           (int32_t)fd))
+                    return 0;     /* a writer fills the buffer and eax */
+            }
             return n < 0 ? err(ERR_EBADF) : (uint32_t)n;
         }
         case USER_FD_DIR:
@@ -2008,23 +2055,50 @@ static uint32_t poll_scan(uint32_t fds_ptr, uint32_t nfds) {
     return ready;
 }
 
-/* poll reports readiness immediately; a positive timeout parks the CPU on
- * `sti; hlt` and re-scans each PIT tick. Negative timeouts return at once
- * because a scheduler that could wake the process does not exist yet. */
-static uint32_t do_poll(uint32_t fds_ptr, uint32_t nfds, uint32_t timeout) {
+/* poll blocks the caller until an fd is ready or the timeout expires.
+ * Wakers (pipe writes, console input, the PIT) re-evaluate the blocked
+ * process's saved fd table, fill its revents array and resume it with
+ * the ready count in eax. With no other runnable process (or from the
+ * pid-1 shell) it degrades to the old `sti; hlt` polling loop. */
+static uint32_t do_poll(registers_t* regs, uint32_t fds_ptr, uint32_t nfds,
+                        uint32_t timeout) {
     if (nfds > SELECT_MAX_FDS) return err(ERR_EINVAL);
     if (nfds && !user_ptr_ok(fds_ptr, nfds * 8)) return err(ERR_EFAULT);
 
     uint32_t ready = poll_scan(fds_ptr, nfds);
-    if (ready || timeout == 0 || (int32_t)timeout < 0) return ready;
+    if (ready || timeout == 0) return ready;
 
-    uint32_t ms = timeout > 0x7FFFFFFFu ? 0x7FFFFFFFu : timeout;
-    uint32_t ticks = (ms + 9u) / 10u;          /* ms -> 100Hz ticks */
-    uint32_t start = pit_get_ticks();
-    while ((uint32_t)(pit_get_ticks() - start) < ticks) {
+    int32_t tmo = (int32_t)timeout;
+    bool_t has_dl = tmo > 0;
+    uint32_t ticks = 0;
+    if (has_dl) {
+        uint32_t ms = timeout > 0x7FFFFFFFu ? 0x7FFFFFFFu : timeout;
+        ticks = (ms + 9u) / 10u;                /* ms -> 100Hz ticks */
+        if (ticks == 0) ticks = 1;
+    }
+    uint32_t deadline = pit_get_ticks() + ticks;
+
+    proc_t* cur = proc_current();
+    if (cur && cur->pid != 1) {
+        /* May switch away; the waker completes the call in our saved
+         * context, so returning here must unwind immediately. */
+        if (proc_block_current_ext(regs, PROC_WAIT_POLL, fds_ptr,
+                                   (int32_t)nfds, deadline, has_dl, -1))
+            return 0;
+    }
+
+    /* No scheduler and no other runnable process: poll in place. */
+    while (!has_dl || (int32_t)(pit_get_ticks() - deadline) < 0) {
         __asm__ volatile ("sti; hlt; cli" ::: "memory");
         ready = poll_scan(fds_ptr, nfds);
         if (ready) return ready;
+        if (proc_signal_pending()) return err(ERR_EINTR);
+    }
+    for (uint32_t i = 0; i < nfds; i++) {
+        pollfd_t p;
+        memcpy(&p, (const void*)(fds_ptr + i * 8), sizeof(p));
+        p.revents = 0;
+        memcpy((void*)(fds_ptr + i * 8), &p, sizeof(p));
     }
     return 0;
 }
@@ -2072,16 +2146,46 @@ static uint32_t do_select(uint32_t nfds, uint32_t rp, uint32_t wp,
     return ready;
 }
 
-static uint32_t do_pselect6(uint32_t nfds, uint32_t rp, uint32_t wp,
-                            uint32_t ep, uint32_t ts, uint32_t sig) {
-    (void)ts; (void)sig;
-    return do_select(nfds, rp, wp, ep, 0);
+/* Timespec -> milliseconds for ppoll/pselect6 (0xFFFFFFFF = infinite). */
+static uint32_t ts_to_ms(uint32_t ts_ptr) {
+    if (!ts_ptr) return 0xFFFFFFFFu;
+    if (!user_ptr_ok(ts_ptr, 8)) return 0xFFFFFFFFu;
+    uint32_t sec, nsec;
+    memcpy(&sec, (const void*)ts_ptr, 4);
+    memcpy(&nsec, (const void*)(ts_ptr + 4), 4);
+    if (sec > 0x7FFFFFFFu / 1000u) return 0x7FFFFFFFu;
+    uint32_t ms = sec * 1000u + (nsec + 999999u) / 1000000u;
+    return ms > 0x7FFFFFFFu ? 0x7FFFFFFFu : ms;
 }
 
-static uint32_t do_ppoll(uint32_t fds_ptr, uint32_t nfds, uint32_t ts,
-                         uint32_t sigmask, uint32_t sigsize) {
-    (void)ts; (void)sigmask; (void)sigsize;
-    return do_poll(fds_ptr, nfds, 0);
+static uint32_t do_pselect6(registers_t* regs, uint32_t nfds, uint32_t rp,
+                            uint32_t wp, uint32_t ep, uint32_t ts, uint32_t sig) {
+    (void)sig;
+    uint32_t ready = do_select(nfds, rp, wp, ep, 0);
+    if (ready || (ts && ts_to_ms(ts) == 0)) return ready;
+    if (!ts) return ready;          /* no timeout: report current state */
+    uint32_t ms = ts_to_ms(ts);
+    if (ms > 0xFFFFFFFEu) return ready;
+    /* Wait on the requested fd set through the poll machinery by
+     * converting the sets into a temporary pollfd array in user space
+     * is overkill; fall back to a bounded PIT loop for select-style
+     * waits, which only the shell and tests use. */
+    uint32_t start = pit_get_ticks();
+    uint32_t ticks = (ms + 9u) / 10u;
+    if (ticks == 0) ticks = 1;
+    while ((uint32_t)(pit_get_ticks() - start) < ticks) {
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+        ready = do_select(nfds, rp, wp, ep, 0);
+        if (ready) return ready;
+        if (proc_signal_pending()) regs->eax = err(ERR_EINTR);
+    }
+    return 0;
+}
+
+static uint32_t do_ppoll(registers_t* regs, uint32_t fds_ptr, uint32_t nfds,
+                         uint32_t ts, uint32_t sigmask, uint32_t sigsize) {
+    (void)sigmask; (void)sigsize;
+    return do_poll(regs, fds_ptr, nfds, ts_to_ms(ts));
 }
 
 /* ---- sleep, resource stats, readlink and ownership ---- */
@@ -2199,9 +2303,115 @@ static proc_t* find_zombie_child(int32_t want_pid) {
 }
 
 static uint32_t do_kill(uint32_t pid, uint32_t sig) {
-    (void)sig;   /* signals are tracked but never delivered yet */
-    if (pid == 0) return 0;
-    return proc_find(pid) ? 0 : err(ERR_ESRCH);
+    int rc = proc_signal_send(pid, (int)sig);
+    return rc < 0 ? err((uint32_t)(-rc)) : 0;
+}
+
+/* signal(48): install a handler (or SIG_DFL/SIG_IGN), return the old one. */
+static uint32_t do_signal(uint32_t sig, uint32_t handler) {
+    proc_t* p = proc_current();
+    if (!p || p->pid == 1) return err(ERR_EPERM);
+    if ((int32_t)sig <= 0 || sig >= SIG_NUM_MAX) return err(ERR_EINVAL);
+    uint32_t old = proc_signal_set_action(p, (int)sig, handler, 0, 0);
+    if (old == 22) return err(ERR_EINVAL);
+    return old;
+}
+
+/* sigaction(67) uses {handler, mask, flags, restorer};
+ * rt_sigaction(174) uses {handler, flags, restorer, mask}. */
+static uint32_t do_sigaction(uint32_t sig, uint32_t act, uint32_t old,
+                             bool_t rt, uint32_t setsize) {
+    proc_t* p = proc_current();
+    if (!p || p->pid == 1) return err(ERR_EPERM);
+    if ((int32_t)sig <= 0 || sig >= SIG_NUM_MAX) return err(ERR_EINVAL);
+    if (rt && (setsize != 4 && setsize != 8)) return err(ERR_EINVAL);
+
+    int off_h = 0;
+    int off_f = rt ? 4 : 8;
+    int off_r = rt ? 8 : 12;
+    int off_m = rt ? 12 : 4;
+
+    if (old) {
+        if (!user_ptr_ok(old, 16)) return err(ERR_EFAULT);
+        uint32_t f = 0, r = 0;
+        uint32_t h = proc_signal_get_action(p, (int)sig, &f, &r);
+        put_u32((char*)old, off_h, h);
+        put_u32((char*)old, off_f, f);
+        put_u32((char*)old, off_r, r);
+        put_u32((char*)old, off_m, 0);
+    }
+    if (act) {
+        if (!user_ptr_ok(act, 16)) return err(ERR_EFAULT);
+        uint32_t h, f, r;
+        memcpy(&h, (const void*)(act + off_h), 4);
+        memcpy(&f, (const void*)(act + off_f), 4);
+        memcpy(&r, (const void*)(act + off_r), 4);
+        uint32_t rc = proc_signal_set_action(p, (int)sig, h, f, r);
+        if (rc == 22) return err(ERR_EINVAL);
+    }
+    return 0;
+}
+
+static uint32_t do_sigprocmask(uint32_t how, uint32_t set, uint32_t old) {
+    proc_t* p = proc_current();
+    if (!p || p->pid == 1) return err(ERR_EPERM);
+    uint32_t mask = p->sig_blocked;
+    if (old) {
+        if (!user_ptr_ok(old, 4)) return err(ERR_EFAULT);
+        put_u32((char*)old, 0, mask);
+    }
+    if (set) {
+        if (!user_ptr_ok(set, 4)) return err(ERR_EFAULT);
+        uint32_t v;
+        memcpy(&v, (const void*)set, 4);
+        v &= ~((1u << 9) | (1u << 19));       /* SIGKILL/SIGSTOP */
+        switch (how) {
+            case SIG_BLOCK:   mask |= v;  break;
+            case SIG_UNBLOCK: mask &= ~v; break;
+            case SIG_SETMASK: mask = v;   break;
+            default: return err(ERR_EINVAL);
+        }
+        p->sig_blocked = mask;
+    }
+    return 0;
+}
+
+/* sigsuspend: install a temporary mask and sleep until a signal arrives.
+ * Returns -EINTR, and the handler is delivered on the way back to Ring3. */
+static uint32_t do_sigsuspend(registers_t* regs, uint32_t mask_ptr) {
+    proc_t* p = proc_current();
+    if (!p || p->pid == 1) return err(ERR_EPERM);
+    if (mask_ptr) {
+        if (!user_ptr_ok(mask_ptr, 4)) return err(ERR_EFAULT);
+        uint32_t v;
+        memcpy(&v, (const void*)mask_ptr, 4);
+        p->sig_blocked = v & ~((1u << 9) | (1u << 19));
+    }
+    if (proc_signal_pending()) return err(ERR_EINTR);
+    if (proc_block_current_ext(regs, PROC_WAIT_SIGSUSP, 0, 0, 0, false, -1))
+        return 0;               /* woken with -EINTR already in eax */
+    while (!proc_signal_pending())
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    return err(ERR_EINTR);
+}
+
+/* sigreturn(119)/rt_sigreturn(173): restore the frame saved at delivery. */
+static uint32_t do_sigreturn(registers_t* regs) {
+    if (!proc_sigreturn(regs)) return err(ERR_EINVAL);
+    return regs->eax;            /* syscall_handler rewrites eax with this */
+}
+
+static uint32_t do_alarm(uint32_t sec) {
+    proc_t* p = proc_current();
+    if (!p || p->pid == 1) return 0;
+    uint32_t now = pit_get_ticks();
+    uint32_t remain = 0;
+    if (p->alarm_tick) {
+        int32_t left = (int32_t)(p->alarm_tick - now);
+        remain = left > 0 ? ((uint32_t)left + 99u) / 100u : 0;
+    }
+    p->alarm_tick = sec ? now + sec * 100u : 0;
+    return remain;
 }
 
 static uint32_t do_fork(registers_t* regs) {
@@ -2241,6 +2451,77 @@ static uint32_t do_fork(registers_t* regs) {
     child->fs_sel = regs->fs ? regs->fs : 0x23;
     child->gs_sel = regs->gs ? regs->gs : 0x23;
     child->has_ctx = true;
+    proc_signal_inherit(child, parent);
+
+    return child->pid;
+}
+
+/* clone(120): threads (CLONE_VM) share the address space and optionally
+ * the fd table, so no memory copy happens; a plain clone degrades to
+ * fork (musl's fork() is clone(SIGCHLD, 0)). The child starts after the
+ * parent's int 0x80 with eax=0, on `stack` when one was supplied. */
+static uint32_t do_clone(registers_t* regs, uint32_t flags, uint32_t stack,
+                         uint32_t ptid, uint32_t tls, uint32_t ctid) {
+    proc_t* parent = proc_current();
+    if (!parent || parent->pid == 1) return err(ERR_EPERM);
+
+    proc_t* child = proc_alloc(parent->name, parent->pid);
+    if (!child) return err(ERR_EAGAIN);
+
+    bool_t share_vm = (flags & CLONE_VM) ? true : false;
+    if (share_vm) {
+        if (!proc_space_share(child, parent)) { proc_reap(child); return err(ERR_ENOMEM); }
+    } else {
+        if (!proc_snapshot_alloc(child)) { proc_reap(child); return err(ERR_ENOMEM); }
+        /* Shared files are never touched here: both blocks are kernel
+         * memory outside the user window. The trampoline page stays. */
+        memcpy(child->mem, parent->mem, USER_SIZE - PAGE_SIZE);
+    }
+
+    if (flags & CLONE_FILES) {
+        if (!proc_fdstate_share(child, parent)) { proc_reap(child); return err(ERR_ENOMEM); }
+    } else {
+        if (!proc_fdstate_alloc(child)) { proc_reap(child); return err(ERR_ENOMEM); }
+        user_fd_state_save(child->fd_state);
+        user_fd_state_retain(child->fd_state);
+        child->fds_retained = true;
+    }
+
+    strncpy(child->cwd, user_cwd_get(), USER_FD_PATH_MAX - 1);
+    child->cwd[USER_FD_PATH_MAX - 1] = '\0';
+    user_get_brk_state(&child->brk_base, &child->brk_cur);
+    gdt_get_user_tls(&child->tls_base, &child->tls_limit, &child->tls_flags);
+    if (flags & CLONE_SETTLS) {
+        child->tls_base = tls;
+        child->tls_limit = TLS_DESC_LIMIT;
+        child->tls_flags = 0x51;        /* data, writable, present, 32-bit */
+    }
+
+    child->eip = regs->eip;
+    child->esp = stack ? stack : regs->useresp;
+    child->eflags = regs->eflags;
+    child->eax = 0;
+    child->ebx = regs->ebx;
+    child->ecx = regs->ecx;
+    child->edx = regs->edx;
+    child->esi = regs->esi;
+    child->edi = regs->edi;
+    child->ebp = regs->ebp;
+    child->fs_sel = 0x23;
+    child->gs_sel = (flags & CLONE_SETTLS) ? 0x33 : (regs->gs ? regs->gs : 0x23);
+    child->has_ctx = true;
+    child->is_thread = share_vm;
+    proc_signal_inherit(child, parent);
+
+    if (ptid && user_ptr_ok(ptid, 4))
+        *(uint32_t*)ptid = child->pid;
+    if (ctid && user_ptr_ok(ctid, 4)) {
+        if (share_vm) {
+            *(uint32_t*)ctid = child->pid;
+        } else if (child->mem && ctid >= USER_BASE && ctid < USER_END) {
+            *(uint32_t*)((uint32_t)child->mem + (ctid - USER_BASE)) = child->pid;
+        }
+    }
 
     return child->pid;
 }
@@ -2399,14 +2680,15 @@ static uint32_t do_writev(uint32_t fd, uint32_t iov_ptr, uint32_t count) {
     return total;
 }
 
-static uint32_t do_readv(uint32_t fd, uint32_t iov_ptr, uint32_t count) {
+static uint32_t do_readv(registers_t* regs, uint32_t fd, uint32_t iov_ptr,
+                         uint32_t count) {
     if (count > 1024) return err(ERR_EINVAL);
     if (!user_ptr_ok(iov_ptr, count * 8)) return err(ERR_EFAULT);
     uint32_t total = 0;
     for (uint32_t i = 0; i < count; i++) {
         iovec32_t v;
         memcpy(&v, (const void*)(iov_ptr + i * 8), sizeof(v));
-        uint32_t n = do_read(fd, v.base, v.len);
+        uint32_t n = do_read(regs, fd, v.base, v.len);
         if ((int32_t)n < 0) return total ? total : n;
         total += n;
         if (n < v.len) break;   /* short read ends the vector */
@@ -2624,9 +2906,8 @@ void syscall_handler(registers_t* regs) {
             ret = do_fork(regs);
             break;
         case SYS_clone:
-            /* Threads (CLONE_VM / custom stack) need real concurrency. */
-            if ((regs->ebx & 0x100) || regs->ecx != 0) ret = err(ERR_ENOSYS);
-            else ret = do_fork(regs);
+            ret = do_clone(regs, regs->ebx, regs->ecx, regs->edx,
+                           regs->esi, regs->edi);
             break;
         case SYS_kill:
             ret = do_kill(regs->ebx, regs->ecx);
@@ -2649,7 +2930,7 @@ void syscall_handler(registers_t* regs) {
             ret = do_execve(regs, regs->ebx, regs->ecx);
             break;
         case SYS_read:
-            ret = do_read(regs->ebx, regs->ecx, regs->edx);
+            ret = do_read(regs, regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_write:
             ret = do_write(regs->ebx, regs->ecx, regs->edx);
@@ -2816,18 +3097,45 @@ void syscall_handler(registers_t* regs) {
         case SYS_sysinfo:
             ret = do_sysinfo(regs->ebx);
             break;
+        case SYS_signal:
+            ret = do_signal(regs->ebx, regs->ecx);
+            break;
+        case SYS_sigaction:
+            ret = do_sigaction(regs->ebx, regs->ecx, regs->edx, false, 4);
+            break;
         case SYS_rt_sigaction:
+            ret = do_sigaction(regs->ebx, regs->ecx, regs->edx, true, regs->esi);
+            break;
+        case SYS_sigprocmask:
+            ret = do_sigprocmask(regs->ebx, regs->ecx, regs->edx);
+            break;
         case SYS_rt_sigprocmask:
+            if (regs->esi != 4 && regs->esi != 8) { ret = err(ERR_EINVAL); break; }
+            ret = do_sigprocmask(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_sigsuspend:
+            ret = do_sigsuspend(regs, regs->ebx);
+            break;
+        case SYS_rt_sigsuspend:
+            ret = do_sigsuspend(regs, regs->ebx);
+            break;
+        case SYS_sigreturn:
+        case SYS_rt_sigreturn:
+            ret = do_sigreturn(regs);
+            break;
+        case SYS_alarm:
+            ret = do_alarm(regs->ebx);
+            break;
         case SYS_sigaltstack:
         case SYS_umask:
-            ret = 0;   /* no signals/umask state: report success */
+            ret = 0;   /* no alt stack / umask state: report success */
             break;
         case SYS_getgroups:
         case SYS_getgroups32:
             ret = 0;   /* root with no supplementary groups */
             break;
         case SYS_readv:
-            ret = do_readv(regs->ebx, regs->ecx, regs->edx);
+            ret = do_readv(regs, regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_writev:
             ret = do_writev(regs->ebx, regs->ecx, regs->edx);
@@ -2855,7 +3163,8 @@ void syscall_handler(registers_t* regs) {
             ret = do_dup(regs->ebx);
             break;
         case SYS_getpid:
-        case SYS_getppid: {
+        case SYS_getppid:
+        case SYS_gettid: {
             proc_t* p = proc_current();
             if (regs->eax == SYS_getppid)
                 ret = p ? p->ppid : 0;
@@ -2896,18 +3205,19 @@ void syscall_handler(registers_t* regs) {
             ret = do_pipe(regs->ebx, regs->ecx);
             break;
         case SYS_poll:
-            ret = do_poll(regs->ebx, regs->ecx, regs->edx);
+            ret = do_poll(regs, regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_select:
         case SYS_newselect:
             ret = do_select(regs->ebx, regs->ecx, regs->edx, regs->esi, regs->edi);
             break;
         case SYS_pselect6:
-            ret = do_pselect6(regs->ebx, regs->ecx, regs->edx, regs->esi,
+            ret = do_pselect6(regs, regs->ebx, regs->ecx, regs->edx, regs->esi,
                               regs->edi, regs->ebp);
             break;
         case SYS_ppoll:
-            ret = do_ppoll(regs->ebx, regs->ecx, regs->edx, regs->esi, regs->edi);
+            ret = do_ppoll(regs, regs->ebx, regs->ecx, regs->edx,
+                           regs->esi, regs->edi);
             break;
         case SYS_brk:
             ret = (regs->ebx == 0 || !user_set_brk(regs->ebx))
@@ -2951,4 +3261,8 @@ void syscall_handler(registers_t* regs) {
     /* A blocking wait/exit may have rewritten the frame for another
      * process; in that case eax already belongs to the next context. */
     if (!proc_frame_switched()) regs->eax = ret;
+
+    /* Deliver any pending signal just before returning to Ring3. A
+     * handler rewrites the frame; a terminating default action exits. */
+    proc_signal_deliver(regs);
 }

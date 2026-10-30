@@ -16,6 +16,33 @@ static int arg_is(const char* s, const char* t) {
     return *s == '\0' && *t == '\0';
 }
 
+/* ---- signal test state ---- */
+static volatile int sig_count = 0;
+static volatile int sig_seen = 0;
+static void usr1_handler(int sig) {
+    sig_count++;
+    sig_seen = sig;
+}
+
+/* ---- thread test state (CLONE_VM threads share this image) ---- */
+static volatile int thread_marks[2];
+static unsigned char thread_stacks[2][4096] __attribute__((aligned(16)));
+
+static void thread_body(void* arg) {
+    int id = (int)arg;
+    thread_marks[id] = 100 + id;      /* visible to the parent: shared VM */
+    for (volatile unsigned n = 0; n < 200000u; n++) { }
+    muos_exit(30 + id);
+}
+
+static void spin_child(void) {
+    for (;;) {
+        volatile unsigned x = 1;
+        x = x + 1;
+        (void)x;
+    }
+}
+
 int main(int argc, char** argv) {
     unsigned cs = read_cs();
 
@@ -78,6 +105,165 @@ int main(int argc, char** argv) {
         rb[n > 0 ? n : 0] = '\0';
         muos_puts("pipe-fork: read="); muos_puts(rb); muos_puts("\n");
         muos_close(fds[0]);
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "sig")) {
+        /* Signal delivery: handler + sigreturn trampoline, blocked-mask
+         * deferral, and the default terminate actions of SIGTERM/SIGKILL. */
+        int ok = 1;
+        int rc, status = 0;
+        unsigned set = 1u << 10, oldmask = 0;
+
+        rc = muos_signal(10, usr1_handler);
+        muos_puts("sig: install-old="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;                      /* old action was SIG_DFL */
+
+        rc = muos_kill(muos_getpid(), 10);
+        muos_puts("sig: kill-self="); muos_putdec(rc);
+        muos_puts(" seen="); muos_putdec(sig_seen); muos_puts("\n");
+        ok = ok && rc == 0 && sig_seen == 10 && sig_count == 1;
+
+        /* Blocking a signal defers delivery until it is unblocked. */
+        rc = muos_sigprocmask(0, &set, &oldmask);
+        muos_puts("sig: block-mask="); muos_putdec(rc);
+        muos_puts(" old="); muos_puthex(oldmask); muos_puts("\n");
+        ok = ok && rc == 0 && oldmask == 0;
+
+        rc = muos_kill(muos_getpid(), 10);
+        muos_puts("sig: blocked-kill="); muos_putdec(rc);
+        muos_puts(" count="); muos_putdec(sig_count); muos_puts("\n");
+        ok = ok && rc == 0 && sig_count == 1;
+
+        set = 0;
+        rc = muos_sigprocmask(2, &set, 0);       /* SIG_SETMASK */
+        muos_puts("sig: unblock="); muos_putdec(rc);
+        muos_puts(" count="); muos_putdec(sig_count); muos_puts("\n");
+        ok = ok && rc == 0 && sig_count == 2;
+
+        /* SIG_IGN swallows the signal; SIGKILL cannot be caught. */
+        rc = muos_signal(10, (void*)1);
+        ok = ok && rc > 0;
+        rc = muos_kill(muos_getpid(), 10);
+        ok = ok && rc == 0 && sig_count == 2;
+        rc = muos_signal(9, usr1_handler);
+        muos_puts("sig: catch-kill="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == -22;
+
+        /* Default action terminates: wait status = 128 + signal. */
+        int pid = muos_fork();
+        if (pid == 0) spin_child();
+        rc = muos_kill(pid, 15);
+        int w = muos_waitpid(pid, &status, 0);
+        int code = (status >> 8) & 0xFF;
+        muos_puts("sig: term wait="); muos_putdec(w);
+        muos_puts(" code="); muos_putdec(code); muos_puts("\n");
+        ok = ok && rc == 0 && w == pid && code == 143;
+
+        pid = muos_fork();
+        if (pid == 0) spin_child();
+        rc = muos_kill(pid, 9);
+        w = muos_waitpid(pid, &status, 0);
+        code = (status >> 8) & 0xFF;
+        muos_puts("sig: kill wait="); muos_putdec(w);
+        muos_puts(" code="); muos_putdec(code); muos_puts("\n");
+        ok = ok && rc == 0 && w == pid && code == 137;
+
+        rc = muos_kill(9999, 0);
+        muos_puts("sig: kill-badpid="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == -3;
+
+        muos_puts(ok ? "SIG-OK\n" : "SIG-BAD\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "thread")) {
+        /* Two CLONE_VM threads on their own stacks mutate this process's
+         * globals; pid/tid are distinct and both join via waitpid. */
+        int ok = 1;
+        thread_marks[0] = thread_marks[1] = 0;
+
+        int p0 = muos_thread_start((void*)thread_body, (void*)0,
+                                   &thread_stacks[0][0] + 4096);
+        int p1 = muos_thread_start((void*)thread_body, (void*)1,
+                                   &thread_stacks[1][0] + 4096);
+        muos_puts("thread: pids="); muos_putdec(p0);
+        muos_puts("/"); muos_putdec(p1);
+        muos_puts(" tid="); muos_putdec(muos_gettid()); muos_puts("\n");
+        ok = ok && p0 > 0 && p1 > 0 && p0 != p1;
+
+        int st0 = 0, st1 = 0;
+        int w0 = muos_waitpid(p0, &st0, 0);
+        int w1 = muos_waitpid(p1, &st1, 0);
+        int c0 = (st0 >> 8) & 0xFF, c1 = (st1 >> 8) & 0xFF;
+        muos_puts("thread: wait="); muos_putdec(w0);
+        muos_puts("/"); muos_putdec(w1);
+        muos_puts(" code="); muos_putdec(c0);
+        muos_puts("/"); muos_putdec(c1);
+        muos_puts(" marks="); muos_putdec(thread_marks[0]);
+        muos_puts("/"); muos_putdec(thread_marks[1]); muos_puts("\n");
+        ok = ok && w0 == p0 && w1 == p1 && c0 == 30 && c1 == 31;
+        ok = ok && thread_marks[0] == 100 && thread_marks[1] == 101;
+
+        muos_puts(ok ? "THREAD-OK\n" : "THREAD-BAD\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "blkpoll")) {
+        /* poll really blocks: a child's pipe write wakes the parent, and a
+         * PIT deadline wakes it while another process keeps running. */
+        int ok = 1;
+        int rc, status = 0;
+        int fds[2] = { -1, -1 };
+        int f2[2] = { -1, -1 };
+        muos_pollfd_t pf;
+        char buf[16];
+
+        rc = muos_pipe(fds);
+        ok = ok && rc == 0;
+        int pid = muos_fork();
+        if (pid == 0) {
+            muos_close(fds[0]);
+            muos_write(fds[1], "WAKE", 4);
+            muos_close(fds[1]);
+            muos_exit(0);
+        }
+        muos_close(fds[1]);
+
+        pf.fd = fds[0]; pf.events = MUOS_POLLIN; pf.revents = 0;
+        rc = muos_poll(&pf, 1, -1);
+        muos_puts("blkpoll: wake="); muos_putdec(rc);
+        muos_puts(" revents="); muos_puthex((unsigned)pf.revents); muos_puts("\n");
+        ok = ok && rc == 1 && (pf.revents & MUOS_POLLIN);
+
+        int n = muos_read(fds[0], buf, sizeof(buf));
+        int same = (n == 4 && buf[0] == 'W' && buf[1] == 'A' &&
+                    buf[2] == 'K' && buf[3] == 'E') ? 1 : 0;
+        muos_puts("blkpoll: read="); muos_putdec(n);
+        muos_puts(same ? " data-ok\n" : " data-bad\n");
+        ok = ok && same;
+
+        int w = muos_waitpid(pid, &status, 0);
+        ok = ok && w == pid;
+        muos_close(fds[0]);
+
+        /* Timeout wakeup while a spinning child keeps the CPU busy. */
+        rc = muos_pipe(f2);
+        int p2 = muos_fork();
+        if (p2 == 0) spin_child();
+        pf.fd = f2[0]; pf.events = MUOS_POLLIN; pf.revents = 0;
+        unsigned t0 = muos_times(0);
+        rc = muos_poll(&pf, 1, 50);
+        unsigned t1 = muos_times(0);
+        muos_puts("blkpoll: timeout="); muos_putdec(rc);
+        muos_puts(" ticks="); muos_putdec((int)(t1 - t0)); muos_puts("\n");
+        ok = ok && rc == 0 && (t1 - t0) >= 2 && (t1 - t0) <= 12;
+
+        muos_kill(p2, 9);
+        muos_waitpid(p2, &status, 0);
+        muos_close(f2[0]); muos_close(f2[1]);
+
+        muos_puts(ok ? "BLKPOLL-OK\n" : "BLKPOLL-BAD\n");
         return 0;
     }
 

@@ -9,6 +9,7 @@
 #include "proc.h"
 #include "fs.h"
 #include "pipe.h"
+#include "keyboard.h"
 
 /* Embedded user image: built by build.ps1 into build/hello.elf and linked
  * into the kernel as a raw binary blob (see the objcopy step). */
@@ -253,6 +254,72 @@ void user_fd_state_release(void* state) {
     for (int i = 0; i < USER_FD_MAX; i++) fd_entry_ref(-1, &s[i]);
 }
 
+/* Readiness of one fd in a saved snapshot (cross-process poll wakeups). */
+int user_fd_state_events(void* state, int fd, int events) {
+    const user_fd_t* s = (const user_fd_t*)state;
+    if (!s || fd < 0 || fd >= USER_FD_MAX) return USER_POLLNVAL;
+    const user_fd_t* e = &s[fd];
+    if (e->kind == USER_FD_FREE) return USER_POLLNVAL;
+
+    int rev = 0;
+    switch (e->kind) {
+        case USER_FD_STDIN:
+        case USER_FD_DEV_CONSOLE:
+            if ((events & USER_POLLIN) && keyboard_haschar()) rev |= USER_POLLIN;
+            break;
+        case USER_FD_FILE:
+        case USER_FD_VFILE:
+        case USER_FD_DIR:
+        case USER_FD_DEV_NULL:
+        case USER_FD_DEV_ZERO:
+            if (events & USER_POLLIN)  rev |= USER_POLLIN;
+            if (events & USER_POLLOUT) rev |= USER_POLLOUT;
+            break;
+        case USER_FD_STDOUT:
+        case USER_FD_STDERR:
+            if (events & USER_POLLOUT) rev |= USER_POLLOUT;
+            break;
+        case USER_FD_PIPE_READ:
+            if (pipe_valid(e->pipe_id)) {
+                if ((events & USER_POLLIN) &&
+                    (pipe_fill(e->pipe_id) > 0 || pipe_writers(e->pipe_id) == 0))
+                    rev |= USER_POLLIN;
+                if (pipe_writers(e->pipe_id) == 0) rev |= USER_POLLHUP;
+            } else {
+                rev |= USER_POLLERR;
+            }
+            break;
+        case USER_FD_PIPE_WRITE:
+            if (pipe_valid(e->pipe_id)) {
+                if ((events & USER_POLLOUT) &&
+                    pipe_fill(e->pipe_id) < PIPE_BUF_SIZE)
+                    rev |= USER_POLLOUT;
+                if (pipe_writers(e->pipe_id) == 0) rev |= USER_POLLERR;
+            } else {
+                rev |= USER_POLLERR;
+            }
+            break;
+        default:
+            break;
+    }
+    return rev;
+}
+
+int user_fd_state_kind(void* state, int fd) {
+    const user_fd_t* s = (const user_fd_t*)state;
+    if (!s || fd < 0 || fd >= USER_FD_MAX) return -1;
+    if (s[fd].kind == USER_FD_FREE) return -1;
+    return s[fd].kind;
+}
+
+int user_fd_state_pipe(void* state, int fd) {
+    const user_fd_t* s = (const user_fd_t*)state;
+    if (!s || fd < 0 || fd >= USER_FD_MAX) return -1;
+    if (s[fd].kind != USER_FD_PIPE_READ && s[fd].kind != USER_FD_PIPE_WRITE)
+        return -1;
+    return s[fd].pipe_id;
+}
+
 void user_get_brk_state(uint32_t* base, uint32_t* cur) {
     if (base) *base = brk_base;
     if (cur) *cur = brk_current;
@@ -394,7 +461,7 @@ static uint32_t push_string(uint32_t sp, const char* s) {
  * Real libcs (musl/glibc) walk envp and auxv; missing terminators make
  * them interpret the first string bytes as pointers. */
 static uint32_t build_user_stack(int argc, const char* const* argv) {
-    uint32_t sp = USER_END - 32;
+    uint32_t sp = USER_SIGTRAMP - 32;   /* top page is the sigreturn tramp */
     uint32_t addrs[16];
 
     if (argc < 1) argc = 1;
@@ -421,7 +488,8 @@ int user_exec_image(const void* img, uint32_t img_size, int argc,
                     uint32_t* entry_out, uint32_t* sp_out) {
     if (!img || img_size == 0) return -1;
 
-    memset((void*)USER_BASE, 0, USER_SIZE);
+    /* The top page is the read-only sigreturn trampoline. */
+    memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);
 
     uint32_t entry = 0, image_end = 0;
     int rc = elf32_load(img, img_size, USER_BASE,
@@ -493,8 +561,8 @@ int user_run_image_argv(const void* img, uint32_t img_size,
     uint32_t prev_pd = mm_get_current_pd();
     proc_switch_space(self);
 
-    /* Fresh process image every run. */
-    memset((void*)USER_BASE, 0, USER_SIZE);
+    /* Fresh process image every run (top page: read-only trampoline). */
+    memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);
 
     uint32_t entry = 0, image_end = 0;
     int rc = elf32_load(img, img_size, USER_BASE,
