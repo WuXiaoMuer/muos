@@ -20,6 +20,7 @@ typedef unsigned int   u32;
 #define AT_PHNUM  5
 #define AT_BASE   7
 #define AT_ENTRY  9
+#define AT_RANDOM 25
 
 #define PT_LOAD     1
 #define PT_DYNAMIC  2
@@ -647,16 +648,23 @@ void ld_main(u32* sp) {
     u32* p = sp + 1 + argc + 1;         /* skip argv + NULL */
     while (*p) p++;                     /* skip envp */
     p++;
-    u32 at_phdr = 0, at_phnum = 0, at_phent = 0, at_entry = 0;
+    u32 at_phdr = 0, at_phnum = 0, at_phent = 0, at_entry = 0, at_random = 0;
     for (;; p += 2) {
         if (p[0] == AT_NULL) break;
-        if (p[0] == AT_PHDR)  at_phdr  = p[1];
-        if (p[0] == AT_PHENT) at_phent = p[1];
-        if (p[0] == AT_PHNUM) at_phnum = p[1];
-        if (p[0] == AT_ENTRY) at_entry = p[1];
+        if (p[0] == AT_PHDR)   at_phdr   = p[1];
+        if (p[0] == AT_PHENT)  at_phent  = p[1];
+        if (p[0] == AT_PHNUM)  at_phnum  = p[1];
+        if (p[0] == AT_ENTRY)  at_entry  = p[1];
+        if (p[0] == AT_RANDOM) at_random = p[1];
     }
     (void)at_phent;
     if (!at_phdr || !at_phnum) fail("bad auxv", 0);
+
+    /* Library ASLR: shift the first library by 0..31 pages. */
+    if (at_random) {
+        u32 r = *(u32*)at_random;
+        next_base = LIB_BASE + ((r & 0x1Fu) << 12);
+    }
 
     /* ---- main program: derive its load bias from AT_PHDR ---- */
     obj_t* m = &objs[0];
