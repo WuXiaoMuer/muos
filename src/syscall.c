@@ -1182,6 +1182,28 @@ static uint32_t do_recvfrom(uint32_t fd, uint32_t buf, uint32_t len,
     return (uint32_t)n;
 }
 
+static uint32_t do_getsockname(uint32_t fd, uint32_t addr, uint32_t alenp) {
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    if (!addr || !user_ptr_ok(addr, 16)) return err(ERR_EFAULT);
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (net_getsockname(id, &ip, &port) < 0) return err(ERR_EBADF);
+    write_sockaddr(addr, alenp, ip, port);
+    return 0;
+}
+
+static uint32_t do_getpeername(uint32_t fd, uint32_t addr, uint32_t alenp) {
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    if (!addr || !user_ptr_ok(addr, 16)) return err(ERR_EFAULT);
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (net_getpeername(id, &ip, &port) < 0) return err(ERR_ENOTCONN);
+    write_sockaddr(addr, alenp, ip, port);
+    return 0;
+}
+
 /* i386 socketcall(102): huge switch over the old multiplexed ABI. */
 static uint32_t do_socketcall(uint32_t call, uint32_t args) {
     if (!args || !user_ptr_ok(args, 6 * 4)) return err(ERR_EFAULT);
@@ -1198,8 +1220,8 @@ static uint32_t do_socketcall(uint32_t call, uint32_t args) {
             if (id < 0) return err(ERR_EBADF);
             return (uint32_t)(id + NET_FD_BASE);
         }
-        case 6:  return 0;                      /* getsockname: no-op */
-        case 7:  return 0;                      /* getpeername: no-op */
+        case 6:  return do_getsockname(a[0], a[1], a[2]);
+        case 7:  return do_getpeername(a[0], a[1], a[2]);
         case 9:  return do_sendto(a[0], a[1], a[2], a[3], 0, 0);
         case 10: return do_recvfrom(a[0], a[1], a[2], a[3], 0, 0);
         case 11: return do_sendto(a[0], a[1], a[2], a[3], a[4], a[5]);
@@ -3185,9 +3207,13 @@ void syscall_handler(registers_t* regs) {
         case SYS_getsockopt:
             ret = 0;
             break;
-        case SYS_socketpair:
         case SYS_getsockname:
+            ret = do_getsockname(regs->ebx, regs->ecx, regs->edx);
+            break;
         case SYS_getpeername:
+            ret = do_getpeername(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_socketpair:
         case SYS_sendmsg:
         case SYS_recvmsg:
             ret = err(ERR_ENOSYS);

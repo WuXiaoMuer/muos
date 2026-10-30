@@ -112,6 +112,8 @@ int muos_bind(int fd, const void* addr, int len);
 int muos_listen(int fd, int backlog);
 int muos_accept(int fd);
 int muos_connect(int fd, const void* addr, int len);
+int muos_getsockname(int fd, void* addr, int* len);
+int muos_getpeername(int fd, void* addr, int* len);
 int muos_send(int fd, const void* buf, unsigned len, int flags);
 int muos_recv(int fd, void* buf, unsigned len, int flags);
 int muos_sendto(int fd, const void* buf, unsigned len, int flags,

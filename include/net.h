@@ -45,6 +45,8 @@ int net_sendto(int id, const void* data, uint32_t len,
 int net_recvfrom(int id, void* buf, uint32_t maxlen,
                  uint32_t* ip, uint16_t* port);
 int net_close(int id);
+int net_getsockname(int id, uint32_t* ip, uint16_t* port);
+int net_getpeername(int id, uint32_t* ip, uint16_t* port);
 bool_t net_socket_ok(int id);
 
 #endif

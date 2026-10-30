@@ -60,7 +60,25 @@ typedef struct {
     bool_t   echo_mode;     /* kernel demo echo service (port 7) */
     uint32_t snd_nxt;
     uint32_t rcv_nxt;
+    uint32_t snd_una;       /* first unacknowledged sequence number */
+    uint32_t cwnd;          /* congestion window, in bytes */
+    uint32_t ssthresh;
+
+    /* Single-outstanding-segment retransmission (RTO with exponential
+     * backoff). Enough for the QEMU user-net and a lost-segment demo. */
+    bool_t   rtx_pending;
+    uint32_t rtx_seq, rtx_end;
+    uint32_t rtx_deadline, rto;
+    uint8_t  rtx_flags, rtx_retries;
+    uint16_t rtx_len;
+    uint8_t  rtx_data[480];
 } net_sock_t;
+
+#define TCP_MSS 480u
+#define TCP_RTO_MIN 100u        /* PIT ticks (10ms each) = 1s */
+#define TCP_RTO_MAX 800u
+#define TCP_RETRIES 5
+#define TCP_CWND_MAX 65535u
 
 #define TCP_CLOSED    0
 #define TCP_LISTEN    1
@@ -114,6 +132,7 @@ static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
                          uint8_t flags, const uint8_t* data, uint32_t len);
 static void tcp_input(uint32_t src, uint32_t dst,
                       const uint8_t* seg, uint32_t len);
+static void tcp_timers(void);
 static void dhcp_input(const uint8_t* b, uint32_t len);
 
 static uint16_t net_cksum(const uint8_t* data, uint32_t len, uint32_t sum0) {
@@ -342,6 +361,7 @@ static void net_poll(void) {
 
         net_handle_frame(rx_frame, flen);
     }
+    tcp_timers();
     /* CAPR is 16 bytes ahead of the internal read pointer on the RTL8139
      * (QEMU mirrors the chip): writing x makes the chip read from x+16,
      * so compensate to publish our actual read offset. */
@@ -573,8 +593,9 @@ static uint16_t tcp_cksum(uint32_t src, uint32_t dst,
     return net_cksum(seg, len, sum);
 }
 
-static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
-                         uint8_t flags, const uint8_t* data, uint32_t len) {
+/* Build and transmit one TCP segment without touching retransmission state. */
+static void tcp_emit(net_sock_t* s, uint32_t seq, uint32_t ack,
+                     uint8_t flags, const uint8_t* data, uint32_t len) {
     if (len > 512) len = 512;
     uint8_t* t = tcp_seg;
     put16be(t + 0, s->lport);
@@ -589,6 +610,69 @@ static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
     if (len) memcpy(t + 20, data, len);
     put16be(t + 16, tcp_cksum(local_ip_for(s->rip), s->rip, t, 20 + len));
     net_send_ip_raw(6, s->rip, t, 20 + len);
+}
+
+/* Send a segment that carries sequence-space (SYN/FIN/data) and arm the
+ * retransmission timer for it. Pure ACKs are sent without arming. */
+static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
+                         uint8_t flags, const uint8_t* data, uint32_t len) {
+    tcp_emit(s, seq, ack, flags, data, len);
+
+    if (len == 0 && !(flags & (TCP_F_SYN | TCP_F_FIN))) return;
+    s->rtx_pending = true;
+    s->rtx_seq  = seq;
+    s->rtx_end  = seq + len +
+                  ((flags & TCP_F_SYN) ? 1u : 0u) +
+                  ((flags & TCP_F_FIN) ? 1u : 0u);
+    s->rtx_flags = flags;
+    s->rtx_len = (uint16_t)(len > TCP_MSS ? TCP_MSS : len);
+    if (s->rtx_len) memcpy(s->rtx_data, data, s->rtx_len);
+    s->rtx_retries = 0;
+    s->rto = TCP_RTO_MIN;
+    s->rtx_deadline = pit_get_ticks() + s->rto;
+}
+
+/* ACK processing: advance snd_una, clear the retransmission entry and
+ * grow the congestion window (slow start / congestion avoidance). */
+static void tcp_ack(net_sock_t* s, uint32_t ack) {
+    if ((int32_t)(ack - s->snd_una) <= 0) return;
+    s->snd_una = ack;
+    if (s->rtx_pending && (int32_t)(ack - s->rtx_end) >= 0)
+        s->rtx_pending = false;
+
+    if (s->cwnd >= s->ssthresh)
+        s->cwnd += (TCP_MSS * TCP_MSS) / (s->cwnd ? s->cwnd : TCP_MSS);
+    else
+        s->cwnd += TCP_MSS;
+    if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
+}
+
+/* RTO timer: retransmit the single outstanding segment with exponential
+ * backoff; collapse the congestion window on every timeout. */
+static void tcp_timers(void) {
+    uint32_t now = pit_get_ticks();
+    int n = NET_FD_MAX - NET_FD_BASE;
+    for (int i = 0; i < n; i++) {
+        net_sock_t* s = &socks[i];
+        if (!s->used || s->type != NET_SOCK_STREAM || !s->rtx_pending) continue;
+        if ((int32_t)(now - s->rtx_deadline) < 0) continue;
+
+        if (s->rtx_retries >= TCP_RETRIES) {
+            s->rtx_pending = false;
+            s->tcp_state = TCP_CLOSED;
+            s->used = false;
+            continue;
+        }
+        s->rtx_retries++;
+        s->ssthresh = s->cwnd > TCP_MSS * 2 ? s->cwnd / 2 : TCP_MSS * 2;
+        s->cwnd = TCP_MSS;
+        s->rto = s->rto < TCP_RTO_MAX / 2 ? s->rto * 2 : TCP_RTO_MAX;
+
+        uint32_t seq = s->rtx_seq;
+        uint32_t ack = (s->rtx_flags & TCP_F_SYN) ? 0 : s->rcv_nxt;
+        s->rtx_deadline = now + s->rto;
+        tcp_emit(s, seq, ack, s->rtx_flags, s->rtx_data, s->rtx_len);
+    }
 }
 
 static net_sock_t* tcp_find(uint32_t dst, uint16_t sport, uint16_t dport,
@@ -650,10 +734,17 @@ static void tcp_input(uint32_t src, uint32_t dst,
             child->parent = listener_id;
             child->rcv_nxt = seq + 1;
             child->snd_nxt = 0x20000000u + (uint32_t)(child - socks) * 0x1000u;
+            child->snd_una = child->snd_nxt;
+            child->cwnd = TCP_MSS;
+            child->ssthresh = TCP_CWND_MAX;
             child->tcp_state = TCP_SYN_RCVD;
-            tcp_send_seg(child, child->snd_nxt, child->rcv_nxt,
+            /* Consume the SYN sequence number before transmitting: loopback
+             * delivers the reply synchronously, so the peer's ACK can arrive
+             * inside this call and must see the updated snd_nxt. */
+            uint32_t cseq = child->snd_nxt;
+            child->snd_nxt = cseq + 1;
+            tcp_send_seg(child, cseq, child->rcv_nxt,
                          TCP_F_SYN | TCP_F_ACK, NULL, 0);
-            child->snd_nxt++;
         } else if (echo && (flags & TCP_F_SYN) && !(flags & TCP_F_ACK)) {
             net_sock_t* child = tcp_new_sock();
             if (!child) return;
@@ -666,10 +757,14 @@ static void tcp_input(uint32_t src, uint32_t dst,
             child->echo_mode = true;
             child->rcv_nxt = seq + 1;
             child->snd_nxt = 0x30000000u + (uint32_t)(child - socks) * 0x1000u;
+            child->snd_una = child->snd_nxt;
+            child->cwnd = TCP_MSS;
+            child->ssthresh = TCP_CWND_MAX;
             child->tcp_state = TCP_SYN_RCVD;
-            tcp_send_seg(child, child->snd_nxt, child->rcv_nxt,
+            uint32_t cseq = child->snd_nxt;
+            child->snd_nxt = cseq + 1;
+            tcp_send_seg(child, cseq, child->rcv_nxt,
                          TCP_F_SYN | TCP_F_ACK, NULL, 0);
-            child->snd_nxt++;
         }
         return;
     }
@@ -678,6 +773,8 @@ static void tcp_input(uint32_t src, uint32_t dst,
         s->used = false;
         return;
     }
+
+    if (flags & TCP_F_ACK) tcp_ack(s, ack);
 
     if (s->tcp_state == TCP_SYN_SENT && (flags & TCP_F_SYN) && (flags & TCP_F_ACK)) {
         if (ack == s->snd_nxt) {
@@ -723,9 +820,26 @@ static void tcp_input(uint32_t src, uint32_t dst,
 static int tcp_send_data(net_sock_t* s, const void* data, uint32_t len) {
     if (s->tcp_state != TCP_ESTAB && s->tcp_state != TCP_CLOSE_WAIT) return -1;
     uint32_t sent = 0;
+    uint32_t guard = 0;
     while (sent < len) {
+        uint32_t inflight = s->snd_nxt - s->snd_una;
+        uint32_t window = s->cwnd ? s->cwnd : TCP_MSS;
+
+        if (inflight >= window) {
+            /* Congestion window is full: wait for ACKs (poll also runs
+             * the RTO timer and may abort the connection). */
+            net_poll();
+            if (s->tcp_state == TCP_CLOSED) {
+                return sent ? (int)sent : -1;
+            }
+            if (++guard > 2000) return -1;      /* ~20 s */
+            __asm__ volatile ("sti; hlt; cli");
+            continue;
+        }
+
         uint32_t chunk = len - sent;
-        if (chunk > 480) chunk = 480;
+        if (chunk > TCP_MSS) chunk = TCP_MSS;
+        if (chunk > window - inflight) chunk = window - inflight;
         tcp_send_seg(s, s->snd_nxt, s->rcv_nxt,
                      TCP_F_PSH | TCP_F_ACK,
                      (const uint8_t*)data + sent, chunk);
@@ -785,14 +899,19 @@ int net_connect(int id, uint32_t ip, uint16_t port) {
     s->tcp_state = TCP_SYN_SENT;
     s->rcv_nxt = 0;
     s->snd_nxt = 0x10000000u + (uint32_t)id * 0x1000u;
+    s->snd_una = s->snd_nxt;
+    s->cwnd = TCP_MSS;
+    s->ssthresh = TCP_CWND_MAX;
     uint32_t seq = s->snd_nxt;
     s->snd_nxt = seq + 1;            /* SYN consumes one sequence number */
+    s->rtx_pending = false;
     tcp_send_seg(s, seq, 0, TCP_F_SYN, NULL, 0);
-    for (uint32_t loops = 0; loops < 100; loops++) {
+    /* SYN retransmission is handled by tcp_timers (up to TCP_RETRIES). */
+    for (uint32_t loops = 0; loops < 1000; loops++) {
         if (s->tcp_state == TCP_ESTAB && s->used) return 0;
         if (!s->used) return -1;
-        __asm__ volatile ("sti; hlt; cli");
         net_poll();
+        __asm__ volatile ("sti; hlt; cli");
     }
     return (s->tcp_state == TCP_ESTAB) ? 0 : -1;
 }
@@ -869,6 +988,25 @@ int net_close(int id) {
         s->snd_nxt++;
     }
     memset(s, 0, sizeof(*s));
+    return 0;
+}
+
+/* getsockname/getpeername: report the real bind/connect tuple instead of
+ * the 0.0.0.0:0 placeholders the old stub returned. */
+int net_getsockname(int id, uint32_t* ip, uint16_t* port) {
+    if (!net_socket_ok(id)) return -1;
+    net_sock_t* s = &socks[id];
+    if (ip)   *ip   = s->bound ? local_ip_for(s->rip) : 0;
+    if (port) *port = s->bound ? s->lport : 0;
+    return 0;
+}
+
+int net_getpeername(int id, uint32_t* ip, uint16_t* port) {
+    if (!net_socket_ok(id)) return -1;
+    net_sock_t* s = &socks[id];
+    if (!s->connected) return -1;
+    if (ip)   *ip   = s->rip;
+    if (port) *port = s->rport;
     return 0;
 }
 

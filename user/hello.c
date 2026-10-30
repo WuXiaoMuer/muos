@@ -282,38 +282,117 @@ int main(int argc, char** argv) {
     }
 
     if (argc > 1 && arg_is(argv[1], "tcp")) {
-        /* SOCK_STREAM over the local loopback against the kernel's demo
-         * echo service on 127.0.0.1:7: handshake, send, receive echo, FIN. */
+        /* 1) Two concurrent connections to the kernel echo service on
+         *    127.0.0.1:7 (multi-socket + congestion window).
+         * 2) getsockname/getpeername must report the real 4-tuple.
+         * 3) User-space listen/accept with two forked clients. */
         int ok = 1;
         muos_sockaddr_in_t sa;
+        muos_sockaddr_in_t ga;
+        int glen;
+        char rb[64];
 
         int c = muos_socket(MUOS_AF_INET, MUOS_SOCK_STREAM, 0);
-        muos_puts("tcp: client="); muos_putdec(c); muos_puts("\n");
-        ok = ok && c >= 0;
+        int c2 = muos_socket(MUOS_AF_INET, MUOS_SOCK_STREAM, 0);
+        muos_puts("tcp: clients="); muos_putdec(c); muos_puts(","); muos_putdec(c2);
+        muos_puts("\n");
+        ok = ok && c >= 0 && c2 >= 0;
 
         sa.sin_family = MUOS_AF_INET;
         sa.sin_port = htons16(7);
         sa.sin_addr = IP4(127,0,0,1);
         sa.pad[0] = sa.pad[1] = 0;
         int rc = muos_connect(c, &sa, 16);
-        muos_puts("tcp: connect="); muos_putdec(rc); muos_puts("\n");
-        ok = ok && rc == 0;
+        int rc2 = muos_connect(c2, &sa, 16);
+        muos_puts("tcp: connect="); muos_putdec(rc); muos_puts(",");
+        muos_putdec(rc2); muos_puts("\n");
+        ok = ok && rc == 0 && rc2 == 0;
+
+        /* getpeername on c: 127.0.0.1:7; getsockname: a bound local port. */
+        glen = 16;
+        rc = muos_getpeername(c, &ga, &glen);
+        int peer_ok = rc == 0 && ga.sin_addr == IP4(127,0,0,1) &&
+                      ga.sin_port == htons16(7);
+        glen = 16;
+        rc2 = muos_getsockname(c, &ga, &glen);
+        int local_ok = rc2 == 0 && ga.sin_addr == IP4(127,0,0,1) &&
+                       ga.sin_port != 0;
+        muos_puts("tcp: names="); muos_putdec(peer_ok); muos_puts(",");
+        muos_putdec(local_ok); muos_puts("\n");
+        ok = ok && peer_ok && local_ok;
 
         const char msg[] = "TCP-ECHO-REQ";
-        int n = muos_send(c, msg, sizeof(msg) - 1, 0);
-        muos_puts("tcp: send="); muos_putdec(n); muos_puts("\n");
-        ok = ok && n == (int)sizeof(msg) - 1;
+        const char msg2[] = "TCP-ECHO-2";
+        int n1 = muos_send(c, msg, sizeof(msg) - 1, 0);
+        int n2 = muos_send(c2, msg2, sizeof(msg2) - 1, 0);
+        muos_puts("tcp: send="); muos_putdec(n1); muos_puts(",");
+        muos_putdec(n2); muos_puts("\n");
+        ok = ok && n1 == (int)sizeof(msg) - 1 && n2 == (int)sizeof(msg2) - 1;
 
-        char rb[64];
-        int rn = muos_recv(c, rb, sizeof(rb) - 1, 0);
-        int same = (rn == (int)sizeof(msg) - 1) ? 1 : 0;
-        for (int i = 0; same && i < rn; i++) if (rb[i] != msg[i]) same = 0;
-        muos_puts("tcp: recv="); muos_putdec(rn);
-        muos_puts(same ? " echo-ok\n" : " echo-bad\n");
-        ok = ok && same;
+        int rn1 = muos_recv(c, rb, sizeof(rb) - 1, 0);
+        int same1 = (rn1 == (int)sizeof(msg) - 1) ? 1 : 0;
+        for (int i = 0; same1 && i < rn1; i++) if (rb[i] != msg[i]) same1 = 0;
+        int rn2 = muos_recv(c2, rb, sizeof(rb) - 1, 0);
+        int same2 = (rn2 == (int)sizeof(msg2) - 1) ? 1 : 0;
+        for (int i = 0; same2 && i < rn2; i++) if (rb[i] != msg2[i]) same2 = 0;
+        muos_puts("tcp: recv="); muos_putdec(rn1); muos_puts(",");
+        muos_putdec(rn2); muos_puts(same1 && same2 ? " echo-ok\n" : " echo-bad\n");
+        ok = ok && same1 && same2;
         muos_close(c);
+        muos_close(c2);
 
-        muos_puts(ok ? "TCP-OK\n" : "TCP-BAD\n");
+        /* ---- user-space listen/accept with two concurrent clients ---- */
+        int lfd = muos_socket(MUOS_AF_INET, MUOS_SOCK_STREAM, 0);
+        sa.sin_family = MUOS_AF_INET;
+        sa.sin_port = htons16(9000);
+        sa.sin_addr = 0;                    /* any local address */
+        sa.pad[0] = sa.pad[1] = 0;
+        int brc = muos_bind(lfd, &sa, 16);
+        int lrc = muos_listen(lfd, 2);
+        muos_puts("tcp: listen="); muos_putdec(brc); muos_puts(",");
+        muos_putdec(lrc); muos_puts("\n");
+        ok = ok && brc == 0 && lrc == 0;
+
+        /* Self-connect: the kernel completes the handshake synchronously
+         * over loopback, then accept() must return the server-side socket.
+         * (Kernel-side wakeups cannot preempt a Ring0 syscall poll loop, so
+         * a two-process client/server test is not possible yet.) */
+        int cli = muos_socket(MUOS_AF_INET, MUOS_SOCK_STREAM, 0);
+        sa.sin_family = MUOS_AF_INET;
+        sa.sin_port = htons16(9000);
+        sa.sin_addr = IP4(127,0,0,1);
+        sa.pad[0] = sa.pad[1] = 0;
+        int crc = muos_connect(cli, &sa, 16);
+        int a = muos_accept(lfd);
+        muos_puts("tcp: self-connect="); muos_putdec(crc);
+        muos_puts(" accept="); muos_putdec(a); muos_puts("\n");
+        ok = ok && crc == 0 && a >= 0;
+
+        if (a >= 0) {
+            const char rq[] = "ACCEPT-REQ";
+            muos_send(cli, rq, sizeof(rq) - 1, 0);
+            char ab[32];
+            int an = muos_recv(a, ab, sizeof(ab) - 1, 0);
+            int got = (an == (int)sizeof(rq) - 1);
+            for (int i = 0; got && i < an; i++) if (ab[i] != rq[i]) got = 0;
+            muos_puts("tcp: accept-recv="); muos_putdec(an);
+            muos_puts(got ? " data-ok\n" : " data-bad\n");
+            ok = ok && got;
+
+            muos_send(a, "OK", 2, 0);
+            int rn = muos_recv(cli, ab, sizeof(ab) - 1, 0);
+            muos_puts("tcp: client-recv="); muos_putdec(rn);
+            muos_puts(rn == 2 && ab[0] == 'O' && ab[1] == 'K' ? " reply-ok\n"
+                                                              : " reply-bad\n");
+            ok = ok && rn == 2 && ab[0] == 'O' && ab[1] == 'K';
+            muos_close(a);
+        }
+        muos_close(cli);
+        muos_close(lfd);
+        muos_puts(ok ? "ACCEPT-OK\n" : "ACCEPT-BAD\n");
+        if (!ok) { muos_puts("TCP-BAD\n"); return 0; }
+
+        muos_puts("TCP-OK\n");
         return 0;
     }
 

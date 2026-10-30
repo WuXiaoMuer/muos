@@ -244,6 +244,14 @@ int muos_connect(int fd, const void* addr, int len) {
     return syscall3(362, fd, (int)addr, len);
 }
 
+int muos_getsockname(int fd, void* addr, int* len) {
+    return syscall3(367, fd, (int)addr, (int)len);
+}
+
+int muos_getpeername(int fd, void* addr, int* len) {
+    return syscall3(368, fd, (int)addr, (int)len);
+}
+
 int muos_send(int fd, const void* buf, unsigned len, int flags) {
     return syscall5(369, fd, (int)buf, (int)len, flags, 0);
 }
