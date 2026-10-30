@@ -5,7 +5,7 @@
 - **完整启动链**:Multiboot1(QEMU `-kernel`)+ 自研 El Torito 光盘引导
 - **硬件抽象**:GDT / IDT(256 项全覆盖)/ PIC / PIT / PS/2 键盘 + PS/2 鼠标 / 串口 / VGA 文本模式
 - **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、**higher-half 内核**(链接 0xC0100000 / 物理 0x100000,引导期自举页表,全 RAM 恒等映射 + 0xC0000000 别名)、内核堆(kmalloc/kfree/kcalloc)
-- **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,在 0x08048000 起的 8MB 用户窗口内运行 C 程序;每个进程有独立 8MB 物理块与页目录(CR3 切换),100Hz 抢占轮转;ELF 可来自内核内嵌(`run`)、RAM FS(`exec hello.elf`)或 Multiboot 模块;支持 ET_EXEC 与 ET_DYN(PIE,`run pie`);用户态故障只杀进程,不 panic 内核
+- **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,在 0x08048000 起的用户窗口内运行 C 程序(默认 8MB,`build.ps1 -SandboxMB` 可改为 8/12/16/32MB 等 4MB 倍数);每个进程有独立页目录(CR3 切换),**fork 为写时复制**(共享页只读,首次写才复制一页),100Hz 抢占轮转;ELF 可来自内核内嵌(`run`)、RAM FS(`exec hello.elf`)或 Multiboot 模块;支持 ET_EXEC 与 ET_DYN(PIE,`run pie`);用户态故障只杀进程,不 panic 内核
 - **进程与信号**:`fork/execve/wait4/waitid`、`clone` 线程(`CLONE_VM/FILES/THREAD/SETTLS`,共享地址空间)、信号 pending/blocked 掩码与 `signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline、默认终止动作、`alarm`;阻塞 `wait4/waitid/poll/read` 在管道/键盘/定时器事件上唤醒
 - **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;多级 RAM FS(`mkdir/rmdir`、子目录路径解析)与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块;`/dev/hda` 提供 ATA PIO 块设备(跨启动持久化)
 - **ATA 磁盘 + MuFS**:primary master PIO / 28-bit LBA,`/dev/hda` 字节级读写(部分扇区读改写);扇区 0 超级块、元数据表、16×64KB 数据槽,所有文件变更写穿、`fsync/sync` 全量刷新、开机自动挂载(无盘时退回纯 RAM FS);`tools/test_ata.py` 两次启动验证文件内容与裸扇区数据都保留
@@ -91,6 +91,7 @@ muos/
 # 日常启动脚本(默认 ISO:VBE + RTL8139,pixel 可用;会先做增量构建)
 .\run.ps1
 .\run.ps1 -Kernel        # 等价于 build.ps1 -Run(无 VBE)
+.\build.ps1 -SandboxMB 16 # 用户沙箱改为 16MB(>=8 且为 4 的倍数)
 .\run.ps1 -Disk          # 额外挂一个 build\ata_disk.img(ATA/MuFS 测试)
 .\run.ps1 -NoBuild       # 不构建,直接启动已有产物
 
@@ -206,7 +207,7 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - `nanosleep` 在单进程/没有其他可运行进程时用 `sti; hlt` 等 PIT tick(100Hz),整机暂停到时间到期;`times` 返回 tick 数,`getrusage` 返回全零结构,`chown/lchown/fchown/fchownat` 只校验目标(不跟踪所有权),`readlink` 对非符号链接返回 `EINVAL`。
 - `*at` 路径解析:绝对路径忽略 dirfd;相对路径在 `AT_FDCWD(-100)` 时按 cwd,在目录 fd 时拼接该 fd 的绝对路径;`fstatat64` 空路径 + `AT_EMPTY_PATH` 直接 stat dirfd,`unlinkat` 的 `AT_REMOVEDIR` 走 rmdir 语义。VFS 暂无符号链接,`readlinkat` 对已存在目标返回 `EINVAL`。
 - 路径统一规范化:支持绝对/相对路径、`.` 与 `..`(父目录越界时停在 `/`)。命名空间 = 扁平 RAM FS 根目录 + `/dev`、`/proc`、`/etc` 虚拟目录;`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`。
-- 沙箱要求物理 RAM > 128MB;ISO 路径现在通过自建 E820 info 获得真实内存图,内存足够时 `exec` 可正常运行,内存不足时才提示并优雅拒绝。
+- 沙箱要求物理 RAM > 128MB;ISO 路径现在通过自建 E820 info 获得真实内存图,内存足够时 `exec` 可正常运行,内存不足时才提示并优雅拒绝。沙箱大小在构建期可配(`-SandboxMB`,默认 8);fork 使用页级 COW(帧引用计数 + 写故障内存复制),但尚无按需分页/页面换出。
 
 ## 真实 Linux 二进制(BusyBox)
 

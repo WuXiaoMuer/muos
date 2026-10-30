@@ -3,7 +3,8 @@ param(
     [switch]$Run,
     [switch]$Iso,
     [switch]$Clean,
-    [int]$Jobs = 0
+    [int]$Jobs = 0,
+    [int]$SandboxMB = 8
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,7 +82,12 @@ Write-Host ""
 # ======================== Build ========================
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
+if ($SandboxMB -lt 8 -or ($SandboxMB % 4) -ne 0) {
+    Write-Host "[ERROR] -SandboxMB must be >= 8 and a multiple of 4" -ForegroundColor Red
+    exit 1
+}
 $CFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
+             "-DUSER_SANDBOX_MB=$SandboxMB",
              "-fno-exceptions", "-fno-stack-protector", "-nostdinc",
              # Keep GCC from turning our byte loops in string.c into
              # calls to memcpy/memset (self-recursion hazard in a

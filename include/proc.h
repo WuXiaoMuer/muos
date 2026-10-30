@@ -90,6 +90,7 @@ typedef struct {
     int32_t  wait_pid;
     uint32_t wait_status_ptr;
     uint32_t wait_infop;
+    uint32_t last_wait_pid;    /* child reported by a wakeup, reaped on next wait */
     uint32_t blk_ptr;          /* poll fds array / user buffer */
     int32_t  blk_len;          /* nfds / byte count */
     int32_t  blk_fd;           /* read() fd for PROC_WAIT_READ */
@@ -121,6 +122,10 @@ char     proc_state_char(const proc_t* p);
 /* Address space helpers (return false on allocation failure) */
 bool_t   proc_snapshot_alloc(proc_t* p);
 bool_t   proc_space_share(proc_t* child, proc_t* parent);
+/* Copy-on-write fork: share pages read-only until one side writes. */
+bool_t   proc_space_cow(proc_t* child, proc_t* parent);
+/* Make the current process's user pages private (execve rewrites them). */
+bool_t   proc_detach_current(void);
 void     proc_snapshot_free(proc_t* p);
 
 /* fd table helpers */

@@ -2648,14 +2648,12 @@ static uint32_t do_fork(registers_t* regs) {
     proc_t* child = proc_alloc(parent->name, parent->pid);
     if (!child) return err(ERR_EAGAIN);
 
-    if (!proc_snapshot_alloc(child) || !proc_fdstate_alloc(child)) {
+    /* Copy-on-write fork: the child shares the parent's user pages
+     * read-only; each side copies a page on its first write. */
+    if (!proc_space_cow(child, parent) || !proc_fdstate_alloc(child)) {
         proc_reap(child);
         return err(ERR_ENOMEM);
     }
-    /* Copy the parent's 8MB block into the child's private block. Both
-     * blocks live outside the user virtual window, so the kernel identity
-     * map reaches them regardless of the active CR3. */
-    memcpy(child->mem, parent->mem, USER_SIZE);
     user_fd_state_save(child->fd_state);
     user_fd_state_retain(child->fd_state);  /* child snapshot holds its own refs */
     child->fds_retained = true;
@@ -2699,10 +2697,7 @@ static uint32_t do_clone(registers_t* regs, uint32_t flags, uint32_t stack,
     if (share_vm) {
         if (!proc_space_share(child, parent)) { proc_reap(child); return err(ERR_ENOMEM); }
     } else {
-        if (!proc_snapshot_alloc(child)) { proc_reap(child); return err(ERR_ENOMEM); }
-        /* Shared files are never touched here: both blocks are kernel
-         * memory outside the user window. The trampoline page stays. */
-        memcpy(child->mem, parent->mem, USER_SIZE - PAGE_SIZE);
+        if (!proc_space_cow(child, parent)) { proc_reap(child); return err(ERR_ENOMEM); }
     }
 
     if (flags & CLONE_FILES) {
@@ -2745,8 +2740,10 @@ static uint32_t do_clone(registers_t* regs, uint32_t flags, uint32_t stack,
     if (ctid && user_ptr_ok(ctid, 4)) {
         if (share_vm) {
             *(uint32_t*)ctid = child->pid;
-        } else if (child->mem && ctid >= USER_BASE && ctid < USER_END) {
-            *(uint32_t*)((uint32_t)child->mem + (ctid - USER_BASE)) = child->pid;
+        } else if (child->pd_phys && ctid >= USER_BASE && ctid < USER_END) {
+            mm_user_make_writable(child->pd_phys, ctid);
+            uint32_t phys = mm_user_translate(child->pd_phys, ctid);
+            if (phys) *(uint32_t*)phys = child->pid;
         }
     }
 
@@ -2758,6 +2755,14 @@ static uint32_t do_wait4(registers_t* regs, uint32_t pid_arg,
     proc_t* parent = proc_current();
     if (!parent || parent->pid == 1) return err(ERR_ECHILD);
     if (status_ptr && !user_ptr_ok(status_ptr, 4)) return err(ERR_EFAULT);
+
+    /* The wakeup path reports the child but cannot free its kernel stack
+     * while it is still exiting; reap it here on the next wait call. */
+    if (parent->last_wait_pid) {
+        proc_t* done = proc_find(parent->last_wait_pid);
+        if (done && done->state == PROC_ZOMBIE) proc_reap(done);
+        parent->last_wait_pid = 0;
+    }
 
     int32_t want = (int32_t)pid_arg;
     proc_t* child = find_zombie_child(want);
@@ -2786,6 +2791,12 @@ static uint32_t do_waitid(registers_t* regs, uint32_t idtype, uint32_t id,
 
     proc_t* parent = proc_current();
     if (!parent || parent->pid == 1) return err(ERR_ECHILD);
+
+    if (parent->last_wait_pid) {
+        proc_t* done = proc_find(parent->last_wait_pid);
+        if (done && done->state == PROC_ZOMBIE) proc_reap(done);
+        parent->last_wait_pid = 0;
+    }
 
     /* idtype: 0 = P_ALL, 1 = P_PID, 2 = P_PGID (no pgid filtering). */
     int32_t want = (idtype == 1) ? (int32_t)id : -1;

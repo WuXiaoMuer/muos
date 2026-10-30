@@ -457,7 +457,9 @@ bool_t user_handle_fault(registers_t* regs) {
     vga_print("\n  Returning to shell.\n");
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
 
-    serial_write("\n[user] fault: ");
+    serial_write("\n[user] fault: pid=");
+    { proc_t* dbg = proc_current(); serial_dec(dbg ? dbg->pid : 0); }
+    serial_write(" ");
     serial_write(regs->int_no < 32 ? exception_names[regs->int_no] : "unknown");
     serial_write(" EIP="); serial_hex(regs->eip);
     serial_write(" CS=");  serial_hex(regs->cs);
@@ -584,6 +586,10 @@ int user_exec_image(const void* img, uint32_t img_size, int argc,
                     const char* const* argv,
                     uint32_t* entry_out, uint32_t* sp_out) {
     if (!img || img_size == 0) return -1;
+
+    /* execve rewrites the whole window: privatize COW pages first so a
+     * forked child cannot scribble over the parent's still-shared pages. */
+    proc_detach_current();
 
     /* The top page is the read-only sigreturn trampoline. */
     memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);

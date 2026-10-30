@@ -7,6 +7,7 @@
 #include "string.h"
 #include "pipe.h"
 #include "keyboard.h"
+#include "serial.h"
 
 static proc_t procs[PROC_MAX];
 static proc_t* current_proc = NULL;
@@ -18,11 +19,14 @@ static uint32_t kernel_stack_pages(void) {
 
 /* ---- refcounted address space ---- */
 
+static uint8_t* proc_user_ptr(proc_t* p, uint32_t uptr);
+
 static void proc_space_unref(proc_space_t* s) {
     if (!s) return;
     if (s->refs > 1) { s->refs--; return; }
-    if (s->pd_phys)   mm_free_user_pd(s->pd_phys);
-    if (s->mem)       mm_free_pages(s->mem, s->mem_pages);
+    /* Release per-page references (COW pages may now live in other blocks). */
+    if (s->pd_phys)    mm_user_release_pages(s->pd_phys);
+    if (s->pd_phys)    mm_free_user_pd(s->pd_phys);
     if (s->tramp_phys) mm_free_page((void*)s->tramp_phys);
     kfree(s);
 }
@@ -65,6 +69,51 @@ static bool_t proc_space_alloc(proc_t* p) {
     p->mem_pages = s->mem_pages;
     p->pd_phys = s->pd_phys;
     return true;
+}
+
+/* Copy-on-write fork: both processes map the same physical pages read-only;
+ * the first write to each page copies it in mm_user_make_writable(). */
+bool_t proc_space_cow(proc_t* child, proc_t* parent) {
+    if (!child || !parent || !parent->space) return false;
+    proc_space_t* s = kmalloc(sizeof(*s));
+    if (!s) return false;
+    memset(s, 0, sizeof(*s));
+    s->mem = parent->mem;
+    s->mem_pages = parent->mem_pages;
+    s->tramp_phys = (uint32_t)mm_alloc_page();
+    if (!s->tramp_phys) { kfree(s); return false; }
+    uint8_t* t = (uint8_t*)s->tramp_phys;
+    memset(t, 0, PAGE_SIZE);
+    t[0] = 0xB8; t[1] = 173; t[5] = 0xCD; t[6] = 0x80;
+
+    /* Clone the parent's *current* page tables: pages already privatized
+     * by an earlier COW must not be remapped to the stale block base. */
+    s->pd_phys = mm_clone_user_pd(parent->pd_phys, s->tramp_phys);
+    if (!s->pd_phys) {
+        mm_free_page((void*)s->tramp_phys);
+        kfree(s);
+        return false;
+    }
+    mm_user_write_protect(s->pd_phys);           /* child: read-only */
+    if (parent->pd_phys) mm_user_write_protect(parent->pd_phys);
+    for (uint32_t va = USER_BASE; va < USER_SIGTRAMP; va += PAGE_SIZE) {
+        uint32_t phys = mm_user_translate(s->pd_phys, va);
+        if (phys) mm_page_ref_inc(phys);
+    }
+
+    s->refs = 1;
+    child->space = s;
+    child->mem = s->mem;
+    child->mem_pages = s->mem_pages;
+    child->pd_phys = s->pd_phys;
+    return true;
+}
+
+/* Privatize the current process's pages before execve rewrites the image. */
+bool_t proc_detach_current(void) {
+    proc_t* p = proc_current();
+    if (!p || !p->pd_phys) return false;
+    return mm_user_detach_pages(p->pd_phys);
 }
 
 bool_t proc_space_share(proc_t* child, proc_t* parent) {
@@ -298,10 +347,9 @@ static void sched_load(proc_t* p, registers_t* regs) {
 /* Write a 32-bit value into a (possibly blocked) process's user memory
  * through its physical block, since its page directory is not active. */
 static void proc_write_user_u32(proc_t* p, uint32_t uptr, uint32_t value) {
-    if (!p || !p->mem) return;
-    if (uptr < USER_BASE || uptr > USER_END - 4) return;
-    uint32_t phys = (uint32_t)p->mem + (uptr - USER_BASE);
-    *(uint32_t*)phys = value;
+    if (!p || uptr < USER_BASE || uptr > USER_END - 4) return;
+    uint8_t* dst = proc_user_ptr(p, uptr);
+    if (dst) *(uint32_t*)dst = value;
 }
 
 static void proc_wake_parent(proc_t* child) {
@@ -314,6 +362,7 @@ static void proc_wake_parent(proc_t* child) {
             proc_write_user_u32(parent, parent->wait_status_ptr,
                                 (uint32_t)(child->exit_code & 0xFF) << 8);
         parent->eax = child->pid;
+        parent->last_wait_pid = child->pid;
     } else if (parent->wait_kind == PROC_WAIT_WAITID) {
         uint32_t base = parent->wait_infop;
         proc_write_user_u32(parent, base + 0, 17);                 /* SIGCHLD */
@@ -324,6 +373,7 @@ static void proc_wake_parent(proc_t* child) {
         proc_write_user_u32(parent, base + 20,
                             (uint32_t)(child->exit_code & 0xFF));
         parent->eax = 0;
+        parent->last_wait_pid = child->pid;
     }
     parent->wait_kind = PROC_WAIT_NONE;
     parent->state = PROC_READY;
@@ -557,7 +607,16 @@ bool_t proc_sigreturn(registers_t* regs) {
 /* A blocked process's page directory is not active: user pointers are
  * translated through its physical block (identity-addressable). */
 static uint8_t* proc_user_ptr(proc_t* p, uint32_t uptr) {
-    if (!p || !p->mem || uptr < USER_BASE || uptr >= USER_END) return NULL;
+    if (!p || uptr < USER_BASE || uptr >= USER_END) return NULL;
+    if (p->pd_phys) {
+        /* Wakeup writers go through the target process's page table so a
+         * COW page is privatized before the kernel writes into it. */
+        mm_user_make_writable(p->pd_phys, uptr);
+        uint32_t phys = mm_user_translate(p->pd_phys, uptr);
+        if (!phys) return NULL;
+        return (uint8_t*)phys;
+    }
+    if (!p->mem) return NULL;
     return (uint8_t*)((uint32_t)p->mem + (uptr - USER_BASE));
 }
 

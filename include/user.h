@@ -9,7 +9,13 @@
  * the door open for real static Linux binaries later. The range is
  * claimed from the physical allocator before first use. */
 #define USER_BASE  0x08048000u
-#define USER_SIZE  0x00800000u           /* 8MB sandbox */
+/* Sandbox size is configurable at build time (-SandboxMB, default 8). It
+ * must stay >= 8MB so the interpreter/lib/TLS fixed addresses fit, and be
+ * a multiple of 4MB (PDE granularity). */
+#ifndef USER_SANDBOX_MB
+#define USER_SANDBOX_MB 8
+#endif
+#define USER_SIZE  ((uint32_t)USER_SANDBOX_MB * 1024u * 1024u)
 #define USER_END   (USER_BASE + USER_SIZE)
 #define USER_STACK_RESERVE 0x00010000u   /* 64KB kept free for the stack */
 /* PT_INTERP (dynamic linker) window: far enough above the program image and

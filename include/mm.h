@@ -2,6 +2,7 @@
 #define MUOS_MM_H
 #include "types.h"
 #include "multiboot.h"
+#include "user.h"
 
 #define PAGE_SIZE       4096
 #define PAGE_SHIFT      12
@@ -69,13 +70,34 @@ uint32_t mm_get_page_directory(void);
  * identity map remains shared for every other range, so the physical
  * window [0x08000000,0x08C00000) is reserved for user mappings only. */
 #define MM_USER_WINDOW_START 0x08000000u
-#define MM_USER_WINDOW_END   0x08C00000u
+/* Reserve physical frames shadowed by the configured user window (rounded
+ * up to a 4MB PDE boundary). */
+#define MM_USER_WINDOW_END   ((USER_END + 0x3FFFFFu) & ~0x3FFFFFu)
 
 /* The last page of the user window is left unmapped by the block and holds
  * a per-process sigreturn trampoline instead (read-only for user code). */
 uint32_t mm_create_user_pd(uint32_t block_phys, uint32_t tramp_phys);
+/* Clone a user page directory (kernel PDEs shared, user PTEs copied into
+ * fresh page tables) so COW'd remaps are preserved; gives the child its
+ * own sigreturn trampoline page. */
+uint32_t mm_clone_user_pd(uint32_t src_pd_phys, uint32_t tramp_phys);
 void     mm_free_user_pd(uint32_t pd_phys);
 void     mm_switch_pd(uint32_t pd_phys);
 uint32_t mm_get_current_pd(void);
+
+/* Copy-on-write support for the user window. */
+void     mm_page_ref_inc(uint32_t phys);
+uint32_t mm_page_ref(uint32_t phys);
+/* Translate a user virtual address through a specific page directory. */
+uint32_t mm_user_translate(uint32_t pd_phys, uint32_t va);
+/* Make the page containing `va` writable in `pd_phys`, copying it first
+ * when it is shared (frame refcount > 1). Returns false when not mapped. */
+bool_t   mm_user_make_writable(uint32_t pd_phys, uint32_t va);
+/* Clear the writable bit on every user page (fork marks both sides). */
+void     mm_user_write_protect(uint32_t pd_phys);
+/* Drop one reference from every user page this directory maps. */
+void     mm_user_release_pages(uint32_t pd_phys);
+/* Privatize every still-shared user page (used by execve). */
+bool_t   mm_user_detach_pages(uint32_t pd_phys);
 
 #endif

@@ -216,7 +216,7 @@ USER_SIGTRAMP = 0x08847000
 ### 7.7 进程、线程与信号(proc.c)
 
 - `proc_t` 固定 8 槽:pid/ppid/tgid、state、exit_code/faulted、`proc_space_t*`(mem/pd/tramp/refs,`CLONE_VM` 线程共享)、8KB 独立内核栈(每线程一个)、fd 表(`proc_fdstate_t` 引用计数,`CLONE_FILES` 可共享)、cwd/brk/TLS、完整寄存器组、阻塞等待字段(poll fds/deadline/read fd)、信号字段(pending/blocked/handler/flags/restorer/sigframe 栈)。
-- `fork/clone`:分配槽位 + 内核栈;非 `CLONE_VM` 复制 8MB 块与 fd 快照;`CLONE_VM` 只加地址空间引用并共享 `p->mem`;`CLONE_FILES` 共享 fd 表;`CLONE_SETTLS` 写入子线程 TLS;子线程 `eax=0`、`esp=stack`(由 `muos_thread_start` 预置),父进程返回 tid。`SIGCHLD` 语义由 wait4 处理。
+- `fork/clone`:分配槽位 + 内核栈;非 `CLONE_VM` 走**页级 COW**(`proc_space_cow`):克隆父进程当前页表(保留已 COW 的页映射)、两侧用户 PTE 清 RW、对每个已映射帧 `mm_page_ref_inc`;写故障在 `isr_handler` 里先于杀进程判定:用户在窗口内且错误码 bit1(写)→ `mm_user_make_writable`(帧引用>1 时分配新页 memcpy 并改 PTE,否则仅置 RW)后 iret 重试。内核经用户指针写(等待状态/poll revents/read 完成)走 `proc_user_ptr` 的 PD 翻译并先私有化,避免写到共享页。`execve` 前 `proc_detach_current` 把共享页全部私有化。`CLONE_VM` 只加地址空间引用并共享 `p->mem`;`CLONE_FILES` 共享 fd 表;`CLONE_SETTLS` 写入子线程 TLS;子线程 `eax=0`、`esp=stack`(由 `muos_thread_start` 预置),父进程返回 tid。`SIGCHLD` 语义由 wait4 处理。
 - `wait4/waitid`:先找 ZOMBIE 直接收尸;否则 `proc_block_current` 保存现场并切到下一个 READY;子进程 `proc_exit_current` 经 `proc_wake_parent` 把 status/siginfo 写进父进程内存并置 `parent->eax=pid`,父进程恢复后如同 syscall 正常返回。
 - `exit`:标记 ZOMBIE、释放 fd 快照引用、唤醒父进程;若无可运行进程则切回内核页目录并返回 shell。僵尸的地址空间在 `proc_reap`(父进程 wait 或 `proc_cleanup_children`)时按引用计数释放。
 - `execve(11)`:先把 path/argv 拷到内核,`vfs_lookup` 找到 RAM FS 文件,`elf32_validate` 预校验;`user_exec_image` 清空当前进程块、重载段+栈(保留 fd/cwd),再把 syscall 的 iret 帧改成新 entry/esp——同一个 pid 原地替换。
@@ -314,6 +314,7 @@ USER_SIGTRAMP = 0x08847000
 | `entry_phys / _kernel_end` | linker.ld | ELF 入口物理地址、内核虚拟结束地址 |
 | `persist_active / persist_gen` | fs.c | MuFS 挂载状态与 generation |
 | `meta_buf / dmeta_buf` | fs.c | 写穿的元数据暂存表 |
+| `frame_refs[]` | mm.c | 物理帧引用计数(fork COW) |
 | `parts[] / nparts / partitioned` | part.c | MBR/GPT 分区表与“不要格式化”标志 |
 | `vol / dirbuf` | fat.c | FAT32 卷参数与 16KB 目录簇缓冲 |
 | `vol / blkbuf` | ext2.c | ext2 卷参数与块缓冲 |
@@ -325,8 +326,8 @@ USER_SIGTRAMP = 0x08847000
 
 ## 十一、已知局限(真实清单)
 
-1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
-2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
+1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;无按需分页/换出
+2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
 3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE` 与静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)已支持;符号版本化(`.gnu.version`)未实现,也未用真实 glibc/musl 的 `.so` 验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回
 4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32 支持 8.3 文件读写但未接入 `open/read` 的 VFS、不支持长名创建;ext2 只读、无二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(单段在途重传/RTO 退避/慢开始+拥塞避免;无发送队列、无乱序重排、无窗口缩放,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)

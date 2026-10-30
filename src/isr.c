@@ -2,6 +2,9 @@
 #include "vga.h"
 #include "serial.h"
 #include "user.h"
+#include "mm.h"
+#include "proc.h"
+#include "string.h"
 
 const char* exception_names[32] = {
     "Division By Zero",
@@ -51,6 +54,18 @@ static const char* hex32(uint32_t n, char* buf) {
 }
 
 void isr_handler(registers_t* regs) {
+    /* Copy-on-write: a write to a shared user page is resolved before any
+     * fault handling, whether the store came from Ring3 or from a syscall
+     * writing through a user pointer. */
+    if (regs->int_no == 14 && user_is_active() && (regs->err_code & 2)) {
+        uint32_t cr2 = 0;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+        proc_t* p = proc_current();
+        if (p && p->pd_phys && cr2 >= USER_BASE && cr2 < USER_SIGTRAMP &&
+            mm_user_make_writable(p->pd_phys, cr2))
+            return;             /* iret retries the faulting instruction */
+    }
+
     /* A fault raised by a Ring3 process kills the process, not the kernel.
      * (Kernel-mode faults still take the fatal path below.) */
     if ((regs->cs & 3) == 3 && user_is_active()) {

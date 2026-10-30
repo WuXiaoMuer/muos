@@ -3,6 +3,7 @@
 #include "module.h"
 #include "vga.h"
 #include "user.h"
+#include "string.h"
 
 /* External symbol defined in linker script */
 extern uint32_t _kernel_end;
@@ -19,6 +20,35 @@ extern uint32_t _kernel_end;
 static uint32_t bitmap_storage[(MM_MAX_PAGES + 31) / 32];
 static uint32_t* bitmap = bitmap_storage;
 static uint32_t  total_pages = 0;
+
+static bool_t bitmap_test(uint32_t frame);
+static void   bitmap_clear(uint32_t frame);
+static uint32_t free_pages;
+
+/* Per-frame reference counts, used by copy-on-write fork. A frame is
+ * physically freed only when its count reaches zero. */
+static uint8_t frame_refs[MM_MAX_PAGES];
+
+void mm_page_ref_inc(uint32_t phys) {
+    uint32_t pfn = phys >> PAGE_SHIFT;
+    if (pfn >= total_pages) return;
+    if (frame_refs[pfn] < 255) frame_refs[pfn]++;
+}
+
+uint32_t mm_page_ref(uint32_t phys) {
+    uint32_t pfn = phys >> PAGE_SHIFT;
+    return pfn < total_pages ? frame_refs[pfn] : 0;
+}
+
+static void page_unref(uint32_t pfn) {
+    if (pfn >= total_pages) return;
+    if (frame_refs[pfn] > 1) { frame_refs[pfn]--; return; }
+    frame_refs[pfn] = 0;
+    if (bitmap_test(pfn)) {
+        bitmap_clear(pfn);
+        free_pages++;
+    }
+}
 static uint32_t  free_pages = 0;
 static uint32_t  mmap_region_count = 0;
 static uint32_t  reported_mem_upper_kb = 0;  /* loader-reported RAM above 1MB */
@@ -208,18 +238,14 @@ void* mm_alloc_page(void) {
     if (frame == (uint32_t)-1) return NULL;
 
     bitmap_set(frame);
+    frame_refs[frame] = 1;
     free_pages--;
     return (void*)(frame * PAGE_SIZE);
 }
 
 void mm_free_page(void* addr) {
     uint32_t frame = (uint32_t)addr / PAGE_SIZE;
-    if (frame < total_pages) {
-        if (bitmap_test(frame)) {
-            bitmap_clear(frame);
-            free_pages++;
-        }
-    }
+    if (frame < total_pages) page_unref(frame);
 }
 
 uint32_t mm_get_total_pages(void) { return total_pages; }
@@ -243,6 +269,7 @@ void* mm_alloc_pages(uint32_t count) {
         if (found) {
             for (uint32_t i = 0; i < count; i++) {
                 bitmap_set(start + i);
+                frame_refs[start + i] = 1;
             }
             free_pages -= count;
             return (void*)(start * PAGE_SIZE);
@@ -256,12 +283,7 @@ void mm_free_pages(void* addr, uint32_t count) {
     if (count == 0) return;
     if ((uint32_t)addr & (PAGE_SIZE - 1)) return;  /* must be page-aligned */
     if (frame >= total_pages || frame + count > total_pages) return;
-    for (uint32_t i = 0; i < count; i++) {
-        if (bitmap_test(frame + i)) {
-            bitmap_clear(frame + i);
-            free_pages++;
-        }
-    }
+    for (uint32_t i = 0; i < count; i++) page_unref(frame + i);
 }
 
 bool_t mm_map_page(uint32_t phys, uint32_t virt, uint32_t flags) {
@@ -429,4 +451,95 @@ uint32_t mm_get_current_pd(void) {
     uint32_t v;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(v));
     return v & PAGE_MASK;
+}
+
+uint32_t mm_clone_user_pd(uint32_t src_pd_phys, uint32_t tramp_phys) {
+    if (!src_pd_phys || !tramp_phys) return 0;
+    uint32_t* src = (uint32_t*)src_pd_phys;
+    uint32_t* pd = (uint32_t*)mm_alloc_page();
+    if (!pd) return 0;
+    for (uint32_t i = 0; i < 1024; i++) pd[i] = src[i];
+
+    uint32_t first_pde = USER_BASE >> 22;
+    uint32_t last_pde  = (USER_END - 1) >> 22;
+    for (uint32_t d = first_pde; d <= last_pde; d++) {
+        if (!(src[d] & PDE_PRESENT)) { pd[d] = 0; continue; }
+        uint32_t* npt = (uint32_t*)mm_alloc_page();
+        if (!npt) { mm_free_user_pd((uint32_t)pd); return 0; }
+        uint32_t* spt = (uint32_t*)(src[d] & PAGE_MASK);
+        for (uint32_t j = 0; j < 1024; j++) npt[j] = spt[j];
+        pd[d] = (uint32_t)npt | (src[d] & ~PAGE_MASK);
+    }
+
+    /* Child gets its own read-only sigreturn trampoline page. */
+    uint32_t tva = USER_SIGTRAMP;
+    uint32_t* tpt = (uint32_t*)(pd[tva >> 22] & PAGE_MASK);
+    tpt[(tva >> 12) & 0x3FF] = tramp_phys | PTE_PRESENT | PTE_USER;
+    return (uint32_t)pd;
+}
+
+/* ---- copy-on-write helpers for the user window ---- */
+
+static uint32_t* user_pte(uint32_t pd_phys, uint32_t va) {
+    if (!pd_phys) return NULL;
+    uint32_t* pd = (uint32_t*)pd_phys;
+    uint32_t pde = pd[va >> 22];
+    if (!(pde & PDE_PRESENT)) return NULL;
+    uint32_t* pt = (uint32_t*)(pde & PAGE_MASK);
+    return &pt[(va >> 12) & 0x3FF];
+}
+
+uint32_t mm_user_translate(uint32_t pd_phys, uint32_t va) {
+    uint32_t* pte = user_pte(pd_phys, va);
+    if (!pte || !(*pte & PTE_PRESENT)) return 0;
+    return (*pte & PAGE_MASK) + (va & 0xFFF);
+}
+
+bool_t mm_user_make_writable(uint32_t pd_phys, uint32_t va) {
+    uint32_t* pte = user_pte(pd_phys, va);
+    if (!pte || !(*pte & PTE_PRESENT)) return false;
+    if (*pte & PTE_WRITABLE) return true;
+
+    uint32_t old = *pte & PAGE_MASK;
+    uint32_t flags = *pte & ~PAGE_MASK;
+    if (frame_refs[old >> PAGE_SHIFT] > 1) {
+        uint32_t fresh = (uint32_t)mm_alloc_page();
+        if (!fresh) return false;
+        memcpy((void*)fresh, (const void*)old, PAGE_SIZE);
+        *pte = fresh | flags | PTE_WRITABLE;
+        page_unref(old >> PAGE_SHIFT);
+    } else {
+        *pte |= PTE_WRITABLE;
+    }
+    if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
+    return true;
+}
+
+void mm_user_write_protect(uint32_t pd_phys) {
+    if (!pd_phys) return;
+    for (uint32_t va = USER_BASE; va < USER_SIGTRAMP; va += PAGE_SIZE) {
+        uint32_t* pte = user_pte(pd_phys, va);
+        if (pte && (*pte & PTE_PRESENT)) *pte &= ~PTE_WRITABLE;
+    }
+    if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
+}
+
+void mm_user_release_pages(uint32_t pd_phys) {
+    if (!pd_phys) return;
+    for (uint32_t va = USER_BASE; va < USER_SIGTRAMP; va += PAGE_SIZE) {
+        uint32_t* pte = user_pte(pd_phys, va);
+        if (pte && (*pte & PTE_PRESENT)) page_unref((*pte & PAGE_MASK) >> PAGE_SHIFT);
+    }
+}
+
+bool_t mm_user_detach_pages(uint32_t pd_phys) {
+    if (!pd_phys) return false;
+    for (uint32_t va = USER_BASE; va < USER_SIGTRAMP; va += PAGE_SIZE) {
+        uint32_t* pte = user_pte(pd_phys, va);
+        if (pte && (*pte & PTE_PRESENT) && !(*pte & PTE_WRITABLE)) {
+            if (!mm_user_make_writable(pd_phys, va)) return false;
+        }
+    }
+    if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
+    return true;
 }

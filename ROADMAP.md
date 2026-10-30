@@ -31,7 +31,9 @@
 - [x] `poll` 的真正阻塞等待(`PROC_WAIT_POLL` + 唤醒方按保存的 fd 表填充 `revents`,PIT 到期唤醒;无其他可运行进程时退回 `sti; hlt` 有界等待)
 
 ### P2 进程模型升级(结构性)
-- [x] 每进程页目录 + 独立 8MB 物理块(CR3 切换,块/页目录按引用计数共享)
+- [x] 每进程页目录 + 用户块(CR3 切换);**fork 页级 COW**(物理帧引用计数,父/子页表只读,写故障复制单页并重载 CR3),exec 前强制私有化
+- [x] 可配置沙箱:`build.ps1 -SandboxMB`(默认 8,>=8 且 4MB 倍数),`USER_SIZE` 由宏派生,保留物理窗口按沙箱尺寸取整
+- [ ] 按需分页/页面换出(当前用户块仍一次性分配全部物理页)
 - [x] higher-half 内核:链接 0xC0100000,`AT()` 指定物理装载 0x100000;boot.s 自举页目录(identity 0..8MB + 0xC0000000),mm_init 把全部 RAM 再别名到 0xC0000000(上限 1GB = 256 个 PDE)
 - [x] 抢占调度:Ring3 进程 100Hz 轮转,`waitpid` 阻塞让出 CPU(内核 shell 不参与调度)
 - [x] `clone` 线程(`CLONE_VM/CLONE_FS/CLONE_FILES/CLONE_THREAD/CLONE_SETTLS`)、每线程内核栈与 TLS
