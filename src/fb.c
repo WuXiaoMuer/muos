@@ -132,6 +132,33 @@ uint32_t fb_width(void) { return info.width; }
 uint32_t fb_height(void) { return info.height; }
 uint32_t fb_bpp(void) { return info.bpp; }
 
+bool_t fb_blit32(const uint32_t* src, uint32_t w, uint32_t h) {
+    if (!active || !src) return false;
+    if (w > info.width || h > info.height) return false;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint32_t* s = src + y * w;
+        uint8_t* d = fb + y * info.pitch;
+        if (info.bpp == 32) {
+            memcpy(d, s, w * 4);
+        } else {
+            for (uint32_t x = 0; x < w; x++) {
+                uint32_t rgbv = s[x];
+                if (info.bpp == 24) {
+                    d[x * 3 + 0] = (uint8_t)(rgbv & 0xFF);
+                    d[x * 3 + 1] = (uint8_t)((rgbv >> 8) & 0xFF);
+                    d[x * 3 + 2] = (uint8_t)((rgbv >> 16) & 0xFF);
+                } else {
+                    uint16_t v = (uint16_t)(((rgbv >> 19) & 0x1F) << 11 |
+                                            ((rgbv >> 10) & 0x3F) << 5 |
+                                            ((rgbv >> 3) & 0x1F));
+                    ((uint16_t*)d)[x] = v;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void fb_clear(uint32_t rgb) {
     if (!active) return;
     fill_rect(0, 0, info.width, info.height, rgb);

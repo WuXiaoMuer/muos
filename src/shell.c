@@ -21,6 +21,7 @@
 #include "fat.h"
 #include "ext2.h"
 #include "acpi.h"
+#include "wm.h"
 
 /* ── Types ────────────────────────────── */
 #define CMD_MAX   128
@@ -435,7 +436,7 @@ static void execute(void){
     else if(streq(cmd,"version"))cmd_version();
     else if(streq(cmd,"gui")||streq(cmd,"desktop"))win7_run();
     else if(streq(cmd,"win7"))win7_run();
-    else if(streq(cmd,"pixel"))gui_run();
+    else if(streq(cmd,"pixel"))wm_run();
     else if(streq(cmd,"reboot")){ vga_print("Reboot (ACPI)...\n"); serial_write("[shell] acpi reboot\n"); acpi_reboot(); }
     else if(streq(cmd,"poweroff"))cmd_poweroff();
     else if(streq(cmd,"halt"))cmd_halt();

@@ -12,7 +12,8 @@
 - **分区与真实文件系统**:`part.c` 解析 MBR 与 GPT(保护性 MBR → GPT 表项,过滤 Basic Data GUID),`fat.c` 读取 FAT32(8.3 + VFAT 长名、簇链、子目录)并可创建/覆盖 8.3 文件(分配/释放簇链、双 FAT 写穿),`ext2.c` 读取 ext2(超级块/组描述符/12 直接块 + 一级间接);检测到分区表时 MuFS 不再格式化该盘;MuFS 元数据提交带写前日志(扇区 9–15,挂载时重放未完成提交)。`tools/test_fs_read.py` 用生成的 MBR/GPT FAT32 与 ext2 镜像验证 `part/fatls/fatcat/fatwrite/ext2ls/ext2cat`,并二次启动验证写入持久化
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
-- **"MuOS 7" 桌面**:Win7 风格文本模式 GUI —— 任务栏 + 实况 RTC 时钟/内存、开始菜单、窗口 z-order、鼠标点击/拖拽/最小化/最大化/关闭、聚焦后键盘可交互的 Calculator
+- **"MuOS 7" 桌面**:文本模式 Win7 风格 GUI(任务栏、开始菜单、窗口 z-order、Calculator)
+- **像素窗口管理器(`pixel`,ISO/VBE)**:每个窗口独立 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`),鼠标拖动标题栏/点击关闭/聚焦置顶、键盘输入到焦点窗口;文字用 8×8 字模纵向 2 倍渲染成 8×16;ESC 返回文本 shell
 - **安全与电源**:SMEP(CPUID 可用时置 CR4 bit20)、弱 ASLR(栈顶 0..7 页随机 + `AT_RANDOM` 驱动库加载基址随机)、ACPI FADT 定位与 S5 关机(`poweroff`) / 8042 复位(`reboot`)
 - **88 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
 
@@ -169,7 +170,7 @@ muos> run dyn             # 动态链接:PT_INTERP + 共享库 libmu.so(DT_NEEDE
 muos> run tls             # 静态 TLS:initial-exec(TPOFF)+ global-dynamic(__tls_get_addr)
 muos> run net             # 网卡:raw ICMP echo + UDP DNS 查询(QEMU -nic user,model=rtl8139)
 muos> run tcp             # TCP:双连接回显 + getsockname/getpeername + listen/accept 自连接
-muos> pixel               # 像素桌面原型(仅 ISO/VBE):渐变桌面、窗口、任务栏、鼠标箭头
+muos> pixel               # 像素窗口管理器(仅 ISO/VBE):拖动/聚焦/关闭、键盘输入、双缓冲合成
 muos> run fsata           # MuFS 持久文件:创建/写/fsync/回读(重启后 run fsread)
 muos> run ata             # /dev/hda 写入并回读 PERSIST-DATA
 muos> disk                # ATA 型号、扇区数与 MuFS generation
@@ -183,7 +184,7 @@ muos> poweroff            # ACPI S5 关机(无 FADT 时用 QEMU 0x604/0xB004 端
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```
 
-hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用,`run p1` 验证目录改名、打开后 unlink、pipe HUP、超时等待与 `waitid`。`run sig/thread/blkpoll` 覆盖 P2 的进程模型,`run pie` 覆盖 P3 的 ET_DYN 装载,`run dyn` 覆盖 P3 的动态链接(PT_INTERP → ld-mu.so → libmu.so),`run tls` 覆盖静态 TLS(主程序 local-exec、库 initial-exec 与 global-dynamic `__tls_get_addr`),`run ata` 覆盖 P4 的 ATA 块设备(配合 `build/test_ata.py` 做两次启动的持久化验证),`run net` 覆盖 P4 的网卡与 socket ABI(ICMP ping + UDP DNS),`run tcp` 覆盖 TCP 握手/双连接回显/真实 socket 名/accept 自连接,`pixel` 覆盖 VBE 像素桌面原型(仅 ISO 路径)。
+hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用,`run p1` 验证目录改名、打开后 unlink、pipe HUP、超时等待与 `waitid`。`run sig/thread/blkpoll` 覆盖 P2 的进程模型,`run pie` 覆盖 P3 的 ET_DYN 装载,`run dyn` 覆盖 P3 的动态链接(PT_INTERP → ld-mu.so → libmu.so),`run tls` 覆盖静态 TLS(主程序 local-exec、库 initial-exec 与 global-dynamic `__tls_get_addr`),`run ata` 覆盖 P4 的 ATA 块设备(配合 `build/test_ata.py` 做两次启动的持久化验证),`run net` 覆盖 P4 的网卡与 socket ABI(ICMP ping + UDP DNS),`run tcp` 覆盖 TCP 握手/双连接回显/真实 socket 名/accept 自连接,`pixel` 启动像素窗口管理器(仅 ISO 路径;三个窗口、拖动/关闭/聚焦、任务栏与鼠标箭头)。
 
 - 用户地址空间固定为 `0x08048000` 起 8MB 的**虚拟**窗口(经典 Linux i386 ET_EXEC 地址),但每个进程拥有独立 8MB 物理块和页目录:分配时仅该窗口的 PDE 32–34 指向进程块,其余 PDE 与内核页目录共享恒等映射;调度器切换 CR3 即可切换进程。窗口最后一页是内核提供的只读 sigreturn trampoline(类似 vDSO)。
 - 进入 Ring3 使用 TSS.esp0 切换内核栈;`int 0x80`(DPL3 门)按 Linux i386 ABI 分发(eax=号,ebx/ecx/edx 传参);Ring3 进程可被 IRQ0 抢占,`wait4/waitid/poll/read` 阻塞时让出 CPU;退出/故障时若无其他可运行进程则恢复 `user_enter` 保存的内核上下文返回 Shell。

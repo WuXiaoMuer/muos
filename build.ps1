@@ -147,7 +147,7 @@ $CFiles = @(
     "pit", "keyboard", "mouse", "mm", "kheap", "string", "fs", "editor",
     "win7", "task", "shell", "irq", "test", "elf", "tss", "user", "syscall",
     "rtc", "module", "proc", "pipe", "ata", "pci", "net", "fb", "gui",
-    "part", "fat", "ext2", "acpi"
+    "part", "fat", "ext2", "acpi", "wm"
 )
 
 $ObjFiles = @()

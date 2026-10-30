@@ -36,5 +36,8 @@ uint32_t fb_palette(uint8_t index);
 uint32_t fb_width(void);
 uint32_t fb_height(void);
 uint32_t fb_bpp(void);
+/* Blit a 32-bit 0xRRGGBB buffer to the top-left of the framebuffer.
+ * Handles 16/24/32-bpp modes; returns false when VBE is not active. */
+bool_t fb_blit32(const uint32_t* src, uint32_t w, uint32_t h);
 
 #endif

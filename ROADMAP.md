@@ -57,8 +57,8 @@
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/listen(363)/accept4(364)/sendto(369)/recvfrom(371)/shutdown(373)/getsockname(367)/getpeername(368)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽
 - [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;单在途段重传 + RTO 指数退避(最多 5 次)、慢开始/拥塞避免窗口;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)
 - [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
-- [x] 像素桌面原型:`pixel` 命令(fb_fill_rect/fb_pixel/fb_text + PS/2 鼠标箭头与存屏/恢复),ESC 返回文本 shell
-- [ ] 真正的图形窗口系统(per-window 缓冲、裁剪、控件、事件分发);TCP 发送队列/乱序重排与网络事件唤醒的阻塞 accept、其他网卡
+- [x] 像素窗口管理器(`pixel`,ISO/VBE):每窗口 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`);鼠标拖动标题栏/关闭/聚焦置顶,键盘输入到焦点窗口,任务栏与 8×16 文字(8×8 字模纵向 2 倍);ESC 返回文本 shell
+- [ ] 窗口控件(滚动条/按钮/输入框)、裁剪栈、更多字体尺寸;TCP 发送队列/乱序重排与网络事件唤醒的阻塞 accept、其他网卡
 
 ## 阶段 0:地基(已完成,2026-09)
 
