@@ -50,6 +50,8 @@ unsigned muos_mmap(unsigned len);
 int  muos_munmap(unsigned addr, unsigned len);
 unsigned muos_mmap_file(int fd, unsigned len, int prot, int flags, unsigned offset);
 int  muos_chmod(const char* path, int mode);
+int  muos_setuid(int uid);
+int  muos_setgid(int gid);
 int  muos_truncate(const char* path, unsigned len);
 int  muos_ftruncate(int fd, unsigned len);
 int  muos_fsync(int fd);

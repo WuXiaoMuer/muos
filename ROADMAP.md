@@ -55,7 +55,7 @@
 - [x] 分区与真实文件系统:MBR 4 项 + GPT(保护性 MBR → LBA1 头/LBA2 表项,Basic Data GUID);FAT32 读取(8.3/VFAT 长名/簇链/子目录)与**写入**(创建/覆盖 8.3 文件、簇分配与释放、双 FAT 写穿);ext2 只读(超级块/组描述符/直接块 + 一级间接);有分区表时 MuFS 拒绝格式化;`part/fatls/fatcat/fatwrite/ext2ls/ext2cat` + `tools/test_fs_read.py`(MBR/GPT FAT32 + ext2 镜像 + 二次启动写入持久化)实测通过
 - [x] MuFS 元数据写前日志:提交前把 meta/dir 副本写到扇区 10–15 并置扇区 9 头魔数,真实表写完后清除;挂载时发现有效头即重放。槽位引用计数归零后回收(空间回收已随 unlink 生效)
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/listen(363)/accept4(364)/sendto(369)/recvfrom(371)/shutdown(373)/getsockname(367)/getpeername(368)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽
-- [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;单在途段重传 + RTO 指数退避(最多 5 次)、慢开始/拥塞避免窗口;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)
+- [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;8 段发送队列 + 队列头 RTO 指数退避(最多 5 次)、ACK 逐段退休、慢开始/拥塞避免窗口;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)
 - [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
 - [x] 像素窗口管理器(`pixel`,ISO/VBE):每窗口 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`);鼠标拖动标题栏/关闭/聚焦置顶,键盘输入到焦点窗口,任务栏与 8×16 文字(8×8 字模纵向 2 倍);ESC 返回文本 shell
 - [ ] 窗口控件(滚动条/按钮/输入框)、裁剪栈、更多字体尺寸;TCP 发送队列/乱序重排与网络事件唤醒的阻塞 accept、其他网卡
@@ -160,10 +160,11 @@
 - [ ] 内核堆 Grow(耗尽时向 vmm 要新页)
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
 - [x] 网卡(RTL8139)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] TCP 重传/并发服务端、其他网卡;MuFS 仍是整槽布局,无块分配位图/碎片整理
-- [ ] 动态链接器兼容真实 libc 产物(版本化符号;`.gnu.hash`/TLS/`R_386_COPY`/`IRELATIVE` 已支持);当前 `ld-mu.so` 只在自研 `.so` 上验证
+- [x] 符号版本化:解析 `DT_VERSYM/DT_VERDEF/DT_VERNEED`,按版本名筛选提供者并处理隐藏版本位;未版本化 `.so` 仍兼容
+- [ ] 动态链接器兼容真实 libc 产物(仍未用真实 glibc/musl `.so` 端到端验证;`.gnu.hash`/TLS/`R_386_COPY`/`IRELATIVE` 已支持)
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
 - [x] 安全基础:SMEP(CPUID leaf7 EBX bit7 时置 CR4 bit20);弱 ASLR(栈顶 0..7 页、`AT_RANDOM` 使库基址偏移 0..31 页)
-- [ ] uid/gid 强制与文件权限检查(`getuid` 恒 0、chown 仅校验目标)
+- [x] uid/gid 与文件权限:MuFS 元数据保存 owner/mode(v2),`getuid/getgid/setuid/setgid` 生效,open/access 按 rwx 检查(目录需 x),chmod/chown 落盘;`run perm` 实测非 root 读 0600 被拒、读 0644 成功
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)
 - [ ] panic 打印带 addr2line 说明(已加 -g)
 - [x] ISO 路径构造最小 mb_info:`boot_cd.s` 用 BIOS INT 15h/E820 收集内存图,生成带 MEM|MMAP 的 Multiboot info(0x5600/0x5800)并交给内核;仅 BIOS 无 E820 时才回退 32MB

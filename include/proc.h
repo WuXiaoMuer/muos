@@ -78,6 +78,7 @@ typedef struct {
     char     cwd[USER_FD_PATH_MAX];
     uint32_t brk_base, brk_cur;
     uint32_t tls_base, tls_limit, tls_flags;   /* GDT slot 6 per process */
+    uint32_t uid, gid;                         /* credentials (root = 0) */
 
     /* Registers to resume at (children start after the parent's fork) */
     uint32_t eip, esp, eflags;

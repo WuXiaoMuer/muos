@@ -104,6 +104,9 @@ int fs_create(const char* path) {
             files[i].deleted = 0;
             files[i].refs = 0;
             files[i].atime = files[i].mtime = files[i].ctime = rtc_now();
+            files[i].uid = 0;
+            files[i].gid = 0;
+            files[i].mode = 0644;
             persist_meta();
             persist_slot(i);
             return i;
@@ -124,6 +127,9 @@ int fs_mkdir(const char* path) {
             strncpy(dirs[i].name, path, FS_MAX_NAME - 1);
             dirs[i].name[FS_MAX_NAME - 1] = '\0';
             dirs[i].used = 1;
+            dirs[i].uid = 0;
+            dirs[i].gid = 0;
+            dirs[i].mode = 0755;
             persist_meta();
             return 0;
         }
@@ -488,6 +494,92 @@ int fs_write_at(int fd, uint32_t offset, const char* data, uint32_t len) {
     return (int)len;
 }
 
+/* ---- ownership / permission metadata ---- */
+
+static int file_slot_of(const char* path) {
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (files[i].used && !files[i].deleted &&
+            strcmp(files[i].name, path) == 0) return i;
+    }
+    return -1;
+}
+
+static int dir_slot_of(const char* path) {
+    if (!*path) return -2;                   /* root */
+    for (int i = 0; i < FS_MAX_DIRS; i++) {
+        if (dirs[i].used && strcmp(dirs[i].name, path) == 0) return i;
+    }
+    return -1;
+}
+
+bool_t fs_perm_slot(int slot, uint32_t* uid, uint32_t* gid, uint16_t* mode) {
+    if (slot < 0 || slot >= FS_MAX_FILES || !files[slot].used) return false;
+    if (uid)  *uid  = files[slot].uid;
+    if (gid)  *gid  = files[slot].gid;
+    if (mode) *mode = files[slot].mode;
+    return true;
+}
+
+bool_t fs_perm_path(const char* path, uint32_t* uid, uint32_t* gid,
+                    uint16_t* mode, bool_t* is_dir) {
+    if (!path) return false;
+    int fi = file_slot_of(path);
+    if (fi >= 0) {
+        if (uid)  *uid  = files[fi].uid;
+        if (gid)  *gid  = files[fi].gid;
+        if (mode) *mode = files[fi].mode;
+        if (is_dir) *is_dir = false;
+        return true;
+    }
+    int di = dir_slot_of(path);
+    if (di != -1) {
+        if (uid)  *uid  = (di == -2) ? 0 : dirs[di].uid;
+        if (gid)  *gid  = (di == -2) ? 0 : dirs[di].gid;
+        if (mode) *mode = (di == -2) ? 0755 : dirs[di].mode;
+        if (is_dir) *is_dir = true;
+        return true;
+    }
+    return false;
+}
+
+int fs_chmod_slot(int slot, uint16_t mode) {
+    if (slot < 0 || slot >= FS_MAX_FILES || !files[slot].used) return -1;
+    files[slot].mode = mode;
+    files[slot].ctime = rtc_now();
+    persist_meta();
+    return 0;
+}
+
+int fs_chmod_path(const char* path, uint16_t mode) {
+    int fi = file_slot_of(path);
+    if (fi >= 0) return fs_chmod_slot(fi, mode);
+    int di = dir_slot_of(path);
+    if (di < 0) return -1;
+    dirs[di].mode = mode;
+    persist_meta();
+    return 0;
+}
+
+int fs_chown_slot(int slot, uint32_t uid, uint32_t gid) {
+    if (slot < 0 || slot >= FS_MAX_FILES || !files[slot].used) return -1;
+    files[slot].uid = uid;
+    files[slot].gid = gid;
+    files[slot].ctime = rtc_now();
+    persist_meta();
+    return 0;
+}
+
+int fs_chown_path(const char* path, uint32_t uid, uint32_t gid) {
+    int fi = file_slot_of(path);
+    if (fi >= 0) return fs_chown_slot(fi, uid, gid);
+    int di = dir_slot_of(path);
+    if (di < 0) return -1;
+    dirs[di].uid = uid;
+    dirs[di].gid = gid;
+    persist_meta();
+    return 0;
+}
+
 /* ===================== MuFS persistence on ATA =====================
  * On-disk layout (512-byte sectors):
  *   0      superblock (magic/version/generation)
@@ -498,7 +590,7 @@ int fs_write_at(int fd, uint32_t offset, const char* data, uint32_t len) {
  * touched sector range. `fs_sync()` rewrites the whole image. */
 
 #define MUFS_MAGIC        "MUFS"
-#define MUFS_VERSION      1u
+#define MUFS_VERSION      2u       /* + uid/gid/mode metadata */
 #define MUFS_SB_LBA       0
 #define MUFS_META_LBA     2
 #define MUFS_DIR_LBA      6
@@ -530,11 +622,19 @@ typedef struct {
     uint32_t atime;
     uint32_t mtime;
     uint32_t ctime;
+    uint32_t uid;
+    uint32_t gid;
+    uint16_t mode;
+    uint16_t pad;
 } __attribute__((packed)) mufs_file_meta_t;
 
 typedef struct {
     char     name[FS_MAX_NAME];
     uint32_t used;
+    uint32_t uid;
+    uint32_t gid;
+    uint16_t mode;
+    uint16_t pad;
 } __attribute__((packed)) mufs_dir_meta_t;
 
 static bool_t persist_active = false;
@@ -557,10 +657,16 @@ static void persist_meta(void) {
         meta_buf[i].atime = files[i].atime;
         meta_buf[i].mtime = files[i].mtime;
         meta_buf[i].ctime = files[i].ctime;
+        meta_buf[i].uid = files[i].uid;
+        meta_buf[i].gid = files[i].gid;
+        meta_buf[i].mode = files[i].mode;
     }
     for (int i = 0; i < FS_MAX_DIRS; i++) {
         memcpy(dmeta_buf[i].name, dirs[i].name, FS_MAX_NAME);
         dmeta_buf[i].used = dirs[i].used;
+        dmeta_buf[i].uid = dirs[i].uid;
+        dmeta_buf[i].gid = dirs[i].gid;
+        dmeta_buf[i].mode = dirs[i].mode;
     }
 
     /* Journal: data copies first, then the valid header; after the real
@@ -648,6 +754,9 @@ void fs_persist_mount(void) {
             files[i].atime = meta_buf[i].atime;
             files[i].mtime = meta_buf[i].mtime;
             files[i].ctime = meta_buf[i].ctime;
+            files[i].uid = meta_buf[i].uid;
+            files[i].gid = meta_buf[i].gid;
+            files[i].mode = meta_buf[i].mode;
             if (files[i].used && files[i].size) {
                 ata_read_bytes(slot_lba(i) * 512, files[i].data, files[i].size);
             }
@@ -656,6 +765,9 @@ void fs_persist_mount(void) {
             memcpy(dirs[i].name, dmeta_buf[i].name, FS_MAX_NAME);
             dirs[i].name[FS_MAX_NAME - 1] = '\0';
             dirs[i].used = dmeta_buf[i].used;
+            dirs[i].uid = dmeta_buf[i].uid;
+            dirs[i].gid = dmeta_buf[i].gid;
+            dirs[i].mode = dmeta_buf[i].mode;
         }
         persist_gen = sb.generation;
         persist_active = true;

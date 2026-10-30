@@ -64,14 +64,19 @@ typedef struct {
     uint32_t cwnd;          /* congestion window, in bytes */
     uint32_t ssthresh;
 
-    /* Single-outstanding-segment retransmission (RTO with exponential
-     * backoff). Enough for the QEMU user-net and a lost-segment demo. */
-    bool_t   rtx_pending;
-    uint32_t rtx_seq, rtx_end;
-    uint32_t rtx_deadline, rto;
-    uint8_t  rtx_flags, rtx_retries;
-    uint16_t rtx_len;
-    uint8_t  rtx_data[480];
+    /* Small send queue: segments that carry sequence space stay here until
+     * acknowledged; the head is retransmitted on RTO with backoff. */
+    #define TXQ_MAX 8
+    struct {
+        bool_t   used;
+        uint32_t seq, end;
+        uint8_t  flags;
+        uint16_t len;
+        uint8_t  data[480];
+    } txq[TXQ_MAX];
+    int      q_head, q_count;
+    uint32_t q_deadline, rto;
+    uint8_t  q_retries;
 } net_sock_t;
 
 #define TCP_MSS 480u
@@ -612,33 +617,48 @@ static void tcp_emit(net_sock_t* s, uint32_t seq, uint32_t ack,
     net_send_ip_raw(6, s->rip, t, 20 + len);
 }
 
-/* Send a segment that carries sequence-space (SYN/FIN/data) and arm the
- * retransmission timer for it. Pure ACKs are sent without arming. */
+/* Enqueue a sequence-space segment for retransmission and send it now. */
 static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
                          uint8_t flags, const uint8_t* data, uint32_t len) {
     tcp_emit(s, seq, ack, flags, data, len);
 
     if (len == 0 && !(flags & (TCP_F_SYN | TCP_F_FIN))) return;
-    s->rtx_pending = true;
-    s->rtx_seq  = seq;
-    s->rtx_end  = seq + len +
-                  ((flags & TCP_F_SYN) ? 1u : 0u) +
-                  ((flags & TCP_F_FIN) ? 1u : 0u);
-    s->rtx_flags = flags;
-    s->rtx_len = (uint16_t)(len > TCP_MSS ? TCP_MSS : len);
-    if (s->rtx_len) memcpy(s->rtx_data, data, s->rtx_len);
-    s->rtx_retries = 0;
-    s->rto = TCP_RTO_MIN;
-    s->rtx_deadline = pit_get_ticks() + s->rto;
+    if (s->q_count >= TXQ_MAX) return;          /* queue full: drop new */
+    int idx = (s->q_head + s->q_count) % TXQ_MAX;
+    s->txq[idx].used = true;
+    s->txq[idx].seq = seq;
+    s->txq[idx].end = seq + len +
+                      ((flags & TCP_F_SYN) ? 1u : 0u) +
+                      ((flags & TCP_F_FIN) ? 1u : 0u);
+    s->txq[idx].flags = flags;
+    s->txq[idx].len = (uint16_t)(len > TCP_MSS ? TCP_MSS : len);
+    if (s->txq[idx].len) memcpy(s->txq[idx].data, data, s->txq[idx].len);
+    if (s->q_count == 0) {
+        s->rto = TCP_RTO_MIN;
+        s->q_retries = 0;
+        s->q_deadline = pit_get_ticks() + s->rto;
+    }
+    s->q_count++;
 }
 
-/* ACK processing: advance snd_una, clear the retransmission entry and
+/* ACK processing: advance snd_una, retire acknowledged queue entries and
  * grow the congestion window (slow start / congestion avoidance). */
 static void tcp_ack(net_sock_t* s, uint32_t ack) {
     if ((int32_t)(ack - s->snd_una) <= 0) return;
     s->snd_una = ack;
-    if (s->rtx_pending && (int32_t)(ack - s->rtx_end) >= 0)
-        s->rtx_pending = false;
+
+    while (s->q_count > 0) {
+        int h = s->q_head;
+        if ((int32_t)(ack - s->txq[h].end) < 0) break;
+        s->txq[h].used = false;
+        s->q_head = (h + 1) % TXQ_MAX;
+        s->q_count--;
+        s->q_retries = 0;
+    }
+    if (s->q_count > 0) {
+        s->rto = TCP_RTO_MIN;
+        s->q_deadline = pit_get_ticks() + s->rto;
+    }
 
     if (s->cwnd >= s->ssthresh)
         s->cwnd += (TCP_MSS * TCP_MSS) / (s->cwnd ? s->cwnd : TCP_MSS);
@@ -647,31 +667,32 @@ static void tcp_ack(net_sock_t* s, uint32_t ack) {
     if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
 }
 
-/* RTO timer: retransmit the single outstanding segment with exponential
- * backoff; collapse the congestion window on every timeout. */
+/* RTO timer: retransmit the queue head with exponential backoff; collapse
+ * the congestion window on every timeout. */
 static void tcp_timers(void) {
     uint32_t now = pit_get_ticks();
     int n = NET_FD_MAX - NET_FD_BASE;
     for (int i = 0; i < n; i++) {
         net_sock_t* s = &socks[i];
-        if (!s->used || s->type != NET_SOCK_STREAM || !s->rtx_pending) continue;
-        if ((int32_t)(now - s->rtx_deadline) < 0) continue;
+        if (!s->used || s->type != NET_SOCK_STREAM || s->q_count == 0) continue;
+        if ((int32_t)(now - s->q_deadline) < 0) continue;
 
-        if (s->rtx_retries >= TCP_RETRIES) {
-            s->rtx_pending = false;
+        if (s->q_retries >= TCP_RETRIES) {
+            s->q_count = 0;
             s->tcp_state = TCP_CLOSED;
             s->used = false;
             continue;
         }
-        s->rtx_retries++;
+        s->q_retries++;
         s->ssthresh = s->cwnd > TCP_MSS * 2 ? s->cwnd / 2 : TCP_MSS * 2;
         s->cwnd = TCP_MSS;
         s->rto = s->rto < TCP_RTO_MAX / 2 ? s->rto * 2 : TCP_RTO_MAX;
 
-        uint32_t seq = s->rtx_seq;
-        uint32_t ack = (s->rtx_flags & TCP_F_SYN) ? 0 : s->rcv_nxt;
-        s->rtx_deadline = now + s->rto;
-        tcp_emit(s, seq, ack, s->rtx_flags, s->rtx_data, s->rtx_len);
+        int h = s->q_head;
+        uint32_t ack = (s->txq[h].flags & TCP_F_SYN) ? 0 : s->rcv_nxt;
+        s->q_deadline = now + s->rto;
+        tcp_emit(s, s->txq[h].seq, ack, s->txq[h].flags,
+                 s->txq[h].data, s->txq[h].len);
     }
 }
 
@@ -904,7 +925,8 @@ int net_connect(int id, uint32_t ip, uint16_t port) {
     s->ssthresh = TCP_CWND_MAX;
     uint32_t seq = s->snd_nxt;
     s->snd_nxt = seq + 1;            /* SYN consumes one sequence number */
-    s->rtx_pending = false;
+    s->q_head = 0;
+    s->q_count = 0;
     tcp_send_seg(s, seq, 0, TCP_F_SYN, NULL, 0);
     /* SYN retransmission is handled by tcp_timers (up to TCP_RETRIES). */
     for (uint32_t loops = 0; loops < 1000; loops++) {

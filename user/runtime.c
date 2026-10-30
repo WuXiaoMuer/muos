@@ -157,6 +157,14 @@ int muos_chmod(const char* path, int mode) {
     return syscall2(15, (int)path, mode);
 }
 
+int muos_setuid(int uid) {
+    return syscall1(23, uid);
+}
+
+int muos_setgid(int gid) {
+    return syscall1(46, gid);
+}
+
 int muos_truncate(const char* path, unsigned len) {
     return syscall2(92, (int)path, (int)len);
 }

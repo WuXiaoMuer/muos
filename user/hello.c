@@ -396,6 +396,41 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "perm")) {
+        /* uid/gid enforcement: a non-root child may read a 0644 file but
+         * must be denied a 0600 file owned by root. */
+        int ok = 1;
+        int fd = muos_open("/permpriv", MUOS_O_CREAT | MUOS_O_WRONLY);
+        if (fd < 0) { muos_puts("PERM-BAD\n"); return 0; }
+        muos_write(fd, "SECRET", 6);
+        muos_close(fd);
+        ok = ok && muos_chmod("/permpriv", 0600) == 0;
+
+        fd = muos_open("/permpublic", MUOS_O_CREAT | MUOS_O_WRONLY);
+        if (fd < 0) { muos_puts("PERM-BAD\n"); return 0; }
+        muos_write(fd, "PUBLIC", 6);
+        muos_close(fd);
+        ok = ok && muos_chmod("/permpublic", 0644) == 0;
+
+        int pid = muos_fork();
+        if (pid == 0) {
+            muos_setuid(1000);
+            muos_setgid(1000);
+            int bad = muos_open("/permpriv", 0);      /* 0600 root: denied */
+            int good = muos_open("/permpublic", 0);   /* 0644: allowed */
+            if (good >= 0) muos_close(good);
+            if (bad >= 0) muos_close(bad);
+            muos_exit((bad < 0 && good >= 0) ? 0 : 1);
+        }
+        int status = 0;
+        muos_waitpid(pid, &status, 0);
+        int code = (status >> 8) & 0xFF;
+        muos_puts("perm: child="); muos_putdec(code); muos_puts("\n");
+        ok = ok && code == 0;
+        muos_puts(ok ? "PERM-OK\n" : "PERM-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "pie")) {
         /* Runs from the ET_DYN image: the kernel loaded the lowest
          * segment at USER_BASE and applied its RELATIVE relocations. */

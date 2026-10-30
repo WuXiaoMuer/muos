@@ -341,10 +341,11 @@ static void make_short(const char* name, uint8_t out[11]) {
 
 /* Find the directory slot for `shortname`; if it does not exist, return the
  * first free 32-byte slot (extending the directory chain if necessary). */
-static bool_t dir_slot(uint32_t dir_cluster, const uint8_t shortname[11],
-                       bool_t* exists, uint32_t* slot_cluster,
-                       uint32_t* slot_off, uint32_t* entry_cluster,
-                       uint32_t* entry_size) {
+static bool_t __attribute__((unused))
+dir_slot(uint32_t dir_cluster, const uint8_t shortname[11],
+         bool_t* exists, uint32_t* slot_cluster,
+         uint32_t* slot_off, uint32_t* entry_cluster,
+         uint32_t* entry_size) {
     uint32_t free_c = 0xFFFFFFFFu, free_off = 0;
     uint32_t last = dir_cluster;
     *exists = false;
@@ -399,6 +400,183 @@ slot_found:
     return true;
 }
 
+/* ---------------- long-name creation helpers ---------------- */
+
+static bool_t name_is_83(const char* n) {
+    int base = 0, ext = 0, dot = 0;
+    for (const char* p = n; *p; p++) {
+        if (*p == '.') {
+            if (dot) return false;
+            dot = 1;
+            continue;
+        }
+        if (*p >= 'a' && *p <= 'z') return false;
+        if (!dot) { if (++base > 8) return false; }
+        else      { if (++ext > 3) return false; }
+    }
+    return base > 0;
+}
+
+/* Build a unique "NAME~n.EXT" 8.3 alias for a long name. */
+static void make_alias(const char* name, uint8_t out[11]) {
+    char base[8];
+    int bn = 0;
+    const char* p = name;
+    for (; *p && *p != '.' && bn < 6; p++) {
+        char ch = *p;
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')))
+            ch = '_';
+        base[bn++] = ch;
+    }
+    while (bn < 6) base[bn++] = '_';
+    char alias[20];
+    int a = 0;
+    for (int i = 0; i < 6; i++) alias[a++] = base[i];
+    alias[a++] = '~';
+    alias[a++] = '1';
+    if (*p == '.') {
+        alias[a++] = '.';
+        const char* q = p + 1;
+        for (int i = 0; *q && i < 3; q++, i++) {
+            char ch = *q;
+            if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+            alias[a++] = ch;
+        }
+    }
+    alias[a] = '\0';
+    make_short(alias, out);
+}
+
+/* Find an existing directory entry by long or short name. */
+static bool_t dir_find(uint32_t dir_cluster, const char* name, bool_t* found,
+                       uint32_t* slot_c, uint32_t* slot_off,
+                       uint32_t* entry_cluster, uint32_t* entry_size) {
+    *found = false;
+    for (uint32_t c = dir_cluster, guard = 0; c >= 2 && c < 0x0FFFFFF8u;
+         c = fat_next(c)) {
+        if (++guard > 4096) return false;
+        if (!read_cluster(c, dirbuf)) return false;
+        char lfn[260];
+        lfn[0] = '\0';
+        int have = 0;
+        for (uint32_t off = 0; off + 32 <= vol.spc * SECTOR; off += 32) {
+            const uint8_t* e = dirbuf + off;
+            if (e[0] == 0x00) return true;
+            if (e[0] == 0xE5) { have = 0; lfn[0] = '\0'; continue; }
+            uint8_t attr = e[11];
+            if ((attr & 0x3F) == 0x0F) {
+                uint8_t seq = e[0] & 0x1F;
+                if (!seq || seq > 20) continue;
+                int base = ((int)seq - 1) * 13;
+                for (int i = 0; i < 13; i++) {
+                    uint8_t ch;
+                    if (i < 5)       ch = e[1 + i];
+                    else if (i < 11) ch = e[14 + (i - 5)];
+                    else             ch = e[28 + (i - 11)];
+                    if (base + i < 259) lfn[base + i] = ch;
+                }
+                lfn[259] = '\0';
+                have = 1;
+                continue;
+            }
+            if (attr & 0x08) { have = 0; lfn[0] = '\0'; continue; }
+            char sn[16];
+            short_name(e, sn);
+            if ((have && ci_cmp(lfn, name) == 0) || ci_cmp(sn, name) == 0) {
+                *found = true;
+                *slot_c = c;
+                *slot_off = off;
+                if (entry_cluster)
+                    *entry_cluster = ((uint32_t)le16(e + 20) << 16) | le16(e + 26);
+                if (entry_size) *entry_size = le32(e + 28);
+                return true;
+            }
+            have = 0;
+            lfn[0] = '\0';
+        }
+    }
+    return true;
+}
+
+/* Find `need` contiguous free 32-byte slots; append a cluster if needed. */
+static bool_t dir_free_run(uint32_t dir_cluster, int need,
+                           uint32_t* slot_c, uint32_t* slot_off) {
+    uint32_t last = dir_cluster;
+    for (uint32_t c = dir_cluster, guard = 0; c >= 2 && c < 0x0FFFFFF8u;
+         c = fat_next(c)) {
+        if (++guard > 4096) return false;
+        last = c;
+        if (!read_cluster(c, dirbuf)) return false;
+        int run = 0;
+        uint32_t start = 0;
+        for (uint32_t off = 0; off + 32 <= vol.spc * SECTOR; off += 32) {
+            const uint8_t* e = dirbuf + off;
+            bool_t free = (e[0] == 0x00 || e[0] == 0xE5);
+            if (free) {
+                if (run == 0) start = off;
+                run++;
+                if (run >= need) { *slot_c = c; *slot_off = start; return true; }
+            } else {
+                run = 0;
+            }
+        }
+    }
+    uint32_t fresh;
+    if (!alloc_cluster(&fresh)) return false;
+    if (!set_fat(last, fresh)) return false;
+    uint32_t bytes = vol.spc * SECTOR;
+    memset(dirbuf, 0, bytes);
+    if (!wr((uint64_t)(vol.data_start + (fresh - 2) * vol.spc) * SECTOR,
+            dirbuf, bytes)) return false;
+    *slot_c = fresh;
+    *slot_off = 0;
+    return ((int)(bytes / 32) >= need);
+}
+
+static uint8_t lfn_checksum(const uint8_t sn[11]) {
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; i++) {
+        sum = (uint8_t)(((sum & 1) ? 0x80 : 0) + (sum >> 1) + sn[i]);
+    }
+    return sum;
+}
+
+/* Write count LFN entries + the short entry into one cluster buffer. */
+static bool_t dir_write_long(uint32_t slot_c, uint32_t slot_off,
+                             const char* name, const uint8_t sn[11],
+                             uint32_t first, uint32_t size, int entries) {
+    if (!read_cluster(slot_c, dirbuf)) return false;
+    uint8_t csum = lfn_checksum(sn);
+    int len = 0;
+    while (name[len]) len++;
+    for (int seq = entries; seq >= 1; seq--) {
+        uint8_t* e = dirbuf + slot_off + (uint32_t)(entries - seq) * 32;
+        memset(e, 0, 32);
+        e[0] = (uint8_t)(seq | (seq == entries ? 0x40 : 0));
+        e[11] = 0x0F;
+        e[13] = csum;
+        for (int i = 0; i < 13; i++) {
+            int pos = (seq - 1) * 13 + i;
+            uint8_t ch = (pos < len) ? (uint8_t)name[pos] : 0;
+            if (i < 5)       e[1 + i] = ch;
+            else if (i < 11) e[14 + (i - 5)] = ch;
+            else             e[28 + (i - 11)] = ch;
+        }
+    }
+    uint8_t* s = dirbuf + slot_off + (uint32_t)entries * 32;
+    memset(s, 0, 32);
+    for (int i = 0; i < 11; i++) s[i] = sn[i];
+    s[11] = 0x20;
+    s[20] = (uint8_t)(first >> 16);
+    s[21] = (uint8_t)(first >> 24);
+    s[26] = (uint8_t)first;
+    s[27] = (uint8_t)(first >> 8);
+    memcpy(s + 28, &size, 4);
+    uint64_t off = (uint64_t)(vol.data_start + (slot_c - 2) * vol.spc) * SECTOR;
+    return wr(off, dirbuf, vol.spc * SECTOR);
+}
+
 int fat_write_file(const char* path, const void* data, uint32_t len) {
     if (!present || !path) return -1;
 
@@ -425,12 +603,23 @@ int fat_write_file(const char* path, const void* data, uint32_t len) {
     if (!resolve(parent, &pd) || !(pd.attr & 0x10)) return -1;
 
     uint8_t sn[11];
-    make_short(name, sn);
+    bool_t use_lfn = !name_is_83(name);
+    if (use_lfn) make_alias(name, sn);
+    else         make_short(name, sn);
+
+    int nlen = 0;
+    while (name[nlen]) nlen++;
+    int lfn_entries = use_lfn ? (nlen + 12) / 13 : 0;
+    if (lfn_entries > 19) return -1;
 
     bool_t exists;
-    uint32_t slot_c, slot_off, old_c = 0, old_size = 0;
-    if (!dir_slot(pd.cluster, sn, &exists, &slot_c, &slot_off, &old_c, &old_size))
+    uint32_t slot_c = 0, slot_off = 0, old_c = 0, old_size = 0;
+    if (!dir_find(pd.cluster, name, &exists, &slot_c, &slot_off, &old_c, &old_size))
         return -1;
+    if (!exists) {
+        if (!dir_free_run(pd.cluster, lfn_entries + 1, &slot_c, &slot_off))
+            return -1;
+    }
 
     uint32_t first = 0, prev = 0, written = 0;
     uint32_t bytes_per = vol.spc * SECTOR;
@@ -453,13 +642,23 @@ int fat_write_file(const char* path, const void* data, uint32_t len) {
     }
     if (!first && len == 0) first = 0;
 
-    /* Rewrite the directory entry in place. */
+    if (use_lfn && !exists) {
+        if (!dir_write_long(slot_c, slot_off, name, sn, first, len, lfn_entries)) {
+            if (first) free_chain(first);
+            return -1;
+        }
+        return (int)len;
+    }
+
+    /* Rewrite the (short) directory entry in place. */
     if (!read_cluster(slot_c, dirbuf)) {
         if (first) free_chain(first);
         return -1;
     }
     uint8_t* e = dirbuf + slot_off;
-    for (int i = 0; i < 11; i++) e[i] = sn[i];
+    if (!exists) {
+        for (int i = 0; i < 11; i++) e[i] = sn[i];
+    }
     e[11] = 0x20;                      /* archive */
     e[12] = 0;
     e[13] = 0;

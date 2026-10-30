@@ -202,6 +202,7 @@ USER_SIGTRAMP = 0x08847000
 - `linker.ld`(ET_EXEC,0x08048000)与 `linker_pie.ld`(ET_DYN,从 `SIZEOF_HEADERS` 开始、`load PT_LOAD FILEHDR PHDRS` + `dynamic PT_DYNAMIC`);build.ps1 用 `-fPIE -pie` 产出 `hello-pie.elf` 并作为第二个 blob 嵌入。
 - **动态链接集**:`linker_so.ld`(共享对象,`FILEHDR PHDRS`,从 `SIZEOF_HEADERS` 起)产出 `libmu.so`(导出 `mu_hello`,数据指针经 `R_386_RELATIVE` 修正)与 `ld-mu.so`(`ld_start.s` 取原始 esp 调 `ld_main`);`linker_dyn.ld` 增加 `interp PT_INTERP` 与独立的 `.rel.dyn/.rel.plt`,配合 `-Wl,--dynamic-linker=/lib/ld-mu.so -L build -lmu` 产出 `dyn.elf`(DT_NEEDED libmu.so)。三者都以 `objcopy -I binary` 嵌入内核。
 - `ldmu.c`(ld-mu.so,无依赖):从栈解析 auxv → 由 `AT_PHDR` + `PROG_BASE` 反推主程序 bias → 解析 `PT_DYNAMIC`/`PT_TLS` → 按 `DT_NEEDED` 从 `/lib/<name>` 用 `open/read` 读入 `fbuf` 并映射到 `0x08400000` 起的空位 → 符号解析(SysV `DT_HASH` 或 `DT_GNU_HASH`:gnu 走 bloom 过滤 + bucket/chain 链)→ `tls_setup()` 布局静态 TLS → 对依赖库和主程序依次应用 `RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY/IRELATIVE`(COPY 按 `st_size` 从提供者复制数据;IRELATIVE 调用 `bias + addend` 处的 resolver 并写回结果)→ `jmp AT_ENTRY`(不改动栈)。未知重定位会打印 `unsupported relocation` 并退出,不再静默跳过。
+- 符号版本化:`DT_VERSYM` 给出每个 dynsym 的版本索引;`ver_name` 先在 `DT_VERDEF`(导出)里匹配 `vd_ndx → verdaux.vda_name`,再在 `DT_VERNEED`(依赖)里匹配 `vernaux.vna_other → vna_name`。未定义符号用 `want_version` 取其所需版本名,`lookup_gnu/lookup_in/find_in` 对每个同名候选调用 `ver_ok`:提供者无 versym 视为兼容;索引 ≤1 为基版本;索引带 `0x8000`(hidden)只在不指定版本时拒绝;否则比较版本名。
 - 静态 TLS 细节:`tls_setup` 以 `TLS_TP=0x08780000` 为线程指针,按对象顺序(主程序在前)从 TP 向下扣减对齐后的 `p_memsz`,记录每模块的负偏移与模块 id;把 `bias + p_vaddr` 的 `.tdata` 复制进块、`.tbss` 清零;`*(u32*)TP = TP` 写自指针,再 `set_thread_area(243, {base=TP, limit=0xFFFFF, flags=0x51})` 并 `mov %gs,0x33`。`R_386_TLS_TPOFF/IE/GOTIE/TPOFF32/IE_32` 只把模块偏移加到 GOT 里已就位的符号偏移(与 glibc i386 ld.so 的规则一致),`LE/LE_32` 完整解析;`DTPMOD32` 写模块 id、`DTPOFF32` 加符号块内偏移。`__tls_get_addr` 由 ld-mu 内建:汇编入口 `ldmu_tls_get_addr_entry` 按 i386 约定从 `%eax` 取 (mod,off) 二元组指针,压栈后调 `ldmu_tls_get_addr_c` 返回 `TP + 模块偏移 + off`。
 - 用户态异常在 `isr_handler` 开头分流:`(regs->cs & 3) == 3 && user_is_active()` → `user_handle_fault` 打印 EIP/CS/CR2 后回 Shell,内核 panic 路径不受影响。
 
@@ -335,11 +336,18 @@ USER_SIGTRAMP = 0x08847000
 | `info / fb / active` | fb.c | VBE 模式信息、恒等映射后的显存指针与启用状态 |
 | `cells[] / pending` | vga.c | 80×25 影子文本网格与"等待帧缓冲"标志 |
 
+### 7.13 权限、TCP 发送队列与 FAT 长名
+
+- `fs_file_t/fs_dir_t` 增加 `uid/gid/mode`;MuFS 元数据 v2 保存这些字段(旧的 v1 盘在挂载时因版本不匹配被重新格式化)。新建文件 0644、目录 0755;`fs_perm_path/fs_perm_slot` 供 syscall 层读取,`fs_chmod_*`/`fs_chown_*` 校验后落盘。
+- `proc_t.uid/gid` 默认 0(root),fork/clone 继承;`getuid/getgid/geteuid/getegid` 返回真实值,`setuid/setgid` 允许 root 任意切换、非 root 只能设成自身。`perm_ok` 按 owner/group/other 取 rwx 位;root 对读写直接放行、执行仍需任一 x 位;目录的读写检查附带 x(遍历)。`open` 对已存在文件按 O_ACCMODE 检查 r/w,`O_CREAT` 检查父目录 w+x;`access` 用 X/W/R_OK 位;`chmod/fchmod/chmodat` 与 `chown/fchown/fchownat` 只允许 root 或文件 owner(改所有者仅 root)。
+- TCP 发送队列:`net_sock_t` 内 8 项 `txq`(seq/end/flags/data),`tcp_send_seg` 入队并立即发送;`tcp_ack` 按 `ack >= end` 逐段退休并重置 RTO;`tcp_timers` 只重传队头,超时重置 cwnd/ssthresh。乱序数据仍丢弃并回当前 ACK(无重排重组)。
+- FAT32 长名写入:名字不是纯 8.3 时生成 `NAME~1.EXT` 短别名,`dir_find` 同时按 LFN 与短名匹配,`dir_free_run` 找连续 `need` 个空槽(目录满则追加簇),`dir_write_long` 按序号降序写 LFN(含 11 字节短名校验和)再写短项。
+
 ## 十一、已知局限(真实清单)
 
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;无按需分页/换出
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
-3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE` 与静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)已支持;符号版本化(`.gnu.version`)未实现,也未用真实 glibc/musl 的 `.so` 验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回
+3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc/musl `.so` 端到端验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回;ext2 只读、未接入 VFS
 4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32 支持 8.3 文件读写但未接入 `open/read` 的 VFS、不支持长名创建;ext2 只读、无二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(单段在途重传/RTO 退避/慢开始+拥塞避免;无发送队列、无乱序重排、无窗口缩放,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层

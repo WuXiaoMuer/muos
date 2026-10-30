@@ -36,6 +36,8 @@
 #define SYS_lseek     19
 #define SYS_getpid    20
 #define SYS_getuid    24
+#define SYS_setuid    23
+#define SYS_setgid    46
 #define SYS_access    33
 #define SYS_kill      37
 #define SYS_mkdir     39
@@ -1011,6 +1013,49 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
     return false;
 }
 
+/* Permission bit mapping: read = 4, write = 2, execute/search = 1. Root
+ * bypasses read/write checks; execute still needs at least one x bit. */
+static bool_t perm_ok(uint32_t fuid, uint32_t fgid, uint16_t mode,
+                      uint32_t need) {
+    proc_t* p = proc_current();
+    if (!p) p = NULL;
+    uint32_t uid = p ? p->uid : 0;
+    uint32_t gid = p ? p->gid : 0;
+    if (uid == 0) {
+        if (need & 1) return (mode & 0111) != 0;
+        return true;
+    }
+    uint16_t bits;
+    if (uid == fuid)      bits = (uint16_t)((mode >> 6) & 7);
+    else if (gid == fgid) bits = (uint16_t)((mode >> 3) & 7);
+    else                  bits = (uint16_t)(mode & 7);
+    return (bits & need) == need;
+}
+
+static bool_t path_perm_ok(const char* path, uint32_t need);
+
+static bool_t parent_perm_ok(const char* rel, uint32_t need) {
+    const char* slash = 0;
+    for (const char* q = rel; *q; q++) if (*q == '/') slash = q;
+    if (!slash) return path_perm_ok("", need);       /* root directory */
+    char par[FS_MAX_NAME];
+    uint32_t n = (uint32_t)(slash - rel);
+    if (n >= FS_MAX_NAME) return false;
+    memcpy(par, rel, n);
+    par[n] = '\0';
+    return path_perm_ok(par, need);
+}
+
+static bool_t path_perm_ok(const char* path, uint32_t need) {
+    uint32_t uid = 0, gid = 0;
+    uint16_t mode = 0644;
+    bool_t is_dir = false;
+    while (*path == '/') path++;             /* fs names have no leading '/' */
+    if (!fs_perm_path(path, &uid, &gid, &mode, &is_dir)) return true;
+    if (is_dir && (need & 3)) need |= 1;        /* traversal needs x */
+    return perm_ok(uid, gid, mode, need);
+}
+
 static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
     (void)mode;
     vfs_ent_t e;
@@ -1023,6 +1068,8 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
         if (!*name) return err(ERR_ENOTDIR);
         if (strlen(name) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
         if (!fs_parent_is_dir(name)) return err(ERR_ENOTDIR);
+        /* Creating requires write+search on the parent directory. */
+        if (!parent_perm_ok(name, 3)) return err(ERR_EACCES);
         int slot = fs_create(name);
         if (slot < 0) return err(ERR_ENOSPC);
         int fd = user_fd_alloc(slot);
@@ -1056,6 +1103,9 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
         }
         case VFS_T_FILE: {
             if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
+            uint32_t need = ((flags & O_ACCMODE) == O_RDWR) ? 6 :
+                            ((flags & O_ACCMODE) == O_WRONLY) ? 2 : 4;
+            if (!path_perm_ok(buf, need)) return err(ERR_EACCES);
             if (flags & O_TRUNC) fs_fd_truncate(e.slot);
             int fd = user_fd_alloc(e.slot);
             if (fd < 0) return err(ERR_EMFILE);
@@ -1769,9 +1819,13 @@ static uint32_t do_llseek(uint32_t fd, uint32_t off_lo, uint32_t off_hi,
 }
 
 static uint32_t do_access_buf(const char* buf, uint32_t mode) {
-    (void)mode;
     vfs_ent_t e;
-    return vfs_lookup(buf, &e);
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+    if (mode == 0) return 0;                     /* F_OK */
+    uint32_t need = mode & 7;                    /* X_OK=1,W_OK=2,R_OK=4 */
+    if (!path_perm_ok(buf, need)) return err(ERR_EACCES);
+    return 0;
 }
 
 static uint32_t do_access(uint32_t path_ptr, uint32_t mode) {
@@ -1780,28 +1834,47 @@ static uint32_t do_access(uint32_t path_ptr, uint32_t mode) {
     return do_access_buf(buf, mode);
 }
 
-/* RAM FS modes are fixed; chmod on real files/directories is a no-op. */
-static uint32_t do_chmod_buf(const char* buf) {
+static uint32_t do_chmod_buf(const char* buf, uint32_t mode) {
     vfs_ent_t e;
     uint32_t rc = vfs_lookup(buf, &e);
     if ((int32_t)rc < 0) return rc;
-    if (e.type == VFS_T_FILE) return 0;
-    if (e.type == VFS_T_DIR && e.id == VFS_DIR_REAL) return 0;
+    if (e.type == VFS_T_FILE || (e.type == VFS_T_DIR && e.id == VFS_DIR_REAL)) {
+        proc_t* p = proc_current();
+        uint32_t fuid = 0, fgid = 0;
+        uint16_t fmode = 0;
+        bool_t is_dir = false;
+        const char* rel = buf;
+        while (*rel == '/') rel++;
+        if (fs_perm_path(rel, &fuid, &fgid, &fmode, &is_dir) &&
+            p && p->uid != 0 && p->uid != fuid)
+            return err(ERR_EPERM);
+        return fs_chmod_path(rel, (uint16_t)(mode & 07777)) < 0
+               ? err(ERR_EPERM) : 0;
+    }
     return err(ERR_EPERM);
 }
 
 static uint32_t do_chmod(uint32_t path_ptr, uint32_t mode) {
-    (void)mode;
     char buf[128];
     if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
-    return do_chmod_buf(buf);
+    return do_chmod_buf(buf, mode);
 }
 
 static uint32_t do_fchmod(uint32_t fd, uint32_t mode) {
-    (void)mode;
     int kind = user_fd_kind((int)fd);
     if (kind < 0) return err(ERR_EBADF);
-    if (kind == USER_FD_FILE || kind == USER_FD_DIR) return 0;
+    if (kind == USER_FD_FILE) {
+        int slot = user_fd_slot((int)fd);
+        proc_t* p = proc_current();
+        uint32_t fuid = 0, fgid = 0;
+        uint16_t fmode = 0;
+        if (fs_perm_slot(slot, &fuid, &fgid, &fmode) &&
+            p && p->uid != 0 && p->uid != fuid)
+            return err(ERR_EPERM);
+        return fs_chmod_slot(slot, (uint16_t)(mode & 07777)) < 0
+               ? err(ERR_EPERM) : 0;
+    }
+    if (kind == USER_FD_DIR) return 0;
     return err(ERR_EPERM);
 }
 
@@ -2098,11 +2171,10 @@ static uint32_t do_faccessat(uint32_t dirfd, uint32_t path_ptr, uint32_t mode) {
 }
 
 static uint32_t do_fchmodat(uint32_t dirfd, uint32_t path_ptr, uint32_t mode) {
-    (void)mode;
     char buf[128];
     uint32_t rc = at_path((int32_t)dirfd, path_ptr, buf, sizeof(buf));
     if ((int32_t)rc < 0) return rc;
-    return do_chmod_buf(buf);
+    return do_chmod_buf(buf, mode);
 }
 
 /* readlinkat(305): the VFS has no symlinks, so an existing target is
@@ -2472,26 +2544,51 @@ static uint32_t do_readlink(uint32_t path_ptr) {
     return err(ERR_EINVAL);          /* no symlinks in the VFS yet */
 }
 
-/* Ownership is not tracked; chown validates the target like chmod. */
-static uint32_t do_chown(uint32_t path_ptr) {
-    return do_chmod(path_ptr, 0);
+/* Ownership: only root may chown (a non-root owner cannot change the id). */
+static uint32_t do_chown(uint32_t path_ptr, uint32_t uid, uint32_t gid) {
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+    proc_t* p = proc_current();
+    if (p && p->uid != 0) return err(ERR_EPERM);
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+    if (e.type != VFS_T_FILE && !(e.type == VFS_T_DIR && e.id == VFS_DIR_REAL))
+        return err(ERR_EPERM);
+    const char* rel = buf;
+    while (*rel == '/') rel++;
+    return fs_chown_path(rel, uid, gid) < 0 ? err(ERR_EPERM) : 0;
 }
 
-static uint32_t do_fchown(uint32_t fd) {
-    return do_fchmod(fd, 0);
+static uint32_t do_fchown(uint32_t fd, uint32_t uid, uint32_t gid) {
+    int kind = user_fd_kind((int)fd);
+    if (kind < 0) return err(ERR_EBADF);
+    proc_t* p = proc_current();
+    if (p && p->uid != 0) return err(ERR_EPERM);
+    if (kind == USER_FD_FILE) {
+        int slot = user_fd_slot((int)fd);
+        return fs_chown_slot(slot, uid, gid) < 0 ? err(ERR_EPERM) : 0;
+    }
+    if (kind == USER_FD_DIR) return 0;
+    return err(ERR_EPERM);
 }
 
-static uint32_t do_fchownat(uint32_t dirfd, uint32_t path_ptr, uint32_t flags) {
+static uint32_t do_fchownat(uint32_t dirfd, uint32_t path_ptr,
+                            uint32_t uid, uint32_t gid, uint32_t flags) {
     char raw[USER_FD_PATH_MAX];
     if (!copy_user_string(path_ptr, raw, sizeof(raw))) return err(ERR_EFAULT);
     if (raw[0] == '\0') {
         if (!(flags & AT_EMPTY_PATH)) return err(ERR_ENOENT);
-        return do_fchmod(dirfd, 0);
+        return do_fchown(dirfd, uid, gid);
     }
     char buf[128];
     uint32_t rc = at_resolve_raw((int32_t)dirfd, raw, buf, sizeof(buf));
     if ((int32_t)rc < 0) return rc;
-    return do_chmod_buf(buf);
+    proc_t* p = proc_current();
+    if (p && p->uid != 0) return err(ERR_EPERM);
+    const char* rel = buf;
+    while (*rel == '/') rel++;
+    return fs_chown_path(rel, uid, gid) < 0 ? err(ERR_EPERM) : 0;
 }
 
 /* ---- sequential fork/wait model ----
@@ -2676,6 +2773,8 @@ static uint32_t do_fork(registers_t* regs) {
     child->fs_sel = regs->fs ? regs->fs : 0x23;
     child->gs_sel = regs->gs ? regs->gs : 0x23;
     child->has_ctx = true;
+    child->uid = parent->uid;
+    child->gid = parent->gid;
     proc_signal_inherit(child, parent);
 
     return child->pid;
@@ -2733,6 +2832,8 @@ static uint32_t do_clone(registers_t* regs, uint32_t flags, uint32_t stack,
     child->gs_sel = (flags & CLONE_SETTLS) ? 0x33 : (regs->gs ? regs->gs : 0x23);
     child->has_ctx = true;
     child->is_thread = share_vm;
+    child->uid = parent->uid;
+    child->gid = parent->gid;
     proc_signal_inherit(child, parent);
 
     if (ptid && user_ptr_ok(ptid, 4))
@@ -3291,14 +3392,15 @@ void syscall_handler(registers_t* regs) {
         case SYS_lchown:
         case SYS_chown32:
         case SYS_lchown32:
-            ret = do_chown(regs->ebx);
+            ret = do_chown(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_fchown:
         case SYS_fchown32:
-            ret = do_fchown(regs->ebx);
+            ret = do_fchown(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_fchownat:
-            ret = do_fchownat(regs->ebx, regs->ecx, regs->edi);
+            ret = do_fchownat(regs->ebx, regs->ecx, regs->edx,
+                              regs->esi, regs->edi);
             break;
         case SYS_readlink:
             ret = do_readlink(regs->ebx);
@@ -3474,14 +3576,36 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_getuid:
         case SYS_geteuid:
+        case SYS_getuid32:
+        case SYS_geteuid32: {
+            proc_t* cu = proc_current();
+            ret = cu ? cu->uid : 0;
+            break;
+        }
         case SYS_getgid:
         case SYS_getegid:
-        case SYS_getuid32:
-        case SYS_geteuid32:
         case SYS_getgid32:
-        case SYS_getegid32:
-            ret = 0;
+        case SYS_getegid32: {
+            proc_t* cg = proc_current();
+            ret = cg ? cg->gid : 0;
             break;
+        }
+        case SYS_setuid: {
+            proc_t* su = proc_current();
+            if (!su) { ret = err(ERR_EPERM); break; }
+            if (su->uid != 0 && regs->ebx != su->uid)
+                ret = err(ERR_EPERM);
+            else { su->uid = regs->ebx; ret = 0; }
+            break;
+        }
+        case SYS_setgid: {
+            proc_t* sg = proc_current();
+            if (!sg) { ret = err(ERR_EPERM); break; }
+            if (sg->uid != 0 && regs->ebx != sg->gid)
+                ret = err(ERR_EPERM);
+            else { sg->gid = regs->ebx; ret = 0; }
+            break;
+        }
         case SYS_ioctl:
             ret = err(ERR_ENOTTY);   /* not a real tty yet */
             break;

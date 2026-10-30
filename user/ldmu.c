@@ -39,6 +39,11 @@ typedef unsigned int   u32;
 #define DT_PLTREL   20
 #define DT_JMPREL   23
 #define DT_GNU_HASH 0x6ffffef5
+#define DT_VERSYM      0x6ffffff0
+#define DT_VERDEF      0x6ffffffc
+#define DT_VERDEFNUM   0x6ffffffd
+#define DT_VERNEED     0x6ffffffe
+#define DT_VERNEEDNUM  0x6fffffff
 
 #define R_386_NONE     0
 #define R_386_32       1
@@ -94,6 +99,7 @@ typedef struct obj {
     u32 dyn;
     u32 symtab, strtab, hash, syment;
     u32 gnu_hash;
+    u32 versym, verdef, verdefnum, verneed, verneednum;
     u32 rel, relsz, jmprel, pltrelsz;
     u32 tls_present, tls_vaddr, tls_filesz, tls_memsz, tls_align;
     int tls_off;                 /* block start relative to TP (negative) */
@@ -213,6 +219,11 @@ static void parse_dynamic(obj_t* o, u32 phdr_addr, u32 phnum) {
             case DT_RELSZ:    o->relsz  = d[i].d_val; break;
             case DT_JMPREL:   o->jmprel = d[i].d_val; break;
             case DT_PLTRELSZ: o->pltrelsz = d[i].d_val; break;
+            case DT_VERSYM:     o->versym = d[i].d_val; break;
+            case DT_VERDEF:     o->verdef = d[i].d_val; break;
+            case DT_VERDEFNUM:  o->verdefnum = d[i].d_val; break;
+            case DT_VERNEED:    o->verneed = d[i].d_val; break;
+            case DT_VERNEEDNUM: o->verneednum = d[i].d_val; break;
             default: break;
         }
     }
@@ -222,6 +233,80 @@ static void parse_dynamic(obj_t* o, u32 phdr_addr, u32 phnum) {
     if (o->gnu_hash) o->gnu_hash += o->bias;
     if (o->rel)    o->rel    += o->bias;
     if (o->jmprel) o->jmprel += o->bias;
+    if (o->versym)  o->versym  += o->bias;
+    if (o->verdef)  o->verdef  += o->bias;
+    if (o->verneed) o->verneed += o->bias;
+}
+
+/* Resolve a version index to its name: definitions first (exported symbol),
+ * then requirements (undefined symbol). Returns false when not found. */
+static int ver_name(obj_t* o, u32 idx, char* out, u32 cap) {
+    if (o->verdef && o->verdefnum) {
+        const u8* vd = (const u8*)o->verdef;
+        for (u32 i = 0; i < o->verdefnum && i < 64; i++) {
+            u32 ndx = *(const u16*)(vd + 4);
+            u32 aux = *(const u32*)(vd + 12);
+            u32 next = *(const u32*)(vd + 16);
+            if (ndx == idx) {
+                const u8* va = vd + aux;
+                u32 name = *(const u32*)va;
+                const char* s = (const char*)(o->strtab + name);
+                u32 n = 0;
+                while (s[n] && n + 1 < cap) { out[n] = s[n]; n++; }
+                out[n] = '\0';
+                return true;
+            }
+            if (!next) break;
+            vd += next;
+        }
+    }
+    if (o->verneed && o->verneednum) {
+        const u8* vn = (const u8*)o->verneed;
+        for (u32 i = 0; i < o->verneednum && i < 64; i++) {
+            u32 cnt = *(const u16*)(vn + 2);
+            u32 aux = *(const u32*)(vn + 12);
+            u32 next = *(const u32*)(vn + 16);
+            const u8* va = vn + aux;
+            for (u32 k = 0; k < cnt && k < 64; k++) {
+                u32 other = *(const u16*)(va + 6);
+                u32 name = *(const u32*)(va + 8);
+                u32 vnext = *(const u32*)(va + 12);
+                if (other == idx) {
+                    const char* s = (const char*)(o->strtab + name);
+                    u32 n = 0;
+                    while (s[n] && n + 1 < cap) { out[n] = s[n]; n++; }
+                    out[n] = '\0';
+                    return true;
+                }
+                if (!vnext) break;
+                va += vnext;
+            }
+            if (!next) break;
+            vn += next;
+        }
+    }
+    return false;
+}
+
+/* Is this provider symbol acceptable for the requested version? */
+static int ver_ok(obj_t* o, u32 symidx, const char* want) {
+    if (!o->versym) return true;               /* unversioned provider */
+    u32 v = ((const u16*)o->versym)[symidx];
+    if ((v & 0x7FFFu) <= 1) return true;       /* local/global base */
+    if (!want || !want[0]) return (v & 0x8000u) ? false : true;
+    char vn[64];
+    if (!ver_name(o, v & 0x7FFFu, vn, sizeof(vn))) return true;
+    return strcmp_(vn, want) == 0;
+}
+
+/* Version name requested by an undefined symbol in `o`. */
+static void want_version(obj_t* o, u32 symix, char* out, u32 cap) {
+    out[0] = '\0';
+    if (!o->versym) return;
+    u32 v = ((const u16*)o->versym)[symix];
+    u32 idx = v & 0x7FFFu;
+    if (idx <= 1) return;
+    if (!ver_name(o, idx, out, cap)) out[0] = '\0';
 }
 
 /* ---------------- symbol lookup (SysV hash) ---------------- */
@@ -250,7 +335,7 @@ static u32 sym_value(obj_t* o, const sym_t* sym) {
 
 /* .gnu.hash: nbuckets, symoffset, bloom_size, bloom_shift, bloom[],
  * buckets[], chain[]. Names in the hash table are not sorted. */
-static u32 lookup_gnu(obj_t* o, const char* name) {
+static u32 lookup_gnu(obj_t* o, const char* name, const char* want) {
     const u32* gh = (const u32*)o->gnu_hash;
     u32 nbucket = gh[0], symoff = gh[1], bloom_size = gh[2];
     u32 bloom_shift = gh[3];
@@ -271,15 +356,16 @@ static u32 lookup_gnu(obj_t* o, const char* name) {
         u32 c = chain[idx - symoff];
         if ((c & ~1u) == h &&
             sym->st_shndx != SHN_UNDEF &&
-            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0)
+            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0 &&
+            ver_ok(o, idx, want))
             return sym_value(o, sym);
         if (c & 1) break;
     }
     return 0;
 }
 
-static u32 lookup_in(obj_t* o, const char* name) {
-    if (o->gnu_hash) return lookup_gnu(o, name);
+static u32 lookup_in(obj_t* o, const char* name, const char* want) {
+    if (o->gnu_hash) return lookup_gnu(o, name, want);
     if (!o->hash || !o->symtab || !o->strtab || !o->syment) return 0;
     const u32* ht = (const u32*)o->hash;
     u32 nbucket = ht[0], nchain = ht[1];
@@ -289,7 +375,8 @@ static u32 lookup_in(obj_t* o, const char* name) {
     for (u32 guard = 0; idx != 0 && idx < nchain && guard < nchain; guard++) {
         const sym_t* sym = (const sym_t*)(o->symtab + idx * o->syment);
         if (sym->st_shndx != SHN_UNDEF &&
-            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0) {
+            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0 &&
+            ver_ok(o, idx, want)) {
             return sym_value(o, sym);
         }
         idx = chain[idx];
@@ -299,7 +386,7 @@ static u32 lookup_in(obj_t* o, const char* name) {
 
 /* Symbol-table variants of the lookups above, needed by TLS relocations:
  * they must know which module defines the symbol. */
-static const sym_t* find_gnu(obj_t* o, const char* name) {
+static const sym_t* find_gnu(obj_t* o, const char* name, const char* want) {
     const u32* gh = (const u32*)o->gnu_hash;
     u32 nbucket = gh[0], symoff = gh[1], bloom_size = gh[2];
     u32 bloom_shift = gh[3];
@@ -320,15 +407,16 @@ static const sym_t* find_gnu(obj_t* o, const char* name) {
         u32 c = chain[idx - symoff];
         if ((c & ~1u) == h &&
             sym->st_shndx != SHN_UNDEF &&
-            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0)
+            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0 &&
+            ver_ok(o, idx, want))
             return sym;
         if (c & 1) break;
     }
     return 0;
 }
 
-static const sym_t* find_in(obj_t* o, const char* name) {
-    if (o->gnu_hash) return find_gnu(o, name);
+static const sym_t* find_in(obj_t* o, const char* name, const char* want) {
+    if (o->gnu_hash) return find_gnu(o, name, want);
     if (!o->hash || !o->symtab || !o->strtab || !o->syment) return 0;
     const u32* ht = (const u32*)o->hash;
     u32 nbucket = ht[0], nchain = ht[1];
@@ -338,16 +426,18 @@ static const sym_t* find_in(obj_t* o, const char* name) {
     for (u32 guard = 0; idx != 0 && idx < nchain && guard < nchain; guard++) {
         const sym_t* sym = (const sym_t*)(o->symtab + idx * o->syment);
         if (sym->st_shndx != SHN_UNDEF &&
-            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0)
+            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0 &&
+            ver_ok(o, idx, want))
             return sym;
         idx = chain[idx];
     }
     return 0;
 }
 
-static int find_global(const char* name, obj_t** mo, const sym_t** ms) {
+static int find_global(const char* name, const char* want,
+                       obj_t** mo, const sym_t** ms) {
     for (int i = 0; i < nobj; i++) {
-        const sym_t* s = find_in(&objs[i], name);
+        const sym_t* s = find_in(&objs[i], name, want);
         if (s) { *mo = &objs[i]; *ms = s; return 1; }
     }
     return 0;
@@ -379,9 +469,9 @@ __asm__(
 );
 void ldmu_tls_get_addr_entry(void);
 
-static u32 lookup_global(const char* name) {
+static u32 lookup_global(const char* name, const char* want) {
     for (int i = 0; i < nobj; i++) {
-        u32 v = lookup_in(&objs[i], name);
+        u32 v = lookup_in(&objs[i], name, want);
         if (v) return v;
     }
     if (strcmp_(name, "__tls_get_addr") == 0 ||
@@ -400,7 +490,9 @@ static void tls_sym(obj_t* o, u32 symix, int* moff, u32* symoff, u32* modid) {
     const sym_t* s = (const sym_t*)(o->symtab + symix * o->syment);
     if (symix != 0 && s->st_shndx == SHN_UNDEF) {
         const char* name = (const char*)(o->strtab + s->st_name);
-        if (!find_global(name, &m, &s)) fail("unresolved TLS symbol", name);
+        char wv[64];
+        want_version(o, symix, wv, sizeof(wv));
+        if (!find_global(name, wv, &m, &s)) fail("unresolved TLS symbol", name);
     }
     *moff   = m->tls_off;
     *symoff = s->st_value;
@@ -421,7 +513,9 @@ static int apply_one(obj_t* o, u32 type, u32 symix, u32 where) {
              * (classic COPY relocation). */
             const sym_t* sym = (const sym_t*)(o->symtab + symix * o->syment);
             const char* name = (const char*)(o->strtab + sym->st_name);
-            u32 src = lookup_global(name);
+            char wv[64];
+            want_version(o, symix, wv, sizeof(wv));
+            u32 src = lookup_global(name, wv);
             if (!src) fail("unresolved COPY symbol", name);
             memcpy((void*)where, (const void*)src, sym->st_size);
             return 0;
@@ -440,7 +534,9 @@ static int apply_one(obj_t* o, u32 type, u32 symix, u32 where) {
             const sym_t* sym = (const sym_t*)(o->symtab + symix * o->syment);
             const char* name = (const char*)(o->strtab + sym->st_name);
             if (sym->st_shndx == SHN_UNDEF) {
-                val = lookup_global(name);
+                char wv[64];
+                want_version(o, symix, wv, sizeof(wv));
+                val = lookup_global(name, wv);
                 if (!val) fail("unresolved symbol", name);
             } else {
                 val = (sym->st_shndx == SHN_ABS) ? sym->st_value

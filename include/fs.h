@@ -17,11 +17,17 @@ typedef struct {
     uint32_t atime;   /* UTC seconds since 1970 */
     uint32_t mtime;
     uint32_t ctime;
+    uint32_t uid;     /* owner (root = 0) */
+    uint32_t gid;
+    uint16_t mode;    /* permission bits, e.g. 0644 */
 } fs_file_t;
 
 typedef struct {
     char   name[FS_MAX_NAME];   /* path relative to root */
     uint32_t used;
+    uint32_t uid;
+    uint32_t gid;
+    uint16_t mode;               /* directory permission bits, e.g. 0755 */
 } fs_dir_t;
 
 typedef struct {
@@ -54,6 +60,15 @@ int  fs_used_slots(void);   /* occupied slots, unlinked-but-open included */
  * releases it, so existing readers/writers never dangle. */
 int  fs_ref(int slot);
 int  fs_unref(int slot);
+
+/* Ownership / permission metadata (root bypasses checks in syscall.c). */
+bool_t fs_perm_path(const char* path, uint32_t* uid, uint32_t* gid,
+                    uint16_t* mode, bool_t* is_dir);
+bool_t fs_perm_slot(int slot, uint32_t* uid, uint32_t* gid, uint16_t* mode);
+int    fs_chmod_path(const char* path, uint16_t mode);
+int    fs_chmod_slot(int slot, uint16_t mode);
+int    fs_chown_path(const char* path, uint32_t uid, uint32_t gid);
+int    fs_chown_slot(int slot, uint32_t uid, uint32_t gid);
 const char* fs_name(int idx);
 uint32_t fs_size(int idx);   /* size of the idx-th *existing* file (ls) */
 

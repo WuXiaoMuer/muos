@@ -44,8 +44,11 @@ def main():
                     "fatcat /SUBDIR/INNER.TXT",
                     "fatwrite /NEW.TXT FAT-WRITE-OK", "fatcat /NEW.TXT",
                     "fatwrite /HELLO.TXT FAT-OVERWRITE",
-                    "fatcat /HELLO.TXT"], 4477, "fat")
-    tfw = boot(fat, ["fatcat /NEW.TXT", "fatcat /HELLO.TXT"], 4480, "fat2")
+                    "fatcat /HELLO.TXT",
+                    "fatwrite /LongFileName.txt LONG-NAME-OK",
+                    "fatcat /LongFileName.txt"], 4477, "fat")
+    tfw = boot(fat, ["fatcat /NEW.TXT", "fatcat /HELLO.TXT",
+                     "fatcat /LongFileName.txt"], 4480, "fat2")
     tg = boot(gpt, ["part", "fatcat /HELLO.TXT"], 4478, "gpt")
     te = boot(ext, ["part", "ext2ls /", "ext2cat /hello.txt",
                     "ext2ls /subdir", "ext2cat /subdir/inside.txt"],
@@ -61,7 +64,9 @@ def main():
                        tf.count("[fat] cat ok") >= 3,
         "fat write": "[fat] write ok" in tf and "FAT-WRITE-OK" in tf,
         "fat overwrite": "FAT-OVERWRITE" in tf,
+        "fat long create": "LONG-NAME-OK" in tf and "LongFileName.txt" in tf,
         "fat persist": "FAT-WRITE-OK" in tfw and "FAT-OVERWRITE" in tfw,
+        "fat long persist": "LONG-NAME-OK" in tfw,
         "gpt partition": "GPT" in tg and "[part] table ok" in tg,
         "gpt fat read": "FAT-HELLO-OK" in tg,
         "ext2 part table": "[part] table ok" in te,
