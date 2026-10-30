@@ -123,6 +123,14 @@ int elf32_load(const void* image, uint32_t image_size,
                uint32_t load_base, uint32_t load_limit,
                uint32_t* entry_out, uint32_t* end_out);
 
+/* Execve loader: maps the segments and, for self-contained images, applies
+ * the dynamic relocations. When the image carries a PT_INTERP the caller
+ * must map and enter that interpreter, which relocates the program and its
+ * DT_NEEDED shared libraries itself (see user/ldmu.c). */
+int elf32_load_program(const void* image, uint32_t image_size,
+                       uint32_t load_base, uint32_t load_limit,
+                       elf32_load_info_t* info);
+
 /* Header/segment range validation without writing memory (execve precheck). */
 int elf32_validate(const void* image, uint32_t image_size,
                    uint32_t load_base, uint32_t load_limit,

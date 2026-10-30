@@ -1,0 +1,402 @@
+/* ldmu.c - ld-mu.so, the MuOS dynamic linker (ET_DYN, no dependencies).
+ *
+ * The kernel maps the main program's segments (PT_INTERP present) and this
+ * interpreter, then enters `_start` with the program's original stack. This
+ * code walks the auxiliary vector, maps every DT_NEEDED shared library from
+ * the MuFS (/lib), resolves symbols through the SysV hash table and applies
+ * the RELATIVE / 32 / PC32 / GLOB_DAT / JMP_SLOT relocations of each object,
+ * then jumps to AT_ENTRY with the untouched stack.
+ *
+ * Freestanding: no libc, syscalls via int 0x80, local memcpy/memset.
+ */
+
+typedef unsigned char  u8;
+typedef unsigned short u16;
+typedef unsigned int   u32;
+
+#define AT_NULL   0
+#define AT_PHDR   3
+#define AT_PHENT  4
+#define AT_PHNUM  5
+#define AT_BASE   7
+#define AT_ENTRY  9
+
+#define PT_LOAD     1
+#define PT_DYNAMIC  2
+
+#define DT_NULL     0
+#define DT_NEEDED   1
+#define DT_PLTRELSZ 2
+#define DT_HASH     4
+#define DT_STRTAB   5
+#define DT_SYMTAB   6
+#define DT_STRSZ    10
+#define DT_SYMENT   11
+#define DT_REL      17
+#define DT_RELSZ    18
+#define DT_PLTREL   20
+#define DT_JMPREL   23
+
+#define R_386_NONE     0
+#define R_386_32       1
+#define R_386_PC32     2
+#define R_386_COPY     5
+#define R_386_GLOB_DAT 6
+#define R_386_JMP_SLOT 7
+#define R_386_RELATIVE 8
+
+#define SHN_UNDEF 0
+#define SHN_ABS   0xFFF1
+
+#define PROG_BASE  0x08048000u    /* kernel maps the program's lowest segment here */
+#define LIB_BASE   0x08400000u    /* first shared library address */
+#define MAX_OBJ    4
+#define FILE_MAX   65536u
+
+typedef struct {
+    u8  e_ident[16];
+    u16 e_type, e_machine;
+    u32 e_version, e_entry, e_phoff, e_shoff, e_flags;
+    u16 e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+} ehdr_t;
+
+typedef struct {
+    u32 p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
+} phdr_t;
+
+typedef struct { u32 d_tag, d_val; } dyn_t;
+typedef struct { u32 r_offset, r_info; } rel_t;
+typedef struct {
+    u32 st_name, st_value, st_size;
+    u8  st_info, st_other;
+    u16 st_shndx;
+} sym_t;
+
+typedef struct obj {
+    u32 bias;
+    u32 dyn;
+    u32 symtab, strtab, hash, syment;
+    u32 rel, relsz, jmprel, pltrelsz;
+    const char* name;
+} obj_t;
+
+static obj_t objs[MAX_OBJ];
+static char  objnames[MAX_OBJ][64];
+static int   nobj = 0;
+static u32   next_base = LIB_BASE;
+static u8    fbuf[FILE_MAX];
+
+/* ---------------- freestanding bits ---------------- */
+
+void* memset(void* dst, int v, unsigned n) {
+    u8* d = (u8*)dst;
+    while (n--) *d++ = (u8)v;
+    return dst;
+}
+
+void* memcpy(void* dst, const void* src, unsigned n) {
+    u8* d = (u8*)dst;
+    const u8* s = (const u8*)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+static int strcmp_(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a - *b;
+}
+
+static int sc3(int nr, int a, int b, int c) {
+    int r;
+    __asm__ volatile ("int $0x80" : "=a"(r)
+                      : "a"(nr), "b"(a), "c"(b), "d"(c) : "memory");
+    return r;
+}
+
+static void out(const char* s) {
+    u32 n = 0;
+    while (s[n]) n++;
+    sc3(4, 1, (int)s, (int)n);
+}
+
+static void sys_exit(int code) {
+    sc3(1, code, 0, 0);
+    for (;;) { }
+}
+
+static void fail(const char* what, const char* detail) {
+    out("[ld-mu] ");
+    out(what);
+    if (detail) { out(": "); out(detail); }
+    out("\n");
+    sys_exit(127);
+}
+
+/* ---------------- file input ---------------- */
+
+static int read_file(const char* path, u32* size_out) {
+    int fd = sc3(5, (int)path, 0, 0);
+    if (fd < 0) return -1;
+    int total = 0;
+    while (total < (int)FILE_MAX) {
+        int n = sc3(3, fd, (int)(fbuf + total), (int)(FILE_MAX - total));
+        if (n <= 0) break;
+        total += n;
+    }
+    sc3(6, fd, 0, 0);
+    if (total <= 0) return -1;
+    *size_out = (u32)total;
+    return 0;
+}
+
+/* Join "/lib/" and a DT_NEEDED name into buf; return buf. */
+static const char* lib_path(const char* name, char* buf, u32 cap) {
+    u32 p = 0;
+    const char* pre = "/lib/";
+    while (*pre && p + 1 < cap) buf[p++] = *pre++;
+    while (*name && p + 1 < cap) buf[p++] = *name++;
+    buf[p] = '\0';
+    return buf;
+}
+
+/* ---------------- dynamic section ---------------- */
+
+static void parse_dynamic(obj_t* o, u32 phdr_addr, u32 phnum) {
+    const phdr_t* ph = (const phdr_t*)phdr_addr;
+    for (u32 i = 0; i < phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC && ph[i].p_memsz >= sizeof(dyn_t))
+            o->dyn = o->bias + ph[i].p_vaddr;
+    }
+    if (!o->dyn) return;
+
+    const dyn_t* d = (const dyn_t*)o->dyn;
+    for (u32 i = 0; i < 128; i++) {
+        if (d[i].d_tag == DT_NULL) break;
+        switch (d[i].d_tag) {
+            case DT_SYMTAB:   o->symtab = d[i].d_val; break;
+            case DT_STRTAB:   o->strtab = d[i].d_val; break;
+            case DT_HASH:     o->hash   = d[i].d_val; break;
+            case DT_SYMENT:   o->syment = d[i].d_val; break;
+            case DT_REL:      o->rel    = d[i].d_val; break;
+            case DT_RELSZ:    o->relsz  = d[i].d_val; break;
+            case DT_JMPREL:   o->jmprel = d[i].d_val; break;
+            case DT_PLTRELSZ: o->pltrelsz = d[i].d_val; break;
+            default: break;
+        }
+    }
+    if (o->symtab) o->symtab += o->bias;
+    if (o->strtab) o->strtab += o->bias;
+    if (o->hash)   o->hash   += o->bias;
+    if (o->rel)    o->rel    += o->bias;
+    if (o->jmprel) o->jmprel += o->bias;
+}
+
+/* ---------------- symbol lookup (SysV hash) ---------------- */
+
+static u32 elf_hash(const char* s) {
+    u32 h = 0, g;
+    while (*s) {
+        h = (h << 4) + (u32)(*s++);
+        g = h & 0xF0000000u;
+        if (g) h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}
+
+static u32 lookup_in(obj_t* o, const char* name) {
+    if (!o->hash || !o->symtab || !o->strtab || !o->syment) return 0;
+    const u32* ht = (const u32*)o->hash;
+    u32 nbucket = ht[0], nchain = ht[1];
+    const u32* bucket = ht + 2;
+    const u32* chain = bucket + nbucket;
+    u32 idx = bucket[elf_hash(name) % nbucket];
+    for (u32 guard = 0; idx != 0 && idx < nchain && guard < nchain; guard++) {
+        const sym_t* sym = (const sym_t*)(o->symtab + idx * o->syment);
+        if (sym->st_shndx != SHN_UNDEF &&
+            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0) {
+            return (sym->st_shndx == SHN_ABS) ? sym->st_value
+                                              : o->bias + sym->st_value;
+        }
+        idx = chain[idx];
+    }
+    return 0;
+}
+
+static u32 lookup_global(const char* name) {
+    for (int i = 0; i < nobj; i++) {
+        u32 v = lookup_in(&objs[i], name);
+        if (v) return v;
+    }
+    return 0;
+}
+
+/* ---------------- relocation ---------------- */
+
+static int apply_one(obj_t* o, u32 type, u32 symix, u32 where) {
+    u32* dst = (u32*)where;
+    u32 val;
+    switch (type) {
+        case R_386_NONE:
+            return 0;
+        case R_386_RELATIVE:
+            *dst += o->bias;
+            return 0;
+        case R_386_32:
+        case R_386_PC32:
+        case R_386_GLOB_DAT:
+        case R_386_JMP_SLOT: {
+            const sym_t* sym = (const sym_t*)(o->symtab + symix * o->syment);
+            const char* name = (const char*)(o->strtab + sym->st_name);
+            if (sym->st_shndx == SHN_UNDEF) {
+                val = lookup_global(name);
+                if (!val) fail("unresolved symbol", name);
+            } else {
+                val = (sym->st_shndx == SHN_ABS) ? sym->st_value
+                                                 : o->bias + sym->st_value;
+            }
+            if (type == R_386_32)        *dst += val;
+            else if (type == R_386_PC32) *dst += val - where;
+            else                         *dst = val;
+            return 0;
+        }
+        default:
+            return -1;      /* COPY/IRELATIVE/TLS are not used by our builds */
+    }
+}
+
+static void apply_table(obj_t* o, u32 addr, u32 size) {
+    if (!addr || !size) return;
+    const rel_t* r = (const rel_t*)addr;
+    u32 n = size / sizeof(rel_t);
+    for (u32 i = 0; i < n; i++)
+        apply_one(o, r[i].r_info & 0xFF, r[i].r_info >> 8,
+                  o->bias + r[i].r_offset);
+}
+
+static void apply_relocs(obj_t* o) {
+    apply_table(o, o->rel, o->relsz);
+    apply_table(o, o->jmprel, o->pltrelsz);
+}
+
+/* ---------------- object loading ---------------- */
+
+static int map_from_file(const char* path, const char* name, u32 base) {
+    if (nobj >= MAX_OBJ) fail("too many shared objects", path);
+    u32 size = 0;
+    if (read_file(path, &size) != 0) fail("cannot open", path);
+
+    const ehdr_t* eh = (const ehdr_t*)fbuf;
+    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') fail("not ELF", path);
+    if (eh->e_type != 3) fail("not ET_DYN", path);
+    if (eh->e_phnum == 0 || eh->e_phentsize < sizeof(phdr_t)) fail("bad phdrs", path);
+    u32 phoff = eh->e_phoff;
+    if (phoff > size || (u32)eh->e_phnum * eh->e_phentsize > size - phoff)
+        fail("truncated phdrs", path);
+    const phdr_t* ph = (const phdr_t*)(fbuf + phoff);
+
+    u32 minv = 0xFFFFFFFFu;
+    for (u32 i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        if (ph[i].p_vaddr < minv) minv = ph[i].p_vaddr;
+    }
+    if (minv == 0xFFFFFFFFu) fail("no LOAD segment", path);
+
+    obj_t* o = &objs[nobj];
+    memset(o, 0, sizeof(*o));
+    o->bias = (base >= minv) ? (base - minv) : 0;
+    objnames[nobj][0] = '\0';
+    {
+        u32 p = 0;
+        while (name[p] && p < 63) { objnames[nobj][p] = name[p]; p++; }
+        objnames[nobj][p] = '\0';
+    }
+    o->name = objnames[nobj];
+
+    u32 max_end = base;
+    for (u32 i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        if (ph[i].p_offset > size || ph[i].p_filesz > size - ph[i].p_offset)
+            fail("truncated segment", path);
+        u32 va = o->bias + ph[i].p_vaddr;
+        memcpy((void*)va, fbuf + ph[i].p_offset, ph[i].p_filesz);
+        if (ph[i].p_memsz > ph[i].p_filesz)
+            memset((void*)(va + ph[i].p_filesz), 0, ph[i].p_memsz - ph[i].p_filesz);
+        if (va + ph[i].p_memsz > max_end) max_end = va + ph[i].p_memsz;
+    }
+    next_base = (max_end + 0xFFFu) & ~0xFFFu;
+
+    u32 phdr_addr = o->bias + phoff;
+    parse_dynamic(o, phdr_addr, eh->e_phnum);
+    nobj++;
+    return 0;
+}
+
+/* Recursively load DT_NEEDED libraries of an object (depth-limited). */
+static void load_needed(obj_t* o, int depth) {
+    if (!o->dyn || !o->strtab) return;
+    const dyn_t* d = (const dyn_t*)o->dyn;
+    for (u32 i = 0; i < 128 && d[i].d_tag != DT_NULL; i++) {
+        if (d[i].d_tag != DT_NEEDED) continue;
+        const char* name = (const char*)(o->strtab + d[i].d_val);
+        int already = 0;
+        for (int k = 0; k < nobj; k++) {
+            if (strcmp_(objnames[k], name) == 0) already = 1;
+        }
+        if (already) continue;
+        if (depth > 2) fail("dependency loop", name);
+        char path[80];
+        map_from_file(lib_path(name, path, sizeof(path)), name, next_base);
+        load_needed(&objs[nobj - 1], depth + 1);
+    }
+}
+
+/* ---------------- entry ---------------- */
+
+static void jump_to(u32 entry, u32* sp) {
+    __asm__ volatile ("mov %0, %%esp\n\txor %%ebp, %%ebp\n\tjmp *%1"
+                      :: "r"(sp), "r"(entry) : "memory");
+    __builtin_unreachable();
+}
+
+void ld_main(u32* sp) __attribute__((noreturn, visibility("hidden")));
+
+void ld_main(u32* sp) {
+    u32 argc = sp[0];
+    u32* p = sp + 1 + argc + 1;         /* skip argv + NULL */
+    while (*p) p++;                     /* skip envp */
+    p++;
+    u32 at_phdr = 0, at_phnum = 0, at_phent = 0, at_entry = 0;
+    for (;; p += 2) {
+        if (p[0] == AT_NULL) break;
+        if (p[0] == AT_PHDR)  at_phdr  = p[1];
+        if (p[0] == AT_PHENT) at_phent = p[1];
+        if (p[0] == AT_PHNUM) at_phnum = p[1];
+        if (p[0] == AT_ENTRY) at_entry = p[1];
+    }
+    (void)at_phent;
+    if (!at_phdr || !at_phnum) fail("bad auxv", 0);
+
+    /* ---- main program: derive its load bias from AT_PHDR ---- */
+    obj_t* m = &objs[0];
+    memset(m, 0, sizeof(*m));
+    objnames[0][0] = '<'; objnames[0][1] = '\0';
+    m->name = objnames[0];
+    u32 minv = 0xFFFFFFFFu;
+    const phdr_t* mp = (const phdr_t*)at_phdr;
+    for (u32 i = 0; i < at_phnum; i++) {
+        if (mp[i].p_type == PT_LOAD && mp[i].p_vaddr < minv) minv = mp[i].p_vaddr;
+    }
+    if (minv == 0xFFFFFFFFu) fail("main has no LOAD segment", 0);
+    m->bias = PROG_BASE - minv;
+    parse_dynamic(m, at_phdr, at_phnum);
+    nobj = 1;
+
+    /* ---- DT_NEEDED shared libraries, then relocate everything ---- */
+    load_needed(m, 0);
+    for (int i = 1; i < nobj; i++) apply_relocs(&objs[i]);
+    apply_relocs(m);
+
+    jump_to(at_entry, sp);
+}

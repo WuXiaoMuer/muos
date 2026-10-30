@@ -12,6 +12,9 @@
 #define USER_SIZE  0x00800000u           /* 8MB sandbox */
 #define USER_END   (USER_BASE + USER_SIZE)
 #define USER_STACK_RESERVE 0x00010000u   /* 64KB kept free for the stack */
+/* PT_INTERP (dynamic linker) window: far enough above the program image and
+ * below the shared libraries that ld-mu.so maps at 0x08400000. */
+#define USER_INTERP_BASE 0x08200000u
 /* Last page of the sandbox: kernel-provided `mov eax,173; int 0x80`
  * sigreturn trampoline (the Linux vDSO trick), read-only to user code. */
 #define USER_SIGTRAMP (USER_END - 0x1000u)
@@ -30,6 +33,11 @@ int     user_run_embedded(const char* arg0, const char* arg1);
 /* ET_DYN (PIE) image: loaded with a bias + RELATIVE relocations applied. */
 int     user_run_pie_embedded(const char* arg0, const char* arg1);
 const void* user_get_pie_image(uint32_t* size);
+
+/* Dynamic linking: install /lib/ld-mu.so + /lib/libmu.so in the VFS and run
+ * the embedded dynamically linked test program (`run dyn`). */
+void    user_install_dyn_runtime(void);
+int     user_run_dyn_embedded(void);
 
 /* Per-process fd table (fd 0/1/2 are stdin/stdout/stderr). An entry is a
  * RAM FS file, a directory (offset = next entry index), a virtual /dev

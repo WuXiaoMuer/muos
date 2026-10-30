@@ -159,9 +159,13 @@ static int elf_apply_dynamic(uint32_t dyn_va, uint32_t bias,
     return ELF_OK;
 }
 
-int elf32_load_ex(const void* image, uint32_t image_size,
-                 uint32_t load_base, uint32_t load_limit,
-                 elf32_load_info_t* info) {
+/* Parse + copy every PT_LOAD segment into [load_base, load_limit) and fill
+ * the loader info. Dynamic relocations are NOT applied here; the caller
+ * decides whether it or a user-mode interpreter will do it. The PT_DYNAMIC
+ * address is returned through dyn_va_out (0 = none). */
+static int elf_map_segments(const void* image, uint32_t image_size,
+                            uint32_t load_base, uint32_t load_limit,
+                            elf32_load_info_t* info, uint32_t* dyn_va_out) {
     elf32_ehdr_t eh;
     int rc = elf_parse(image, image_size, &eh);
     if (rc != ELF_OK) return rc;
@@ -238,8 +242,39 @@ int elf32_load_ex(const void* image, uint32_t image_size,
         }
     }
 
+    if (dyn_va_out) *dyn_va_out = dyn_va;
+    return ELF_OK;
+}
+
+int elf32_load_ex(const void* image, uint32_t image_size,
+                  uint32_t load_base, uint32_t load_limit,
+                  elf32_load_info_t* info) {
+    uint32_t dyn_va = 0;
+    int rc = elf_map_segments(image, image_size, load_base, load_limit,
+                              info, &dyn_va);
+    if (rc != ELF_OK) return rc;
     if (dyn_va) {
-        rc = elf_apply_dynamic(dyn_va, bias, load_base, load_limit,
+        rc = elf_apply_dynamic(dyn_va, info->base, load_base, load_limit,
+                               &info->reloc_count);
+        if (rc != ELF_OK) return rc;
+    }
+    return ELF_OK;
+}
+
+/* Load a program for execve. When it names a PT_INTERP, the kernel maps the
+ * segments only: the interpreter (user-mode ld.so) applies the relocations,
+ * including the symbol slots of DT_NEEDED shared libraries. Self-contained
+ * images get their relocations applied here as before. */
+int elf32_load_program(const void* image, uint32_t image_size,
+                       uint32_t load_base, uint32_t load_limit,
+                       elf32_load_info_t* info) {
+    uint32_t dyn_va = 0;
+    int rc = elf_map_segments(image, image_size, load_base, load_limit,
+                              info, &dyn_va);
+    if (rc != ELF_OK) return rc;
+    if (info->has_interp) return ELF_OK;
+    if (dyn_va) {
+        rc = elf_apply_dynamic(dyn_va, info->base, load_base, load_limit,
                                &info->reloc_count);
         if (rc != ELF_OK) return rc;
     }

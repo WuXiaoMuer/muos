@@ -34,6 +34,7 @@ function Find-Tool {
 
 $NASM    = Find-Tool "nasm"
 $GCC     = Find-Tool "i686-elf-gcc"
+$LD      = Find-Tool "i686-elf-ld"
 $OBJCOPY = Find-Tool "i686-elf-objcopy"
 $QEMU    = Find-Tool "qemu-system-i386"
 
@@ -53,6 +54,7 @@ if ($Clean) {
 $missing = @()
 if (-not $NASM)    { $missing += "nasm" }
 if (-not $GCC)     { $missing += "i686-elf-gcc" }
+if (-not $LD)      { $missing += "i686-elf-ld" }
 if (-not $OBJCOPY) { $missing += "i686-elf-objcopy" }
 
 if ($missing.Count -gt 0) {
@@ -189,10 +191,68 @@ if ($pieRc -ne 0) { throw "objcopy hello-pie.elf failed" }
 Write-Host "      OK -> build\hello-pie.elf, build\hello_pie_elf.o" -ForegroundColor Green
 $step++
 
+# ======================== Dynamic linking set ========================
+# ld-mu.so   : user-mode dynamic linker (ET_DYN, no dependencies)
+# libmu.so   : first shared library (ET_DYN, SysV hash + dynsym)
+# dyn.elf    : PIE program with PT_INTERP=/lib/ld-mu.so, DT_NEEDED libmu.so
+$SoCFlags = @("-m32", "-ffreestanding", "-O2", "-g", "-Wall", "-Wextra",
+              "-fno-stack-protector", "-fPIC", "-fno-builtin",
+              "-fno-tree-loop-distribute-patterns", "-nostdinc", "-nostdlib")
+
+Write-Host ">>> [$step] Building libmu.so (shared library) ..." -ForegroundColor Cyan
+& $GCC @SoCFlags -c "$UserDir\libmu.c" -o "$BuildDir\libmu_pic.o"
+if ($LASTEXITCODE -ne 0) { throw "GCC libmu.c failed" }
+& $LD -m elf_i386 -shared -T "$UserDir\linker_so.ld" `
+      "$BuildDir\libmu_pic.o" -o "$BuildDir\libmu.so" `
+      --hash-style=sysv --build-id=none
+if ($LASTEXITCODE -ne 0) { throw "Link libmu.so failed" }
+Write-Host "      OK -> build\libmu.so" -ForegroundColor Green
+$step++
+
+Write-Host ">>> [$step] Building ld-mu.so (dynamic linker) ..." -ForegroundColor Cyan
+& $GCC @SoCFlags -c "$UserDir\ldmu.c" -o "$BuildDir\ldmu_pic.o"
+if ($LASTEXITCODE -ne 0) { throw "GCC ldmu.c failed" }
+& $NASM -f elf32 "$UserDir\ld_start.s" -o "$BuildDir\ld_start.o"
+if ($LASTEXITCODE -ne 0) { throw "NASM ld_start.s failed" }
+& $LD -m elf_i386 -shared -T "$UserDir\linker_so.ld" `
+      "$BuildDir\ldmu_pic.o" "$BuildDir\ld_start.o" -o "$BuildDir\ld-mu.so" `
+      --hash-style=sysv --build-id=none
+if ($LASTEXITCODE -ne 0) { throw "Link ld-mu.so failed" }
+Write-Host "      OK -> build\ld-mu.so" -ForegroundColor Green
+$step++
+
+Write-Host ">>> [$step] Building dyn.elf (PT_INTERP + DT_NEEDED libmu.so) ..." -ForegroundColor Cyan
+& $GCC @PieCFlags -c "$UserDir\dyn.c" -o "$BuildDir\pie_dyn.o"
+if ($LASTEXITCODE -ne 0) { throw "GCC dyn.c failed" }
+& $GCC -m32 -nostdlib -pie -T "$UserDir\linker_dyn.ld" `
+       "$BuildDir\pie_start.o" "$BuildDir\pie_runtime.o" "$BuildDir\pie_dyn.o" `
+       "$BuildDir\pie_syscall6.o" `
+       -L"$BuildDir" -lmu `
+       -o "$BuildDir\dyn.elf" `
+       "-Wl,--dynamic-linker=/lib/ld-mu.so" "-Wl,--hash-style=sysv" `
+       "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
+if ($LASTEXITCODE -ne 0) { throw "Link dyn.elf failed" }
+Write-Host "      OK -> build\dyn.elf" -ForegroundColor Green
+$step++
+
+Write-Host ">>> [$step] Embedding dynamic-linking blobs ..." -ForegroundColor Cyan
+Push-Location $BuildDir
+& $OBJCOPY -I binary -O elf32-i386 -B i386 "ld-mu.so" "ld_mu_so.o"
+if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy ld-mu.so failed" }
+& $OBJCOPY -I binary -O elf32-i386 -B i386 "libmu.so" "libmu_so.o"
+if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy libmu.so failed" }
+& $OBJCOPY -I binary -O elf32-i386 -B i386 "dyn.elf" "dyn_elf.o"
+if ($LASTEXITCODE -ne 0) { Pop-Location; throw "objcopy dyn.elf failed" }
+Pop-Location
+Write-Host "      OK -> build\ld_mu_so.o, build\libmu_so.o, build\dyn_elf.o" -ForegroundColor Green
+$step++
+
 # Link (via GCC driver so standard flags are handled consistently)
 Write-Host ">>> [$step] Linking kernel.elf ..." -ForegroundColor Cyan
 $AllObj = @("$BuildDir\boot.o", "$BuildDir\isr_stubs.o",
-            "$BuildDir\hello_elf.o", "$BuildDir\hello_pie_elf.o") + $ObjFiles
+            "$BuildDir\hello_elf.o", "$BuildDir\hello_pie_elf.o",
+            "$BuildDir\ld_mu_so.o", "$BuildDir\libmu_so.o",
+            "$BuildDir\dyn_elf.o") + $ObjFiles
 $LdArgs = @("-nostdlib", "-T", "$PSScriptRoot\linker.ld",
             "-Wl,--no-warn-rwx-segments") + $AllObj + @("-o", "$BuildDir\kernel.elf")
 & $GCC @LdArgs

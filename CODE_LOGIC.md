@@ -184,8 +184,8 @@ USER_SIGTRAMP = 0x08847000
 - `ET_EXEC` 按 link-time 地址装入;`ET_DYN` 先求 `min(p_vaddr)`,取 `bias = load_base - min_va`,所有段与入口加 bias —— 这就是内核内建的最小 PIE 装载。
 - 逐段 `memcpy` + bss `memset`,记录最高装入地址作为 brk 起点;入口必须在沙箱内。
 - `PT_DYNAMIC`:遍历 `DT_REL/DT_RELSZ` 与 `DT_JMPREL/DT_PLTRELSZ`(i386 `Elf32_Rel`),支持 `R_386_RELATIVE`、`R_386_GLOB_DAT`、`R_386_JMP_SLOT`、`R_386_32`;符号未定义(需要共享库)或 `COPY/IRELATIVE/TLS` 时返回 `ELF_ERR_RELOC`。这是 `run pie` 能工作的关键。
-- `PT_INTERP`:读取解释器路径并回填 `elf32_load_info_t.interp`;`user_run_image` 检测到后打印 `PT_INTERP needs a dynamic loader: <path>` 并拒绝(镜像集里没有 ld.so)。
-- 初始栈的 auxv 由 `build_user_stack` 按 `AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_BASE/AT_ENTRY/AT_NULL` 写入,为将来的 ld.so 预留。
+- `PT_INTERP`:读取解释器路径并回填 `elf32_load_info_t.interp`。`elf32_load_program` 在动态镜像只映射段、**不**应用重定位(交给用户态 ld.so);`user_load_for_exec` 随后按 `/lib/ld-mu.so`(MuFS 优先、内嵌 blob 回退)把解释器映射到 `USER_INTERP_BASE=0x08200000`,入口改为解释器 entry,`AT_BASE` 为其 load bias,`AT_ENTRY`/`AT_PHDR` 仍是主程序的值。
+- 初始栈的 auxv 由 `build_user_stack(argc,argv,li,interp_base)` 按 `AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_BASE/AT_ENTRY/AT_NULL` 写入。
 - 镜像由 build.ps1 用同一交叉编译器链接到 0x08048000,再用 `objcopy -I binary -O elf32-i386` 变成 `hello_elf.o` 链进内核(`_binary_hello_elf_start/end`);运行前整段 memset 清零,重复 `run` 安全。
 - 三个入口共用 `user_run_image_argv(image,size,argc,argv)`:`run` 用内嵌 blob,`exec <file>` 用 `fs_open` + `fs_fd_data/size` 从 RAM FS 读取,`execmod <n> [args...]` 用 Multiboot module。ELF 加载器只读源镜像,不依赖它在沙箱内。
 - `execmod` 先把模块镜像复制到 `mm_alloc_pages` 的连续内核页再清零沙箱;模块页在 mm_init 已预留,不会被堆/页表覆盖。
@@ -197,7 +197,10 @@ USER_SIGTRAMP = 0x08847000
 - `runtime.c`:内联 `int $0x80` 的 muos_* 封装、字符串/数字输出、memset/memcpy(用户镜像 -nostdlib 需要)。不是 libc。新增 `muos_kill/signal/sigprocmask/alarm/gettid`。
 - `syscall6.s`:`muos_pselect6`(6 参必须走 ebp)与 `muos_thread_start`(clone 线程的汇编脚手架:在子栈放 arg,子线程 `call fn(arg)` 后 exit)。
 - `hello.c`:打印 CS(验证 0x1B)、argc/argv、C 计算、brk、`uname`、RAM FS、匿名 `mmap`、键盘 read;子命令覆盖 `at/mmapfile/poll/extra/p1/fork/pipefork/execbin/sched`(P1)、`sig/thread/blkpoll`(P2)、`pie`(P3,PIE 指针经 `R_386_RELATIVE` 修正)、`ata/ataread`(P4);`run fault` 故意写 0xC0000000。
+- `dyn.c` + `libmu.c`:`run dyn` 运行 `dyn.elf`,它只声明未定义的 `mu_hello()`;共享库里的实现通过 `DT_NEEDED` 由 `ld-mu.so` 在运行时装载并解析,输出的 `DYN-LIB-OK`/`DYN-OK` 证明跨对象符号绑定与 RELATIVE 重定位都生效。
 - `linker.ld`(ET_EXEC,0x08048000)与 `linker_pie.ld`(ET_DYN,从 `SIZEOF_HEADERS` 开始、`load PT_LOAD FILEHDR PHDRS` + `dynamic PT_DYNAMIC`);build.ps1 用 `-fPIE -pie` 产出 `hello-pie.elf` 并作为第二个 blob 嵌入。
+- **动态链接集**:`linker_so.ld`(共享对象,`FILEHDR PHDRS`,从 `SIZEOF_HEADERS` 起)产出 `libmu.so`(导出 `mu_hello`,数据指针经 `R_386_RELATIVE` 修正)与 `ld-mu.so`(`ld_start.s` 取原始 esp 调 `ld_main`);`linker_dyn.ld` 增加 `interp PT_INTERP` 与独立的 `.rel.dyn/.rel.plt`,配合 `-Wl,--dynamic-linker=/lib/ld-mu.so -L build -lmu` 产出 `dyn.elf`(DT_NEEDED libmu.so)。三者都以 `objcopy -I binary` 嵌入内核。
+- `ldmu.c`(ld-mu.so,无依赖):从栈解析 auxv → 由 `AT_PHDR` + `PROG_BASE` 反推主程序 bias → 解析 `PT_DYNAMIC` → 按 `DT_NEEDED` 从 `/lib/<name>` 用 `open/read` 读入 `fbuf` 并映射到 `0x08400000` 起的空位 → SysV hash(`DT_HASH`)解析符号 → 对依赖库和主程序依次应用 `RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT` → `jmp AT_ENTRY`(不改动栈)。`.gnu.hash`/TLS/`R_386_COPY` 未实现。
 - 用户态异常在 `isr_handler` 开头分流:`(regs->cs & 3) == 3 && user_is_active()` → `user_handle_fault` 打印 EIP/CS/CR2 后回 Shell,内核 panic 路径不受影响。
 
 ### 7.6 i386 TLS 与真实 libc 启动
@@ -223,7 +226,7 @@ USER_SIGTRAMP = 0x08847000
 
 ## 八、Shell / FS / 桌面
 
-- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault]` 运行内嵌 ELF,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
+- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault|pie|dyn]` 运行内嵌 ELF(其中 `dyn` 先写 `/lib` 再跑动态程序),`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
 - **fs.c**:16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。文件槽位带 `refs` 与 `deleted` 标志:unlink 时若仍有 fd 打开则清空名字但保留数据,最后一个 `fs_unref` 才释放槽位;`fs_rename_dir` 整棵子树改名(先校验全部新名字长度、拒绝目标已存在/移入自身)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
 - **MuFS 持久化(同一文件底部)**:磁盘布局 = 扇区 0 超级块(`MUFS` 魔数/版本/generation)、扇区 2–5 文件元数据表(16×88B)、扇区 6–8 目录元数据表(16×68B)、扇区 16 起 16 个 64KB 数据槽。`fs_persist_mount()` 在 `fs_init` 后调用:魔数/版本/槽参数匹配则读入命名空间与文件体,否则格式化为空;之后每个变更点(`create/write(_at)/truncate/delete/rename*/mkdir/rmdir/set_times/unref 释放`)调用 `persist_meta()` 并只写涉及的数据扇区(`persist_slot/persist_slot_range`)。`fs_sync()` 递增 generation、重写超级块 + 全部元数据 + 全部已用槽;`fsync(118)/sync(36)` 调用它。无盘时 `persist_active=false`,全部是内存操作。
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
@@ -262,6 +265,9 @@ USER_SIGTRAMP = 0x08847000
 | `frame_switched` | proc.c | 调度器是否已改写中断帧 |
 | `present / sectors / model` | ata.c | ATA 主盘探测结果 |
 | `_binary_hello_pie_elf_start/end` | 链接器 | 内嵌 ET_DYN(PIE)镜像起止 |
+| `_binary_ld_mu_so_start/end` | 链接器 | 内嵌动态链接器 ld-mu.so 起止 |
+| `_binary_libmu_so_start/end` | 链接器 | 内嵌共享库 libmu.so 起止 |
+| `_binary_dyn_elf_start/end` | 链接器 | 内嵌动态链接测试程序 dyn.elf 起止 |
 | `KERNEL_VBASE / KERNEL_BASE / KERNEL_PHYS_BASE` | mm.h | higher-half 虚拟基址、链接地址、物理装载地址 |
 | `entry_phys / _kernel_end` | linker.ld | ELF 入口物理地址、内核虚拟结束地址 |
 | `persist_active / persist_gen` | fs.c | MuFS 挂载状态与 generation |
@@ -271,7 +277,7 @@ USER_SIGTRAMP = 0x08847000
 
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
-3. 动态链接只做到静态 PIE + 自身重定位;`PT_INTERP` 只检测并拒绝,没有 ld.so、共享库映射与 `DT_NEEDED` 符号解析;`MAP_SHARED` 不写回
+3. 动态链接由自研 `ld-mu.so` 完成,只支持 SysV hash(`DT_HASH`)与自有 `.so`;`.gnu.hash`、TLS 重定位、`R_386_COPY`、符号版本化未实现,因此还不能加载真实 libc 的共享库;`MAP_SHARED` 不写回
 4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);无网卡/socket ABI;无 VBE 帧缓冲,桌面仍是 80×25 文本模式(需要 GRUB 或 BIOS VBE 引导阶段)
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层

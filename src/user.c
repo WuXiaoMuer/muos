@@ -20,6 +20,15 @@ extern const uint8_t _binary_hello_elf_end[];
 extern const uint8_t _binary_hello_pie_elf_start[];
 extern const uint8_t _binary_hello_pie_elf_end[];
 
+/* Dynamic-linking set: the user-mode linker, its shared library and the
+ * dynamically linked test program (see user/ldmu.c, user/libmu.c). */
+extern const uint8_t _binary_ld_mu_so_start[];
+extern const uint8_t _binary_ld_mu_so_end[];
+extern const uint8_t _binary_libmu_so_start[];
+extern const uint8_t _binary_libmu_so_end[];
+extern const uint8_t _binary_dyn_elf_start[];
+extern const uint8_t _binary_dyn_elf_end[];
+
 /* Saved kernel ESP at user_enter (callee-saved regs + return address live
  * above it). Written by isr_stubs.s, read by user_return_to_kernel. */
 uint32_t user_kernel_esp_save = 0;
@@ -473,7 +482,8 @@ static uint32_t push_string(uint32_t sp, const char* s) {
  * Real libcs (musl/glibc) walk envp and auxv; missing terminators make
  * them interpret the first string bytes as pointers. */
 static uint32_t build_user_stack(int argc, const char* const* argv,
-                                 const elf32_load_info_t* li) {
+                                 const elf32_load_info_t* li,
+                                 uint32_t interp_base) {
     uint32_t sp = USER_SIGTRAMP - 32;   /* top page is the sigreturn tramp */
     uint32_t addrs[16];
 
@@ -491,7 +501,7 @@ static uint32_t build_user_stack(int argc, const char* const* argv,
         {  4, li ? li->phent : 32 },    /* AT_PHENT */
         {  5, li ? li->phnum : 0 },     /* AT_PHNUM */
         {  6, 4096 },                   /* AT_PAGESZ */
-        {  7, 0 },                      /* AT_BASE (no interpreter) */
+        {  7, interp_base },            /* AT_BASE (interpreter bias) */
         {  9, li ? li->entry : 0 },     /* AT_ENTRY */
         {  0, 0 },                      /* AT_NULL */
     };
@@ -508,6 +518,62 @@ static uint32_t build_user_stack(int argc, const char* const* argv,
     return sp;
 }
 
+/* Resolve a PT_INTERP path: the MuFS first (/lib/...), then the embedded
+ * ld-mu.so blob (built into the kernel image at build time). */
+static int interp_find(const char* path, const void** img, uint32_t* size) {
+    if (!path || !*path) return -1;
+    while (*path == '/') path++;
+    if (strlen(path) >= 64) return -1;
+    char norm[64];
+    strncpy(norm, path, sizeof(norm) - 1);
+    norm[sizeof(norm) - 1] = '\0';
+
+    int slot = fs_open(norm);
+    if (slot >= 0) {
+        uint32_t n = fs_fd_size(slot);
+        if (n) {
+            *img = fs_fd_data(slot);
+            *size = n;
+            return 0;
+        }
+    }
+    if (strcmp(norm, "lib/ld-mu.so") == 0 || strcmp(norm, "ld-mu.so") == 0) {
+        *img = _binary_ld_mu_so_start;
+        *size = (uint32_t)(_binary_ld_mu_so_end - _binary_ld_mu_so_start);
+        return 0;
+    }
+    return -1;
+}
+
+/* Map the program (and its interpreter when PT_INTERP is present). Returns
+ * the address to enter: the interpreter when dynamically linked, otherwise
+ * the program entry. The program's own relocations are left to the
+ * interpreter in the dynamic case (see user/ldmu.c). */
+static int user_load_for_exec(const void* img, uint32_t img_size,
+                              elf32_load_info_t* li, uint32_t* entry_out,
+                              uint32_t* interp_base) {
+    int rc = elf32_load_program(img, img_size, USER_BASE,
+                                USER_END - USER_STACK_RESERVE, li);
+    if (rc != 0) return rc;
+
+    *entry_out = li->entry;
+    *interp_base = 0;
+    if (!li->has_interp) return 0;
+
+    const void* iimg = NULL;
+    uint32_t isz = 0;
+    if (interp_find(li->interp, &iimg, &isz) != 0) return -5;
+
+    elf32_load_info_t ii;
+    rc = elf32_load_ex(iimg, isz, USER_INTERP_BASE,
+                       USER_END - USER_STACK_RESERVE, &ii);
+    if (rc != 0) return -6;
+
+    *entry_out = ii.entry;      /* enter ld-mu.so, it jumps to AT_ENTRY */
+    *interp_base = ii.base;
+    return 0;
+}
+
 /* Replace the live sandbox with a new image (execve). Fds/cwd persist. */
 int user_exec_image(const void* img, uint32_t img_size, int argc,
                     const char* const* argv,
@@ -518,17 +584,16 @@ int user_exec_image(const void* img, uint32_t img_size, int argc,
     memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);
 
     elf32_load_info_t li;
-    int rc = elf32_load_ex(img, img_size, USER_BASE,
-                           USER_END - USER_STACK_RESERVE, &li);
+    uint32_t entry = 0, interp_base = 0;
+    int rc = user_load_for_exec(img, img_size, &li, &entry, &interp_base);
     if (rc != 0) return rc;
-    if (li.has_interp) return -4;      /* no dynamic loader in this image set */
 
-    uint32_t entry = li.entry, image_end = li.image_end;
+    uint32_t image_end = li.image_end;
     brk_base = align_up_page(image_end);
     if (brk_base < USER_BASE + PAGE_SIZE) brk_base = USER_BASE + PAGE_SIZE;
     brk_current = brk_base;
 
-    uint32_t sp = build_user_stack(argc, argv, &li);
+    uint32_t sp = build_user_stack(argc, argv, &li, interp_base);
     if (sp <= brk_current + PAGE_SIZE) return -2;
 
     exit_code = 0;
@@ -549,6 +614,29 @@ int user_run_pie_embedded(const char* arg0, const char* arg1) {
     uint32_t img_size = 0;
     const void* img = user_get_pie_image(&img_size);
     return user_run_image(img, img_size, arg0, arg1);
+}
+
+/* Write one embedded blob into the MuFS, replacing an existing copy. */
+static void fs_install_blob(const char* path, const uint8_t* data,
+                            uint32_t size) {
+    int slot = fs_open(path);
+    if (slot < 0) slot = fs_create(path);
+    if (slot >= 0) fs_write(slot, (const char*)data, size);
+}
+
+void user_install_dyn_runtime(void) {
+    if (!fs_is_dir("lib")) fs_mkdir("lib");
+    fs_install_blob("lib/ld-mu.so", _binary_ld_mu_so_start,
+                    (uint32_t)(_binary_ld_mu_so_end - _binary_ld_mu_so_start));
+    fs_install_blob("lib/libmu.so", _binary_libmu_so_start,
+                    (uint32_t)(_binary_libmu_so_end - _binary_libmu_so_start));
+    fs_sync();
+}
+
+int user_run_dyn_embedded(void) {
+    user_install_dyn_runtime();
+    uint32_t size = (uint32_t)(_binary_dyn_elf_end - _binary_dyn_elf_start);
+    return user_run_image(_binary_dyn_elf_start, size, "dyn", NULL);
 }
 
 int user_run_image(const void* img, uint32_t img_size,
@@ -599,39 +687,36 @@ int user_run_image_argv(const void* img, uint32_t img_size,
     memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);
 
     elf32_load_info_t li;
-    int rc = elf32_load_ex(img, img_size, USER_BASE,
-                           USER_END - USER_STACK_RESERVE, &li);
+    uint32_t entry = 0, interp_base = 0;
+    int rc = user_load_for_exec(img, img_size, &li, &entry, &interp_base);
     if (rc != 0) {
         vga_setcolor(vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
-        vga_print("[user] ELF rejected (err ");
-        vga_print_dec((uint32_t)(-rc));
-        vga_print(")\n");
+        if (rc == -5) {
+            vga_print("[user] missing interpreter: ");
+            vga_print(li.interp);
+            vga_putchar('\n');
+            serial_write("[user] missing interpreter\n");
+        } else if (rc == -6) {
+            vga_print("[user] interpreter rejected by the ELF loader\n");
+            serial_write("[user] interpreter rejected\n");
+        } else {
+            vga_print("[user] ELF rejected (err ");
+            vga_print_dec((uint32_t)(-rc));
+            vga_print(")\n");
+            serial_write("[user] ELF rejected\n");
+        }
         vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
-        serial_write("[user] ELF rejected\n");
-        mm_switch_pd(prev_pd);
-        proc_reap(self);
-        return -1;
-    }
-    if (li.has_interp) {
-        vga_setcolor(vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
-        vga_print("[user] PT_INTERP needs a dynamic loader: ");
-        vga_print(li.interp);
-        vga_putchar('\n');
-        vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
-        serial_write("[user] PT_INTERP rejected: ");
-        serial_write(li.interp);
-        serial_write("\n");
         mm_switch_pd(prev_pd);
         proc_reap(self);
         return -1;
     }
 
-    uint32_t entry = li.entry, image_end = li.image_end;
+    uint32_t image_end = li.image_end;
     brk_base = align_up_page(image_end);
     if (brk_base < USER_BASE + PAGE_SIZE) brk_base = USER_BASE + PAGE_SIZE;
     brk_current = brk_base;
 
-    uint32_t user_sp = build_user_stack(argc, argv, &li);
+    uint32_t user_sp = build_user_stack(argc, argv, &li, interp_base);
     if (user_sp <= brk_current + PAGE_SIZE) {
         vga_print("[user] image leaves no room for the stack\n");
         mm_switch_pd(prev_pd);

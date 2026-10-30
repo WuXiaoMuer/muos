@@ -15,11 +15,11 @@
 - 内核自检 **88/0**;`build/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
 - `src/syscall.c` 已定义 **120+ 个 Linux i386 系统调用号**,覆盖进程/stdio、信号、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。
 - 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
-- 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。
+- 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`build/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:无完整动态链接器(仅支持静态 PIE + 重定位,PT_INTERP 只检测并拒绝);无网卡/socket ABI;无帧缓冲图形。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(仅 SysV hash + 自有 `.so`,不兼容 glibc/musl 的 `.gnu.hash`/TLS/COPY 重定位);无网卡/socket ABI;无帧缓冲图形。
 
 ## 后续计划(建议顺序)
 
@@ -41,8 +41,9 @@
 ### P3 动态链接与更大程序
 - [x] `ET_DYN`/静态 PIE 加载:load bias、`PT_DYNAMIC`、`R_386_RELATIVE/GLOB_DAT/JMP_SLOT/32` 重定位
 - [x] 完整 auxv(`AT_PHDR/PHENT/PHNUM/PAGESZ/BASE/ENTRY`);`run pie` 实测 `PIE-RELOC-OK`
-- [x] `PT_INTERP` 检测与明确拒绝(无 ld-musl 可用)
-- [ ] 共享库(`ET_DYN .so`)映射 + 动态链接器(需要可用的 ld.so 与 `DT_NEEDED` 符号解析)
+- [x] `PT_INTERP` 解释器路径解析(MuFS `/lib/...` 优先,回退内嵌 blob),解释器映射到 `0x08200000`,`AT_BASE` 指向其 load bias
+- [x] 共享库(`ET_DYN .so`)映射 + 动态链接器 `ld-mu.so`(`DT_NEEDED` 递归装载、SysV hash 符号解析、`R_386_RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT`);`run dyn` 实测 `DYN-OK`
+- [ ] 与真实 libc 生态的兼容(`.gnu.hash`、TLS、`R_386_COPY`、版本符号)仍未做
 
 ### P4 平台外设
 - [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`build/test_ata.py` 两次启动验证持久化
@@ -150,7 +151,7 @@
 - [ ] 内核堆 Grow(耗尽时向 vmm 要新页)
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
 - [ ] 网卡与 socket ABI、VBE 帧缓冲(见 P4 说明);MuFS 仍是整槽布局,无块分配位图/碎片整理
-- [ ] 完整动态链接器:共享库装载/符号解析/`DT_NEEDED`;当前只有静态 PIE + 自身重定位
+- [ ] 动态链接器兼容真实 libc 产物(`.gnu.hash`/TLS/`R_386_COPY`/版本化符号);当前 `ld-mu.so` 只覆盖自研 `.so`
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)
 - [ ] panic 打印带 addr2line 说明(已加 -g)

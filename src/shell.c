@@ -151,9 +151,13 @@ static void cmd_run(char**a,int n){
     /* Runs the embedded ELF at Ring3; returns when the process exits or
      * faults. `run fault` asks hello.c to touch an unmapped address, which
      * demonstrates that a Ring3 fault kills only the process. `run pie`
-     * uses the ET_DYN (PIE) build so the loader applies relocations. */
+     * uses the ET_DYN (PIE) build so the loader applies relocations.
+     * `run dyn` installs /lib/ld-mu.so + /lib/libmu.so and runs the
+     * dynamically linked program (PT_INTERP + DT_NEEDED). */
     if(n>1 && streq(a[1],"pie"))
         user_run_pie_embedded("hello-pie", "pie");
+    else if(n>1 && streq(a[1],"dyn"))
+        user_run_dyn_embedded();
     else
         user_run_embedded("hello", n>1?a[1]:NULL);
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
