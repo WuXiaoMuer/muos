@@ -2,6 +2,7 @@
 #include "elf.h"
 #include "mm.h"
 #include "tss.h"
+#include "gdt.h"
 #include "vga.h"
 #include "serial.h"
 #include "string.h"
@@ -17,8 +18,8 @@ extern const uint8_t _binary_hello_elf_end[];
 /* Saved kernel ESP at user_enter (callee-saved regs + return address live
  * above it). Written by isr_stubs.s, read by user_return_to_kernel. */
 uint32_t user_kernel_esp_save = 0;
+uint32_t user_kernel_esp_launch = 0;
 
-static bool_t   space_claimed = false;
 static bool_t   active = false;
 static bool_t   faulted = false;
 static int      exit_code = 0;
@@ -80,8 +81,10 @@ static void fd_entry_ref(int delta, const user_fd_t* e) {
 }
 
 void user_fds_reset(void) {
+    /* Only clears the live view. Each process's fd_state is the canonical
+     * holder of its file/pipe refs; the scheduler saves/restores it and
+     * proc_reap releases it. */
     for (int i = 0; i < USER_FD_MAX; i++) {
-        fd_entry_ref(-1, &user_fds[i]);
         memset(&user_fds[i], 0, sizeof(user_fds[i]));
         user_fds[i].fs_slot = -1;
     }
@@ -341,7 +344,7 @@ void user_exit(int code) {
     for (;;) { /* not reached */ }
 }
 
-void user_handle_fault(registers_t* regs) {
+bool_t user_handle_fault(registers_t* regs) {
     faulted = true;
     active = false;
 
@@ -370,8 +373,10 @@ void user_handle_fault(registers_t* regs) {
     }
     serial_write("\n");
 
-    user_return_to_kernel();
-    for (;;) { /* not reached */ }
+    /* The scheduler either switches to another process (returns here so
+     * the ISR epilogue iret's into it) or resumes the shell (no return). */
+    proc_exit_current(regs, 139, true);
+    return true;
 }
 
 /* Copy a NUL-terminated arg onto the downward-growing user stack */
@@ -429,7 +434,6 @@ int user_exec_image(const void* img, uint32_t img_size, int argc,
 
     uint32_t sp = build_user_stack(argc, argv);
     if (sp <= brk_current + PAGE_SIZE) return -2;
-    if (!mm_user_map_range(USER_BASE, USER_END)) return -3;
 
     exit_code = 0;
     faulted = false;
@@ -477,14 +481,17 @@ int user_run_image_argv(const void* img, uint32_t img_size,
         return -1;
     }
 
-    if (!space_claimed) {
-        if (!mm_reserve_range(USER_BASE, USER_END)) {
-            vga_print("[user] sandbox pages unavailable (already claimed)\n");
-            serial_write("[user] sandbox reservation failed\n");
-            return -1;
-        }
-        space_claimed = true;
+    /* Every run gets its own 8MB physical block mapped at USER_BASE by a
+     * private page directory. Switch into it before touching USER_BASE. */
+    proc_t* self = proc_alloc(argc > 0 && argv[0] ? argv[0] : "app", 1);
+    if (!self || !proc_snapshot_alloc(self)) {
+        if (self) proc_reap(self);
+        vga_print("[user] not enough memory for a process block\n");
+        serial_write("[user] process block allocation failed\n");
+        return -1;
     }
+    uint32_t prev_pd = mm_get_current_pd();
+    proc_switch_space(self);
 
     /* Fresh process image every run. */
     memset((void*)USER_BASE, 0, USER_SIZE);
@@ -499,6 +506,8 @@ int user_run_image_argv(const void* img, uint32_t img_size,
         vga_print(")\n");
         vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
         serial_write("[user] ELF rejected\n");
+        mm_switch_pd(prev_pd);
+        proc_reap(self);
         return -1;
     }
 
@@ -509,12 +518,8 @@ int user_run_image_argv(const void* img, uint32_t img_size,
     uint32_t user_sp = build_user_stack(argc, argv);
     if (user_sp <= brk_current + PAGE_SIZE) {
         vga_print("[user] image leaves no room for the stack\n");
-        return -1;
-    }
-
-    if (!mm_user_map_range(USER_BASE, USER_END)) {
-        vga_print("[user] failed to make the sandbox user-accessible\n");
-        serial_write("[user] mm_user_map_range failed\n");
+        mm_switch_pd(prev_pd);
+        proc_reap(self);
         return -1;
     }
 
@@ -522,23 +527,32 @@ int user_run_image_argv(const void* img, uint32_t img_size,
     faulted = false;
     user_fds_reset();
     active = true;
-    tss_set_esp0(tss_get_kernel_stack_top());
 
-    /* Register this Ring3 run as a process (pid 1 is the kernel). */
-    proc_t* self = proc_alloc(argc > 0 && argv[0] ? argv[0] : "app", 1);
-    if (self) {
-        self->state = PROC_RUNNING;
-        self->cmdline[0] = '\0';
-        for (int i = 0; i < argc && i < 16; i++) {
-            uint32_t pos = strlen(self->cmdline);
-            if (pos + 1 >= PROC_CMDLINE_MAX) break;
-            if (i) self->cmdline[pos++] = ' ';
-            const char* a = argv[i] ? argv[i] : "";
-            while (*a && pos + 1 < PROC_CMDLINE_MAX) self->cmdline[pos++] = *a++;
-            self->cmdline[pos] = '\0';
-        }
-        proc_set_current(self);
+    if (!proc_fdstate_alloc(self)) {
+        vga_print("[user] no memory for fd state\n");
+        mm_switch_pd(prev_pd);
+        proc_reap(self);
+        return -1;
     }
+    user_fd_state_save(self->fd_state);
+    self->fds_retained = true;
+    strncpy(self->cwd, user_cwd_get(), USER_FD_PATH_MAX - 1);
+    self->cwd[USER_FD_PATH_MAX - 1] = '\0';
+    user_get_brk_state(&self->brk_base, &self->brk_cur);
+    gdt_set_user_tls(0, 0, 0);          /* fresh TLS base for this program */
+    self->tls_base = self->tls_limit = self->tls_flags = 0;
+
+    self->state = PROC_RUNNING;
+    self->cmdline[0] = '\0';
+    for (int i = 0; i < argc && i < 16; i++) {
+        uint32_t pos = strlen(self->cmdline);
+        if (pos + 1 >= PROC_CMDLINE_MAX) break;
+        if (i) self->cmdline[pos++] = ' ';
+        const char* a = argv[i] ? argv[i] : "";
+        while (*a && pos + 1 < PROC_CMDLINE_MAX) self->cmdline[pos++] = *a++;
+        self->cmdline[pos] = '\0';
+    }
+    proc_set_current(self);
 
     vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
     vga_print("[user] entering Ring3 at ");
@@ -558,25 +572,32 @@ int user_run_image_argv(const void* img, uint32_t img_size,
     user_enter(entry, user_sp);
 
     active = false;
+    /* The scheduler returns to the shell page directory before this call
+     * resumes; make sure it really is the kernel one. */
+    mm_switch_pd(prev_pd);
+    tss_set_esp0(tss_get_kernel_stack_top());
+
+    int final_code = self ? self->exit_code : exit_code;
+    bool_t final_fault = self ? self->faulted : faulted;
+
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK));
-    if (faulted) {
+    if (final_fault) {
         vga_print("[user] process terminated by fault\n");
         serial_write("[user] process terminated by fault\n");
     } else {
         vga_print("[user] process exited with code ");
-        vga_print_dec((uint32_t)exit_code);
+        vga_print_dec((uint32_t)final_code);
         vga_putchar('\n');
         serial_write("[user] exit code=");
-        serial_dec((uint32_t)exit_code);
+        serial_dec((uint32_t)final_code);
         serial_write("\n");
     }
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
 
-    if (self) {
-        proc_cleanup_children(self->pid);
-        proc_reap(self);
-        proc_set_current(proc_find(1));
-    }
+    proc_cleanup_children(self->pid);
+    proc_reap(self);
+    proc_set_current(proc_find(1));
+    user_fds_reset();       /* clear the stale view; refs were released above */
 
-    return faulted ? -1 : exit_code;
+    return final_fault ? -1 : final_code;
 }

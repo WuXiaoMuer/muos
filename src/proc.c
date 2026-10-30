@@ -3,6 +3,7 @@
 #include "kheap.h"
 #include "pit.h"
 #include "tss.h"
+#include "gdt.h"
 #include "string.h"
 
 static proc_t procs[PROC_MAX];
@@ -82,6 +83,24 @@ proc_t* proc_alloc(const char* name, uint32_t ppid) {
         }
         procs[i].kstack = ks;
         procs[i].kstack_top = (uint32_t)ks + TSS_KERNEL_STACK_PAGES * 4096u;
+
+        /* Private 8MB physical block + page directory mapping it at USER_BASE. */
+        void* block = mm_alloc_pages(USER_SIZE / PAGE_SIZE);
+        if (!block) {
+            mm_free_pages(ks, kernel_stack_pages());
+            procs[i].used = false;
+            return NULL;
+        }
+        uint32_t pd = mm_create_user_pd((uint32_t)block);
+        if (!pd) {
+            mm_free_pages(block, USER_SIZE / PAGE_SIZE);
+            mm_free_pages(ks, kernel_stack_pages());
+            procs[i].used = false;
+            return NULL;
+        }
+        procs[i].mem = block;
+        procs[i].mem_pages = USER_SIZE / PAGE_SIZE;
+        procs[i].pd_phys = pd;
         return &procs[i];
     }
     return NULL;
@@ -89,18 +108,232 @@ proc_t* proc_alloc(const char* name, uint32_t ppid) {
 
 bool_t proc_snapshot_alloc(proc_t* p) {
     if (!p) return false;
-    if (p->mem) return true;
-    p->mem = mm_alloc_pages(USER_SIZE / PAGE_SIZE);
-    if (!p->mem) return false;
-    p->mem_pages = USER_SIZE / PAGE_SIZE;
+    if (p->mem && p->pd_phys) return true;
+    if (!p->mem) {
+        p->mem = mm_alloc_pages(USER_SIZE / PAGE_SIZE);
+        if (!p->mem) return false;
+        p->mem_pages = USER_SIZE / PAGE_SIZE;
+    }
+    if (!p->pd_phys) {
+        p->pd_phys = mm_create_user_pd((uint32_t)p->mem);
+        if (!p->pd_phys) {
+            mm_free_pages(p->mem, p->mem_pages);
+            p->mem = NULL;
+            p->mem_pages = 0;
+            return false;
+        }
+    }
     return true;
 }
 
 void proc_snapshot_free(proc_t* p) {
+    if (!p) return;
+    if (p->pd_phys) {
+        mm_free_user_pd(p->pd_phys);
+        p->pd_phys = 0;
+    }
+    if (p->mem) {
+        mm_free_pages(p->mem, p->mem_pages);
+        p->mem = NULL;
+        p->mem_pages = 0;
+    }
+}
+
+void proc_switch_space(proc_t* p) {
+    if (p && p->pd_phys) {
+        mm_switch_pd(p->pd_phys);
+        tss_set_esp0(p->kstack_top);
+    } else {
+        mm_switch_pd(0);                       /* kernel page directory */
+        tss_set_esp0(tss_get_kernel_stack_top());
+    }
+}
+
+/* ---- preemptive round-robin scheduler ----
+ * A switch never copies process memory: each process has its own page
+ * directory and 8MB block. The interrupt/syscall frame is rewritten in
+ * place, so the normal assembly epilogue iret's into the next process.
+ * Kernel (pid 1, the shell) is never scheduled from Ring3. */
+
+static bool_t frame_switched = false;
+
+bool_t proc_frame_switched(void) { return frame_switched; }
+void   proc_clear_frame_switched(void) { frame_switched = false; }
+
+static proc_t* sched_pick_next(proc_t* cur) {
+    int start = 0;
+    if (cur) {
+        for (int i = 0; i < PROC_MAX; i++) {
+            if (&procs[i] == cur) { start = i + 1; break; }
+        }
+    }
+    for (int n = 0; n < PROC_MAX; n++) {
+        int i = (start + n) % PROC_MAX;
+        if (procs[i].used && procs[i].pid != 1 &&
+            procs[i].state == PROC_READY && procs[i].has_ctx)
+            return &procs[i];
+    }
+    return NULL;
+}
+
+static void proc_save_ctx(proc_t* p, const registers_t* regs) {
+    p->eip = regs->eip;
+    p->esp = regs->useresp;
+    p->eflags = regs->eflags;
+    p->eax = regs->eax;
+    p->ebx = regs->ebx;
+    p->ecx = regs->ecx;
+    p->edx = regs->edx;
+    p->esi = regs->esi;
+    p->edi = regs->edi;
+    p->ebp = regs->ebp;
+    p->fs_sel = regs->fs & 0xFFFF;
+    p->gs_sel = regs->gs & 0xFFFF;
+    p->has_ctx = true;
+}
+
+static void proc_save_state(proc_t* p) {
+    if (p->fd_state) user_fd_state_save(p->fd_state);
+    strncpy(p->cwd, user_cwd_get(), USER_FD_PATH_MAX - 1);
+    p->cwd[USER_FD_PATH_MAX - 1] = '\0';
+    user_get_brk_state(&p->brk_base, &p->brk_cur);
+    gdt_get_user_tls(&p->tls_base, &p->tls_limit, &p->tls_flags);
+}
+
+static void sched_load(proc_t* p, registers_t* regs) {
+    proc_switch_space(p);
+    if (p->fd_state) user_fd_state_restore(p->fd_state);
+    user_cwd_set(p->cwd);
+    user_restore_brk_state(p->brk_base, p->brk_cur);
+    gdt_set_user_tls(p->tls_base, p->tls_limit, p->tls_flags);
+    proc_set_current(p);
+    p->state = PROC_RUNNING;
+    user_set_active(true);
+
+    regs->eip = p->eip;
+    regs->useresp = p->esp;
+    regs->eflags = (p->eflags | 0x200u) & ~0x3000u;
+    regs->eax = p->eax;
+    regs->ebx = p->ebx;
+    regs->ecx = p->ecx;
+    regs->edx = p->edx;
+    regs->esi = p->esi;
+    regs->edi = p->edi;
+    regs->ebp = p->ebp;
+    regs->cs = 0x1B;
+    regs->ss = 0x23;
+    regs->ds = 0x23;
+    regs->es = 0x23;
+    regs->fs = p->fs_sel ? p->fs_sel : 0x23;
+    regs->gs = p->gs_sel ? p->gs_sel : 0x23;
+    frame_switched = true;
+}
+
+/* Write a 32-bit value into a (possibly blocked) process's user memory
+ * through its physical block, since its page directory is not active. */
+static void proc_write_user_u32(proc_t* p, uint32_t uptr, uint32_t value) {
     if (!p || !p->mem) return;
-    mm_free_pages(p->mem, p->mem_pages);
-    p->mem = NULL;
-    p->mem_pages = 0;
+    if (uptr < USER_BASE || uptr > USER_END - 4) return;
+    uint32_t phys = (uint32_t)p->mem + (uptr - USER_BASE);
+    *(uint32_t*)phys = value;
+}
+
+static void proc_wake_parent(proc_t* child) {
+    proc_t* parent = proc_find(child->ppid);
+    if (!parent || parent->state != PROC_BLOCKED) return;
+    if (parent->wait_pid > 0 && (uint32_t)parent->wait_pid != child->pid) return;
+
+    if (parent->wait_kind == PROC_WAIT_WAIT4) {
+        if (parent->wait_status_ptr)
+            proc_write_user_u32(parent, parent->wait_status_ptr,
+                                (uint32_t)(child->exit_code & 0xFF) << 8);
+        parent->eax = child->pid;
+    } else if (parent->wait_kind == PROC_WAIT_WAITID) {
+        uint32_t base = parent->wait_infop;
+        proc_write_user_u32(parent, base + 0, 17);                 /* SIGCHLD */
+        proc_write_user_u32(parent, base + 4, 0);
+        proc_write_user_u32(parent, base + 8, 1);                  /* CLD_EXITED */
+        proc_write_user_u32(parent, base + 12, child->pid);
+        proc_write_user_u32(parent, base + 16, 0);
+        proc_write_user_u32(parent, base + 20,
+                            (uint32_t)(child->exit_code & 0xFF));
+        parent->eax = 0;
+    }
+    parent->wait_kind = PROC_WAIT_NONE;
+    parent->state = PROC_READY;
+}
+
+void proc_sched_tick(registers_t* regs) {
+    proc_t* cur = proc_current();
+    if (!cur || cur->pid == 1) return;
+    if ((regs->cs & 3) != 3) return;
+    if (cur->state != PROC_RUNNING) return;
+    if (!proc_fdstate_alloc(cur)) return;
+
+    proc_save_ctx(cur, regs);
+    proc_save_state(cur);
+    cur->state = PROC_READY;
+
+    proc_t* next = sched_pick_next(cur);
+    if (!next || next == cur) {
+        cur->state = PROC_RUNNING;
+        return;
+    }
+    sched_load(next, regs);
+}
+
+bool_t proc_block_current(registers_t* regs, proc_wait_t kind,
+                          int32_t pid, uint32_t status_ptr) {
+    proc_t* cur = proc_current();
+    if (!cur || cur->pid == 1) return false;
+    if (!proc_fdstate_alloc(cur)) return false;
+
+    proc_save_ctx(cur, regs);
+    proc_save_state(cur);
+    cur->wait_kind = kind;
+    cur->wait_pid = pid;
+    cur->wait_status_ptr = status_ptr;
+    cur->wait_infop = status_ptr;      /* waitid passes the infop here */
+    cur->state = PROC_BLOCKED;
+    user_set_active(false);
+
+    proc_t* next = sched_pick_next(cur);
+    if (!next) {
+        cur->state = PROC_RUNNING;
+        user_set_active(true);
+        return false;
+    }
+    sched_load(next, regs);
+    return true;
+}
+
+void proc_exit_current(registers_t* regs, int code, bool_t faulted) {
+    proc_t* cur = proc_current();
+    if (!cur || cur->pid == 1) {
+        user_set_active(false);
+        user_return_to_kernel();
+    }
+
+    if (cur->fd_state) user_fd_state_save(cur->fd_state);
+    cur->exit_code = code;
+    cur->faulted = faulted;
+    cur->state = PROC_ZOMBIE;
+    cur->has_ctx = false;
+    user_set_active(false);
+    proc_wake_parent(cur);
+
+    proc_t* next = sched_pick_next(NULL);
+    if (next) {
+        sched_load(next, regs);
+        return;                 /* asm epilogue iret's into next */
+    }
+
+    /* Nothing runnable: resume the shell that called user_enter(). */
+    proc_switch_space(NULL);
+    proc_set_current(proc_find(1));
+    user_kernel_esp_save = user_kernel_esp_launch;
+    user_return_to_kernel();
+    for (;;) { /* not reached */ }
 }
 
 bool_t proc_fdstate_alloc(proc_t* p) {

@@ -88,8 +88,10 @@ int      user_exec_image(const void* image, uint32_t size, int argc,
                          uint32_t* entry_out, uint32_t* sp_out);
 
 /* Saved kernel ESP of the outer user_enter(); nested entries save/restore
- * it around user_enter_regs. */
+ * it around user_enter_regs. The launch copy is kept stable so the
+ * scheduler can return to the shell when no user process is runnable. */
 extern uint32_t user_kernel_esp_save;
+extern uint32_t user_kernel_esp_launch;
 
 /* Enter Ring3 with a full register set (child after fork). */
 void user_enter_regs(uint32_t entry, uint32_t user_sp, uint32_t eax,
@@ -108,7 +110,9 @@ void user_return_to_kernel(void) __attribute__((noreturn));
 /* Syscall/fault paths that leave user mode and resume the kernel caller.
  * Both never return to their C caller. */
 void    user_exit(int code) __attribute__((noreturn));
-void    user_handle_fault(registers_t* regs) __attribute__((noreturn));
+/* Returns true only when the scheduler switched the faulting process out;
+ * otherwise it never returns (resumes the shell). */
+bool_t  user_handle_fault(registers_t* regs);
 
 uint32_t user_get_brk(void);
 bool_t   user_set_brk(uint32_t addr);

@@ -2183,6 +2183,21 @@ static proc_t* find_child(int32_t want_pid) {
     return NULL;
 }
 
+/* Waiters reap an exited child before blocking on a live one. */
+static proc_t* find_zombie_child(int32_t want_pid) {
+    proc_t* parent = proc_current();
+    if (!parent) return NULL;
+    int n = proc_count();
+    for (int i = 0; i < n; i++) {
+        proc_t* p = proc_get_index(i);
+        if (!p->used || p->ppid != parent->pid) continue;
+        if (p->state != PROC_ZOMBIE) continue;
+        if (want_pid > 0 && p->pid != (uint32_t)want_pid) continue;
+        return p;
+    }
+    return NULL;
+}
+
 static uint32_t do_kill(uint32_t pid, uint32_t sig) {
     (void)sig;   /* signals are tracked but never delivered yet */
     if (pid == 0) return 0;
@@ -2200,7 +2215,10 @@ static uint32_t do_fork(registers_t* regs) {
         proc_reap(child);
         return err(ERR_ENOMEM);
     }
-    memcpy(child->mem, (void*)USER_BASE, USER_SIZE);
+    /* Copy the parent's 8MB block into the child's private block. Both
+     * blocks live outside the user virtual window, so the kernel identity
+     * map reaches them regardless of the active CR3. */
+    memcpy(child->mem, parent->mem, USER_SIZE);
     user_fd_state_save(child->fd_state);
     user_fd_state_retain(child->fd_state);  /* child snapshot holds its own refs */
     child->fds_retained = true;
@@ -2227,89 +2245,33 @@ static uint32_t do_fork(registers_t* regs) {
     return child->pid;
 }
 
-/* Run one child snapshot inside the live sandbox, then restore the parent. */
-static bool_t proc_run_child(proc_t* parent, proc_t* child) {
-    if (!proc_snapshot_alloc(parent) || !proc_fdstate_alloc(parent)) return false;
-
-    memcpy(parent->mem, (void*)USER_BASE, USER_SIZE);
-    user_fd_state_save(parent->fd_state);
-    strncpy(parent->cwd, user_cwd_get(), USER_FD_PATH_MAX - 1);
-    parent->cwd[USER_FD_PATH_MAX - 1] = '\0';
-    user_get_brk_state(&parent->brk_base, &parent->brk_cur);
-
-    uint32_t saved_esp0 = tss_get_esp0();
-    uint32_t saved_root_esp = user_kernel_esp_save;
-    uint32_t parent_tls_base = 0, parent_tls_limit = 0, parent_tls_flags = 0;
-    gdt_get_user_tls(&parent_tls_base, &parent_tls_limit, &parent_tls_flags);
-
-    memcpy((void*)USER_BASE, child->mem, USER_SIZE);
-    user_fd_state_restore(child->fd_state);
-    user_cwd_set(child->cwd);
-    user_restore_brk_state(child->brk_base, child->brk_cur);
-    gdt_set_user_tls(child->tls_base, child->tls_limit, child->tls_flags);
-
-    child->state = PROC_RUNNING;
-    proc_set_current(child);
-    user_set_active(true);
-    user_clear_exit_state();
-    tss_set_esp0(child->kstack_top);
-
-    user_enter_regs(child->eip, child->esp, 0,
-                    child->ebx, child->ecx, child->edx,
-                    child->esi, child->edi, child->ebp,
-                    child->fs_sel, child->gs_sel);
-
-    int code = user_last_exit_code();
-    bool_t faulted = user_last_faulted();
-    /* Keep the child's final fd table (opens/closes done while it ran) so
-     * proc_reap releases exactly the refs this snapshot still holds. */
-    user_fd_state_save(child->fd_state);
-    child->state = PROC_ZOMBIE;
-    child->exit_code = faulted ? 139 : code;
-    child->has_ctx = false;
-    proc_snapshot_free(child);
-
-    memcpy((void*)USER_BASE, parent->mem, USER_SIZE);
-    user_fd_state_restore(parent->fd_state);
-    user_cwd_set(parent->cwd);
-    user_restore_brk_state(parent->brk_base, parent->brk_cur);
-
-    tss_set_esp0(saved_esp0);
-    user_kernel_esp_save = saved_root_esp;
-    gdt_set_user_tls(parent_tls_base, parent_tls_limit, parent_tls_flags);
-    proc_set_current(parent);
-    parent->state = PROC_RUNNING;
-    user_set_active(true);
-    return true;
-}
-
-static uint32_t do_wait4(uint32_t pid_arg, uint32_t status_ptr, uint32_t options) {
+static uint32_t do_wait4(registers_t* regs, uint32_t pid_arg,
+                         uint32_t status_ptr, uint32_t options) {
     proc_t* parent = proc_current();
     if (!parent || parent->pid == 1) return err(ERR_ECHILD);
     if (status_ptr && !user_ptr_ok(status_ptr, 4)) return err(ERR_EFAULT);
 
     int32_t want = (int32_t)pid_arg;
-    for (;;) {
-        proc_t* child = find_child(want);
-        if (!child) return err(ERR_ECHILD);
-
-        if (child->state == PROC_ZOMBIE) {
-            uint32_t cpid = child->pid;
-            int code = child->exit_code;
-            if (status_ptr) *(uint32_t*)status_ptr = (uint32_t)(code & 0xFF) << 8;
-            proc_reap(child);
-            return cpid;
-        }
-        if (!child->has_ctx) return err(ERR_ECHILD);
-        if (options & 1) return 0;                 /* WNOHANG */
-        if (!proc_run_child(parent, child)) return err(ERR_ENOMEM);
+    proc_t* child = find_zombie_child(want);
+    if (child) {
+        uint32_t cpid = child->pid;
+        int code = child->exit_code;
+        if (status_ptr) *(uint32_t*)status_ptr = (uint32_t)(code & 0xFF) << 8;
+        proc_reap(child);
+        return cpid;
     }
+    if (!find_child(want)) return err(ERR_ECHILD);
+    if (options & WNOHANG) return 0;
+
+    if (!proc_block_current(regs, PROC_WAIT_WAIT4, want, status_ptr))
+        return err(ERR_ECHILD);
+    return 0;   /* rescheduled; the parent resumes with eax = child pid */
 }
 
 /* waitid(284): i386 siginfo_t is 128 bytes; SIGCHLD events start with
  * si_pid at offset 12. The kernel fills the exit case only. */
-static uint32_t do_waitid(uint32_t idtype, uint32_t id, uint32_t infop,
-                          uint32_t options, uint32_t rusage) {
+static uint32_t do_waitid(registers_t* regs, uint32_t idtype, uint32_t id,
+                          uint32_t infop, uint32_t options, uint32_t rusage) {
     (void)rusage;
     if (!user_ptr_ok(infop, 128)) return err(ERR_EFAULT);
     memset((void*)infop, 0, 128);
@@ -2319,26 +2281,24 @@ static uint32_t do_waitid(uint32_t idtype, uint32_t id, uint32_t infop,
 
     /* idtype: 0 = P_ALL, 1 = P_PID, 2 = P_PGID (no pgid filtering). */
     int32_t want = (idtype == 1) ? (int32_t)id : -1;
-    proc_t* child = find_child(want);
-    if (!child) return err(ERR_ECHILD);
-
-    if (child->state != PROC_ZOMBIE) {
-        if (options & WNOHANG) return 0;
-        if (!child->has_ctx) return err(ERR_ECHILD);
-        if (!proc_run_child(parent, child)) return err(ERR_ENOMEM);
+    proc_t* child = find_zombie_child(want);
+    if (child) {
+        char* si = (char*)infop;
+        put_u32(si, 0, SIGCHLD);
+        put_u32(si, 4, 0);                      /* si_errno */
+        put_u32(si, 8, CLD_EXITED);             /* si_code */
+        put_u32(si, 12, child->pid);            /* si_pid */
+        put_u32(si, 16, 0);                     /* si_uid */
+        put_u32(si, 20, (uint32_t)(child->exit_code & 0xFF));
+        proc_reap(child);
+        return 0;
     }
+    if (!find_child(want)) return err(ERR_ECHILD);
+    if (options & WNOHANG) return 0;
 
-    uint32_t cpid = child->pid;
-    int code = child->exit_code;
-    char* si = (char*)infop;
-    put_u32(si, 0, SIGCHLD);
-    put_u32(si, 4, 0);                      /* si_errno */
-    put_u32(si, 8, CLD_EXITED);             /* si_code */
-    put_u32(si, 12, cpid);                  /* si_pid */
-    put_u32(si, 16, 0);                     /* si_uid */
-    put_u32(si, 20, (uint32_t)(code & 0xFF));  /* si_status */
-    proc_reap(child);
-    return 0;
+    if (!proc_block_current(regs, PROC_WAIT_WAITID, want, infop))
+        return err(ERR_ECHILD);
+    return 0;   /* siginfo is filled by the exiting child */
 }
 
 static uint32_t do_execve(registers_t* regs, uint32_t path_ptr, uint32_t argv_ptr) {
@@ -2650,11 +2610,14 @@ static void report_unknown(uint32_t nr) {
 
 void syscall_handler(registers_t* regs) {
     uint32_t ret;
+    proc_clear_frame_switched();
 
     switch (regs->eax) {
         case SYS_exit:
-            user_exit((int)regs->ebx);   /* never returns */
-            ret = 0;
+        case SYS_exit_group:
+            user_set_active(false);
+            proc_exit_current(regs, (int)regs->ebx, false);
+            ret = 0;   /* reached only when the scheduler switched frames */
             break;
         case SYS_fork:
         case SYS_vfork:
@@ -2676,10 +2639,10 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_waitpid:
         case SYS_wait4:
-            ret = do_wait4(regs->ebx, regs->ecx, regs->edx);
+            ret = do_wait4(regs, regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_waitid:
-            ret = do_waitid(regs->ebx, regs->ecx, regs->edx,
+            ret = do_waitid(regs, regs->ebx, regs->ecx, regs->edx,
                             regs->esi, regs->edi);
             break;
         case SYS_execve:
@@ -2976,10 +2939,6 @@ void syscall_handler(registers_t* regs) {
              * need the LDT fallback. Do not fake success here. */
             ret = err(ERR_ENOSYS);
             break;
-        case SYS_exit_group:
-            user_exit((int)regs->ebx);   /* never returns */
-            ret = 0;
-            break;
         case SYS_set_tid_address:
             ret = 1;
             break;
@@ -2989,5 +2948,7 @@ void syscall_handler(registers_t* regs) {
             break;
     }
 
-    regs->eax = ret;   /* syscall_common pops this into eax before iret */
+    /* A blocking wait/exit may have rewritten the frame for another
+     * process; in that case eax already belongs to the next context. */
+    if (!proc_frame_switched()) regs->eax = ret;
 }

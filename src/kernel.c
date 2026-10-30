@@ -30,10 +30,9 @@ extern uint32_t _kernel_end;
 
 /* Timer IRQ handler */
 static void timer_handler(registers_t* regs) {
-    (void)regs;
     pit_tick();
-    /* Single task — no need to switch context, and switching
-     * actually broke the shell task's stack frame layout. */
+    /* Round-robin preemption between Ring3 processes (no-op in kernel). */
+    proc_sched_tick(regs);
 }
 
 

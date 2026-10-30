@@ -81,6 +81,44 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "sched")) {
+        /* Two children spin in Ring3 (no syscalls) so the 100Hz timer
+         * preempts them and interleaves their output. The parent blocks in
+         * waitpid while both run. */
+        int pids[2] = { -1, -1 };
+        for (int k = 0; k < 2; k++) {
+            int pid = muos_fork();
+            if (pid == 0) {
+                for (int i = 0; i < 4; i++) {
+                    volatile unsigned spin = 0;
+                    for (unsigned n = 0; n < 900000u; n++) spin += n;
+                    muos_puts(spin ? "child" : "child");
+                    muos_putdec(k); muos_puts(":"); muos_putdec(i);
+                    muos_puts(" ");
+                }
+                muos_puts("\n");
+                muos_exit(10 + k);
+            }
+            pids[k] = pid;
+        }
+
+        int ok = 1;
+        int seen10 = 0, seen11 = 0;
+        for (int k = 0; k < 2; k++) {
+            int status = 0;
+            int w = muos_waitpid(-1, &status, 0);
+            int code = (status >> 8) & 0xFF;
+            muos_puts("sched: wait="); muos_putdec(w);
+            muos_puts(" status="); muos_putdec(code); muos_puts("\n");
+            if (w <= 0) ok = 0;
+            if (code == 10) seen10 = 1;
+            if (code == 11) seen11 = 1;
+        }
+        ok = ok && seen10 && seen11;
+        muos_puts(ok ? "SCHED-OK\n" : "SCHED-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "p1")) {
         /* P1 ABI close-out: directory rename, unlink-while-open, pipe HUP,
          * bounded poll timeout and waitid. */

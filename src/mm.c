@@ -2,6 +2,7 @@
 #include "multiboot.h"
 #include "module.h"
 #include "vga.h"
+#include "user.h"
 
 /* External symbol defined in linker script */
 extern uint32_t _kernel_end;
@@ -143,6 +144,13 @@ void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
             (void)mm_reserve_range(s, e);
         }
     }
+
+    /* The virtual window used by per-process user mappings must never be
+     * handed out as kernel memory: while a process page directory is live,
+     * those virtual addresses map the process block, shadowing the identity
+     * map. Reserve the physical window permanently (fails harmlessly when
+     * RAM is smaller than the window). */
+    (void)mm_reserve_range(MM_USER_WINDOW_START, MM_USER_WINDOW_END);
 
     /* Allocate page directory */
     page_directory = (uint32_t*)mm_alloc_page();
@@ -341,4 +349,61 @@ bool_t mm_user_map_range(uint32_t start, uint32_t end) {
      * error-prone than 2048 invlpg instructions). */
     __asm__ volatile ("mov %0, %%cr3" : : "r"(page_dir_phys) : "memory");
     return true;
+}
+
+/* ---- per-process user address spaces ---- */
+
+/* Build a page directory that shares every kernel mapping but maps the
+ * process's 8MB block at USER_BASE with user permissions. */
+uint32_t mm_create_user_pd(uint32_t block_phys) {
+    if (!block_phys || (block_phys & (PAGE_SIZE - 1))) return 0;
+
+    uint32_t* pd = (uint32_t*)mm_alloc_page();
+    if (!pd) return 0;
+    for (uint32_t i = 0; i < 1024; i++) pd[i] = page_directory[i];
+
+    uint32_t first_pde = USER_BASE >> 22;
+    uint32_t last_pde  = (USER_END - 1) >> 22;
+    for (uint32_t d = first_pde; d <= last_pde; d++) pd[d] = 0;
+
+    uint32_t pages = USER_SIZE / PAGE_SIZE;
+    for (uint32_t i = 0; i < pages; i++) {
+        uint32_t va = USER_BASE + i * PAGE_SIZE;
+        uint32_t pde = va >> 22;
+        uint32_t pti = (va >> 12) & 0x3FF;
+        if (!(pd[pde] & PDE_PRESENT)) {
+            uint32_t* pt = (uint32_t*)mm_alloc_page();
+            if (!pt) {
+                mm_free_user_pd((uint32_t)pd);
+                return 0;
+            }
+            for (uint32_t j = 0; j < 1024; j++) pt[j] = 0;
+            pd[pde] = (uint32_t)pt | PAGE_KERNEL | PDE_USER;
+        }
+        uint32_t* pt = (uint32_t*)(pd[pde] & PAGE_MASK);
+        pt[pti] = (block_phys + i * PAGE_SIZE) | PAGE_KERNEL | PTE_USER;
+    }
+    return (uint32_t)pd;
+}
+
+void mm_free_user_pd(uint32_t pd_phys) {
+    if (!pd_phys || pd_phys == page_dir_phys) return;
+    uint32_t* pd = (uint32_t*)pd_phys;
+    uint32_t first_pde = USER_BASE >> 22;
+    uint32_t last_pde  = (USER_END - 1) >> 22;
+    for (uint32_t d = first_pde; d <= last_pde; d++) {
+        if (pd[d] & PDE_PRESENT) mm_free_page((void*)(pd[d] & PAGE_MASK));
+    }
+    mm_free_page(pd);
+}
+
+void mm_switch_pd(uint32_t pd_phys) {
+    if (!pd_phys) pd_phys = page_dir_phys;
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(pd_phys) : "memory");
+}
+
+uint32_t mm_get_current_pd(void) {
+    uint32_t v;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(v));
+    return v & PAGE_MASK;
 }

@@ -58,4 +58,16 @@ bool_t mm_user_map_range(uint32_t start, uint32_t end);
 /* Get page directory physical address */
 uint32_t mm_get_page_directory(void);
 
+/* Per-process user address spaces. Each process owns an 8MB physical
+ * block mapped at USER_BASE through a private page directory. The kernel
+ * identity map remains shared for every other range, so the physical
+ * window [0x08000000,0x08C00000) is reserved for user mappings only. */
+#define MM_USER_WINDOW_START 0x08000000u
+#define MM_USER_WINDOW_END   0x08C00000u
+
+uint32_t mm_create_user_pd(uint32_t block_phys);
+void     mm_free_user_pd(uint32_t pd_phys);
+void     mm_switch_pd(uint32_t pd_phys);
+uint32_t mm_get_current_pd(void);
+
 #endif

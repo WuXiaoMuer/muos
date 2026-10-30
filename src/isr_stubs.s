@@ -7,6 +7,7 @@ extern isr_handler
 extern irq_handler
 extern syscall_handler
 extern user_kernel_esp_save
+extern user_kernel_esp_launch
 
 ; ---------------------------------------------------------------------------
 ; Common ISR handler (exceptions)
@@ -167,6 +168,7 @@ user_enter:
     push esi
     push edi
     mov [user_kernel_esp_save], esp
+    mov [user_kernel_esp_launch], esp
 
     ; Ring3 data selectors must be live before iret: DS/ES/FS/GS are not
     ; reloaded by iret and a DPL0 selector would fault on first access.
