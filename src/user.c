@@ -119,7 +119,7 @@ int user_fd_alloc_dir(const char* path) {
 
 int user_fd_alloc_dev(int kind) {
     if (kind != USER_FD_DEV_NULL && kind != USER_FD_DEV_ZERO &&
-        kind != USER_FD_DEV_CONSOLE) return -1;
+        kind != USER_FD_DEV_CONSOLE && kind != USER_FD_DEV_ATA) return -1;
     return fd_alloc_kind(kind);
 }
 
@@ -276,6 +276,7 @@ int user_fd_state_events(void* state, int fd, int events) {
         case USER_FD_DIR:
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
+        case USER_FD_DEV_ATA:
             if (events & USER_POLLIN)  rev |= USER_POLLIN;
             if (events & USER_POLLOUT) rev |= USER_POLLOUT;
             break;

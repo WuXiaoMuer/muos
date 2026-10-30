@@ -20,6 +20,7 @@
 #include "module.h"
 #include "proc.h"
 #include "pipe.h"
+#include "ata.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
@@ -129,6 +130,19 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     irq_register_handler(0, timer_handler);
     vga_print("[OK] PIT initialized at 100 Hz\n");
     serial_write("[OK] PIT initialized at 100 Hz\n");
+
+    /* 6b. ATA disk (primary master, PIO / 28-bit LBA) */
+    if (ata_init()) {
+        vga_print("[OK] ATA disk: ");
+        vga_print(ata_model());
+        vga_print(" (");
+        vga_print_dec(ata_sector_count() / 2);
+        vga_print(" KB)\n");
+        serial_write("[OK] ATA disk present\n");
+    } else {
+        vga_print("[WARN] No ATA disk on the primary bus\n");
+        serial_write("[WARN] No ATA disk\n");
+    }
 
     /* 7. Keyboard */
     keyboard_init();

@@ -48,6 +48,7 @@ typedef enum {
     USER_FD_DEV_NULL,
     USER_FD_DEV_ZERO,
     USER_FD_DEV_CONSOLE,
+    USER_FD_DEV_ATA,        /* /dev/hda: raw ATA sectors */
     USER_FD_VFILE,
     USER_FD_PIPE_READ,
     USER_FD_PIPE_WRITE

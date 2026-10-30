@@ -70,6 +70,57 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "ata")) {
+        /* Raw ATA sectors through /dev/hda: write a marker through the
+         * block device, read it back, then verify after a reboot. */
+        int ok = 1;
+        int fd = muos_open("/dev/hda", MUOS_O_WRONLY);
+        muos_puts("ata: open="); muos_putdec(fd); muos_puts("\n");
+        ok = ok && fd >= 0;
+        if (fd >= 0) {
+            const char msg[] = "PERSIST-DATA";
+            int len = (int)sizeof(msg) - 1;
+            muos_lseek(fd, 4096, 0);
+            int n = muos_write(fd, msg, len);
+            muos_puts("ata: write="); muos_putdec(n); muos_puts("\n");
+            ok = ok && n == len;
+
+            char rb[16];
+            muos_lseek(fd, 4096, 0);
+            int rn = muos_read(fd, rb, len);
+            int same = (rn == len) ? 1 : 0;
+            for (int i = 0; same && i < len; i++) if (rb[i] != msg[i]) same = 0;
+            muos_puts("ata: readback="); muos_putdec(rn);
+            muos_puts(same ? " data-ok\n" : " data-bad\n");
+            ok = ok && same;
+            muos_close(fd);
+        }
+        muos_puts(ok ? "ATA-OK\n" : "ATA-BAD\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "ataread")) {
+        /* Second boot: the marker written by `run ata` must still be there. */
+        int ok = 1;
+        char buf[16];
+        int fd = muos_open("/dev/hda", 0);
+        muos_puts("ata: reopen="); muos_putdec(fd); muos_puts("\n");
+        ok = ok && fd >= 0;
+        if (fd >= 0) {
+            const char want[] = "PERSIST-DATA";
+            int len = (int)sizeof(want) - 1;
+            muos_lseek(fd, 4096, 0);
+            int n = muos_read(fd, buf, len);
+            muos_puts("ata: read="); muos_putdec(n); muos_puts("\n");
+            ok = ok && n == len;
+            for (int i = 0; ok && i < len; i++)
+                if (buf[i] != want[i]) ok = 0;
+            muos_close(fd);
+        }
+        muos_puts(ok ? "ATA-PERSIST-OK\n" : "ATA-PERSIST-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "pie")) {
         /* Runs from the ET_DYN image: the kernel loaded the lowest
          * segment at USER_BASE and applied its RELATIVE relocations. */

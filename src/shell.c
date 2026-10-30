@@ -15,6 +15,7 @@
 #include "serial.h"
 #include "user.h"
 #include "module.h"
+#include "ata.h"
 
 /* ── Types ────────────────────────────── */
 #define CMD_MAX   128
@@ -126,10 +127,18 @@ static void cmd_help(void){
     vga_print("  run [fault]                 - Ring3 C program (Linux ABI)\n");
     vga_print("  exec <file>                 - run an ELF from the RAM FS\n");
     vga_print("  mods / execmod <n>          - run a Multiboot -initrd module\n");
-    vga_print("  help clear echo mem tasks time ps logo\n");
+    vga_print("  help clear echo mem tasks time ps disk logo\n");
     vga_print("  version gui win7 desktop test reboot halt crash\n");
 }
 static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
+static void cmd_disk(void){
+    if(!ata_present()){ vga_print("No ATA disk on the primary bus\n"); return; }
+    vga_print(" /dev/hda: ");
+    vga_print(ata_model());
+    vga_print("\n  sectors="); vga_print_dec(ata_sector_count());
+    vga_print(" ("); vga_print_dec(ata_sector_count()/2); vga_print(" KB)\n");
+    serial_write("[disk] "); serial_write(ata_model()); serial_write("\n");
+}
 static void cmd_run(char**a,int n){
     /* Runs the embedded ELF at Ring3; returns when the process exits or
      * faults. `run fault` asks hello.c to touch an unmapped address, which
@@ -326,6 +335,7 @@ static void execute(void){
     else if(streq(cmd,"run")||streq(cmd,"hello"))cmd_run(av,ac);
     else if(streq(cmd,"exec"))cmd_exec(av,ac);
     else if(streq(cmd,"mods"))cmd_mods();
+    else if(streq(cmd,"disk"))cmd_disk();
     else if(streq(cmd,"execmod"))cmd_execmod(av,ac);
 }
 

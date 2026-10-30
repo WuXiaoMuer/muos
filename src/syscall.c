@@ -15,6 +15,7 @@
 #include "elf.h"
 #include "module.h"
 #include "pipe.h"
+#include "ata.h"
 
 /* Linux i386 syscall numbers (the ABI MuOS targets). This is the starter
  * set needed by freestanding user programs; anything else is rejected
@@ -255,6 +256,7 @@
 #define S_IFREG 0100000u
 #define S_IFDIR 0040000u
 #define S_IFCHR 0020000u
+#define S_IFBLK 0060000u
 #define S_IFIFO 0010000u
 #define MAP_SHARED    0x01
 #define MAP_PRIVATE   0x02
@@ -313,6 +315,13 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
             if (id < 0) return err(ERR_EBADF);
             int n = pipe_write(id, (const char*)buf, count);
             return n < 0 ? err(ERR_EBADF) : (uint32_t)n;
+        }
+        case USER_FD_DEV_ATA: {
+            uint32_t off = user_fd_offset((int)fd);
+            int n = ata_write_bytes(off, (const void*)buf, count);
+            if (n < 0) return err((uint32_t)-n);
+            user_fd_set_offset((int)fd, off + (uint32_t)n);
+            return (uint32_t)n;
         }
         case USER_FD_DIR:
             return err(ERR_EISDIR);
@@ -379,6 +388,13 @@ static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
             }
             return n < 0 ? err(ERR_EBADF) : (uint32_t)n;
         }
+        case USER_FD_DEV_ATA: {
+            uint32_t off = user_fd_offset((int)fd);
+            int n = ata_read_bytes(off, (void*)buf, count);
+            if (n < 0) return err((uint32_t)-n);
+            user_fd_set_offset((int)fd, off + (uint32_t)n);
+            return (uint32_t)n;
+        }
         case USER_FD_DIR:
             return err(ERR_EISDIR);
         default:
@@ -421,6 +437,7 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
 #define VFS_DEV_NULL    1
 #define VFS_DEV_ZERO    2
 #define VFS_DEV_CONSOLE 3
+#define VFS_DEV_ATA     4
 
 #define VFS_VF_MEMINFO 1
 #define VFS_VF_UPTIME  2
@@ -562,6 +579,12 @@ static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
         if (strcmp(n, "null") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_NULL; return 0; }
         if (strcmp(n, "zero") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_ZERO; return 0; }
         if (strcmp(n, "console") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_CONSOLE; return 0; }
+        if (strcmp(n, "hda") == 0) {
+            if (!ata_present()) return err(ERR_ENODEV);
+            e->type = VFS_T_DEV;
+            e->id = VFS_DEV_ATA;
+            return 0;
+        }
         return err(ERR_ENOENT);
     }
     if (strncmp(e->path, "/proc/", 6) == 0) {
@@ -896,11 +919,12 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
     }
 
     if (dir == VFS_DIR_DEV) {
-        const char* devs[3] = { "null", "zero", "console" };
-        if (idx < 3) {
+        const char* devs[4] = { "null", "zero", "console", "hda" };
+        if (idx < 4) {
+            if (idx == 3 && !ata_present()) return false;
             strncpy(name, devs[idx], USER_FD_PATH_MAX);
             *ino = 200 + idx;
-            *type = 2;                  /* DT_CHR */
+            *type = (idx == 3) ? 6 : 2;     /* DT_BLK : DT_CHR */
             return true;
         }
         return false;
@@ -995,6 +1019,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
             int kind = USER_FD_DEV_NULL;
             if (e.id == VFS_DEV_ZERO) kind = USER_FD_DEV_ZERO;
             else if (e.id == VFS_DEV_CONSOLE) kind = USER_FD_DEV_CONSOLE;
+            else if (e.id == VFS_DEV_ATA) kind = USER_FD_DEV_ATA;
             int fd = user_fd_alloc_dev(kind);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
@@ -1105,13 +1130,20 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
             *atime = *mtime = *ctime = now;
             return true;
         }
-        case VFS_T_DEV:
+        case VFS_T_DEV: {
             *ino = 200 + (uint32_t)e->id;
-            *mode = S_IFCHR | 0666;
             *nlink = 1;
-            *size = 0;
             *atime = *mtime = *ctime = now;
+            if (e->id == VFS_DEV_ATA) {
+                uint32_t sec = ata_sector_count();
+                *mode = S_IFBLK | 0666;
+                *size = sec > 8000000u ? 0xFFFFFFFFu : sec * 512u;
+            } else {
+                *mode = S_IFCHR | 0666;
+                *size = 0;
+            }
             return true;
+        }
         case VFS_T_VFILE:
             *ino = (e->id >= VFS_VF_PID_STAT && e->id <= VFS_VF_PID_MAPS)
                    ? 600 + e->pid * 8 + (uint32_t)(e->id - VFS_VF_PID_STAT)
@@ -1176,6 +1208,15 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
             *size = 0;
             *atime = *mtime = *ctime = now;
             return true;
+        case USER_FD_DEV_ATA: {
+            uint32_t sec = ata_sector_count();
+            *ino = 204;
+            *mode = S_IFBLK | 0666;
+            *nlink = 1;
+            *size = sec > 8000000u ? 0xFFFFFFFFu : sec * 512u;
+            *atime = *mtime = *ctime = now;
+            return true;
+        }
         case USER_FD_VFILE:
             *ino = 300;
             *mode = S_IFREG | 0444;
@@ -1503,6 +1544,11 @@ static bool_t fd_regular_size(int fd, uint32_t* size) {
         *size = user_fd_vfile(fd, NULL);
         return true;
     }
+    if (kind == USER_FD_DEV_ATA) {
+        uint32_t sec = ata_sector_count();
+        *size = sec > 8000000u ? 0xFFFFFFFFu : sec * 512u;
+        return true;
+    }
     return false;
 }
 
@@ -1519,7 +1565,7 @@ static uint32_t do_lseek(uint32_t fd, uint32_t offset, uint32_t whence) {
     }
 
     int64_t pos = (int64_t)base + (int32_t)offset;
-    if (pos < 0 || pos > FS_MAX_SIZE) return err(ERR_EINVAL);
+    if (pos < 0 || pos > 0x7FFFFFFF) return err(ERR_EINVAL);
     user_fd_set_offset((int)fd, (uint32_t)pos);
     return (uint32_t)pos;
 }
@@ -1540,7 +1586,7 @@ static uint32_t do_llseek(uint32_t fd, uint32_t off_lo, uint32_t off_hi,
         default: return err(ERR_EINVAL);
     }
     int64_t pos = base + (int64_t)(((uint64_t)off_hi << 32) | off_lo);
-    if (pos < 0 || pos > FS_MAX_SIZE) return err(ERR_EINVAL);
+    if (pos < 0 || pos > 0x7FFFFFFF) return err(ERR_EINVAL);
     user_fd_set_offset((int)fd, (uint32_t)pos);
     uint64_t out = (uint64_t)pos;
     memcpy((void*)result, &out, 8);
@@ -1993,6 +2039,7 @@ static bool_t fd_read_ready(int fd) {
         case USER_FD_DIR:
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
+        case USER_FD_DEV_ATA:
             return true;
         case USER_FD_PIPE_READ: {
             int id = user_fd_pipe_id(fd);
@@ -2013,6 +2060,7 @@ static bool_t fd_write_ready(int fd) {
         case USER_FD_DEV_CONSOLE:
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
+        case USER_FD_DEV_ATA:
             return true;
         case USER_FD_PIPE_WRITE: {
             int id = user_fd_pipe_id(fd);
