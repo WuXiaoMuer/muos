@@ -64,7 +64,7 @@ static int  calc_fresh;
 /* ── Low-level text helpers (all clipped to the 80x25 screen) ── */
 static void put_cell(int x, int y, uint16_t v) {
     if (x < 0 || x >= SCR_W || y < 0 || y >= SCR_H) return;
-    ((volatile uint16_t*)0xB8000)[y * SCR_W + x] = v;
+    vga_put_cell((uint16_t)y, (uint16_t)x, v);
 }
 
 static void fd(int y, int x1, int x2, uint8_t c, char ch) {
@@ -73,14 +73,15 @@ static void fd(int y, int x1, int x2, uint8_t c, char ch) {
     if (x2 >= SCR_W) x2 = SCR_W - 1;
     uint16_t v = vga_entry(ch, c);
     for (int x = x1; x <= x2; x++)
-        ((volatile uint16_t*)0xB8000)[y * SCR_W + x] = v;
+        vga_put_cell((uint16_t)y, (uint16_t)x, v);
 }
 
 static void ft(int x, int y, const char* s, uint8_t c) {
     if (y < 0 || y >= SCR_H) return;
     while (*s) {
         if (x >= 0 && x < SCR_W)
-            ((volatile uint16_t*)0xB8000)[y * SCR_W + x] = vga_entry((unsigned char)*s, c);
+            vga_put_cell((uint16_t)y, (uint16_t)x,
+                         vga_entry((unsigned char)*s, c));
         x++; s++;
     }
 }
@@ -90,8 +91,8 @@ static void ftn(int x, int y, int max, const char* s, uint8_t c) {
     if (y < 0 || y >= SCR_H || max <= 0) return;
     for (int i = 0; i < max && s[i]; i++) {
         if (x + i >= 0 && x + i < SCR_W)
-            ((volatile uint16_t*)0xB8000)[y * SCR_W + x + i] =
-                vga_entry((unsigned char)s[i], c);
+            vga_put_cell((uint16_t)y, (uint16_t)(x + i),
+                         vga_entry((unsigned char)s[i], c));
     }
 }
 
@@ -462,22 +463,21 @@ static void toggle_maximize(Win* w) {
 static void mouse_show(void) {
     if (mouse_visible) return;
     if (mouse_cx < 0 || mouse_cx >= SCR_W || mouse_cy < 0 || mouse_cy >= SCR_H) return;
-    int idx = mouse_cy * SCR_W + mouse_cx;
-    uint16_t orig = ((volatile uint16_t*)0xB8000)[idx];
+    uint16_t orig = vga_get_cell((uint16_t)mouse_cy, (uint16_t)mouse_cx);
     mouse_saved = orig;
     /* Highlight the cell by inverting its colors instead of replacing the
      * character, so the text under the pointer stays readable. */
     uint8_t ch = (uint8_t)(orig & 0xFF);
     if (ch == 0) ch = ' ';
     uint8_t attr = (uint8_t)((orig >> 8) ^ 0x77);
-    ((volatile uint16_t*)0xB8000)[idx] = vga_entry(ch, attr);
+    vga_put_cell((uint16_t)mouse_cy, (uint16_t)mouse_cx, vga_entry(ch, attr));
     mouse_visible = true;
 }
 
 static void mouse_hide(void) {
     if (!mouse_visible) return;
     if (mouse_cx >= 0 && mouse_cx < SCR_W && mouse_cy >= 0 && mouse_cy < SCR_H) {
-        ((volatile uint16_t*)0xB8000)[mouse_cy * SCR_W + mouse_cx] = mouse_saved;
+        vga_put_cell((uint16_t)mouse_cy, (uint16_t)mouse_cx, mouse_saved);
     }
     mouse_visible = false;
 }

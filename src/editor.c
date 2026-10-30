@@ -19,9 +19,9 @@ static int  modified;
 static void drow(int y, const char* s, uint8_t c) {
     int i;
     for(i = 0; s[i] && i < 80; i++)
-        ((volatile uint16_t*)0xB8000)[y*80+i] = vga_entry((unsigned char)s[i], c);
+        vga_put_cell((uint16_t)y, (uint16_t)i, vga_entry((unsigned char)s[i], c));
     for(; i < 80; i++)
-        ((volatile uint16_t*)0xB8000)[y*80+i] = vga_entry(' ', c);
+        vga_put_cell((uint16_t)y, (uint16_t)i, vga_entry(' ', c));
 }
 
 static void draw_status(void) {
@@ -36,8 +36,8 @@ static void draw_status(void) {
     { int n = cursor_x+1; if(!n)buf[p++]='0'; else{int d[4],c=0;while(n){d[c++]=n%10;n/=10;}while(c)buf[p++]='0'+d[--c];} }
     buf[p++] = ' '; buf[p] = 0;
     for(int i = 0; i < 80; i++) {
-        if(i < p) ((volatile uint16_t*)0xB8000)[i] = vga_entry((unsigned char)buf[i], cs);
-        else ((volatile uint16_t*)0xB8000)[i] = vga_entry(' ', cs);
+        if(i < p) vga_put_cell(0, (uint16_t)i, vga_entry((unsigned char)buf[i], cs));
+        else vga_put_cell(0, (uint16_t)i, vga_entry(' ', cs));
     }
 }
 
@@ -49,9 +49,9 @@ static void draw_help(void) {
      * next .rodata string (visible as garbage on the help bar). */
     for(int i = 0; i < 80; i++) {
         if((uint32_t)i < len)
-            ((volatile uint16_t*)0xB8000)[23*80+i] = vga_entry((unsigned char)s[i], ch);
+            vga_put_cell(23, (uint16_t)i, vga_entry((unsigned char)s[i], ch));
         else
-            ((volatile uint16_t*)0xB8000)[23*80+i] = vga_entry(' ', ch);
+            vga_put_cell(23, (uint16_t)i, vga_entry(' ', ch));
     }
 }
 
@@ -67,13 +67,11 @@ static void draw_cursor(void) {
     int vrow = cursor_y - scroll_top + 1;
     if(vrow < 1 || vrow > EDIT_ROWS) return;
     /* Highlight cursor position */
-    uint16_t* vm = (uint16_t*)0xB8000;
-    int idx = vrow*80 + cursor_x;
-    uint16_t orig = vm[idx];
+    uint16_t orig = vga_get_cell((uint16_t)vrow, (uint16_t)cursor_x);
     uint8_t ch = orig & 0xFF;
     uint8_t fg = (orig >> 8) ^ 0x77;
     if(!ch) ch = ' ';
-    vm[idx] = vga_entry(ch, fg);
+    vga_put_cell((uint16_t)vrow, (uint16_t)cursor_x, vga_entry(ch, fg));
 }
 
 static void scroll_to_cursor(void) {
@@ -194,10 +192,11 @@ void editor_run(const char* fn) {
         char c = keyboard_getchar();
         /* Erase cursor before processing */
         if(cursor_y - scroll_top + 1 >= 1 && cursor_y - scroll_top + 1 <= EDIT_ROWS) {
-            int idx = (cursor_y-scroll_top+1)*80 + cursor_x;
+            int vrow = cursor_y-scroll_top+1;
             char ch = lines[cursor_y][cursor_x];
             if(!ch) ch = ' ';
-            ((volatile uint16_t*)0xB8000)[idx] = vga_entry(ch, vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+            vga_put_cell((uint16_t)vrow, (uint16_t)cursor_x,
+                         vga_entry(ch, vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK)));
         }
 
         if(c == 0x13) { /* Ctrl+S */ save_file(); draw_status(); continue; }

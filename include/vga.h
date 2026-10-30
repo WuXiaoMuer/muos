@@ -32,6 +32,11 @@ void vga_clear(void);
 void vga_setcolor(uint8_t color);
 void vga_putchar(char c);
 void vga_print(const char* str);
+/* Cell-level access for the text-mode desktop/editor, routed through the
+ * shadow grid so the VBE framebuffer renderer stays in sync. */
+void     vga_put_cell(uint16_t row, uint16_t col, uint16_t entry);
+uint16_t vga_get_cell(uint16_t row, uint16_t col);
+void     vga_repaint(void);   /* redraw the shadow grid after fb_enable() */
 void vga_print_hex(uint32_t n);
 void vga_print_dec(uint32_t n);
 void vga_scroll(void);

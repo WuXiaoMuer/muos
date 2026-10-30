@@ -22,6 +22,7 @@
 #include "pipe.h"
 #include "ata.h"
 #include "net.h"
+#include "fb.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
@@ -100,6 +101,18 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     mm_enable_paging();
     vga_print("[OK] Paging enabled (identity map)\n");
     serial_write("[OK] Paging enabled\n");
+
+    /* 5a. VBE linear framebuffer (only the ISO bootloader sets it up) */
+    if (mb == NULL && fb_pending() && fb_enable()) {
+        vga_repaint();
+        vga_print("[OK] VBE framebuffer ");
+        vga_print_dec(fb_width()); vga_print("x"); vga_print_dec(fb_height());
+        vga_print("x"); vga_print_dec(fb_bpp()); vga_print("\n");
+        serial_write("[OK] VBE framebuffer enabled\n");
+    } else if (mb == NULL) {
+        vga_print("[WARN] No VBE framebuffer (text mode)\n");
+        serial_write("[WARN] No VBE framebuffer\n");
+    }
 
     /* 5b. Kernel heap (needs paging: heap pages live anywhere in RAM) */
     kheap_init();

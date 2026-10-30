@@ -1,12 +1,21 @@
 #include "vga.h"
 #include "io.h"
+#include "fb.h"
+#include "string.h"
 
 static uint16_t* const VGA_BUFFER = (uint16_t*)0xB8000;
-static uint8_t    vga_color;
-static volatile uint16_t   vga_row;
-static volatile uint16_t   vga_col;
-static uint8_t    cursor_scan_start = 0x0E;
-static uint8_t    cursor_scan_end   = 0x0F;
+static uint16_t  cells[VGA_WIDTH * VGA_HEIGHT];
+static uint8_t   vga_color;
+static volatile uint16_t vga_row;
+static volatile uint16_t vga_col;
+static uint8_t   cursor_scan_start = 0x0E;
+static uint8_t   cursor_scan_end   = 0x0F;
+/* The ISO bootloader may have switched to a VBE graphics mode. Until the
+ * kernel has mapped the framebuffer, text writes go to the shadow grid only
+ * (0xB8000 is not the visible console anymore). */
+static bool_t    text_visible;
+static bool_t    pending;
+static uint16_t  cursor_prev_row = 0xFFFF, cursor_prev_col = 0xFFFF;
 
 uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg) {
     return (bg << 4) | fg;
@@ -16,10 +25,31 @@ uint16_t vga_entry(unsigned char c, uint8_t color) {
     return ((uint16_t)color << 8) | (uint16_t)c;
 }
 
+static void render_cell(uint16_t row, uint16_t col, uint16_t entry) {
+    cells[row * VGA_WIDTH + col] = entry;
+    if (fb_active()) {
+        fb_put_cell(row, col, entry);
+    } else if (text_visible) {
+        VGA_BUFFER[row * VGA_WIDTH + col] = entry;
+    }
+}
+
+void vga_put_cell(uint16_t row, uint16_t col, uint16_t entry) {
+    if (row >= VGA_HEIGHT || col >= VGA_WIDTH) return;
+    render_cell(row, col, entry);
+}
+
+uint16_t vga_get_cell(uint16_t row, uint16_t col) {
+    if (row >= VGA_HEIGHT || col >= VGA_WIDTH) return 0;
+    return cells[row * VGA_WIDTH + col];
+}
+
 void vga_init(void) {
     vga_row = 0;
     vga_col = 0;
     vga_color = vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK);
+    pending = fb_pending();
+    text_visible = !pending;
 
     /* Remember the BIOS cursor shape so GUI/editor can hide it and
      * restore the text-mode cursor afterwards. */
@@ -30,11 +60,13 @@ void vga_init(void) {
 }
 
 void vga_hide_cursor(void) {
+    if (fb_active() || pending) return;
     outb(0x3D4, 0x0A);
     outb(0x3D5, 0x20);   /* bit5 = cursor disable */
 }
 
 void vga_show_cursor(void) {
+    if (fb_active() || pending) return;
     outb(0x3D4, 0x0A);
     outb(0x3D5, cursor_scan_start);
     outb(0x3D4, 0x0B);
@@ -46,29 +78,60 @@ void vga_setcolor(uint8_t color) {
 }
 
 void vga_clear(void) {
-    for (size_t i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        VGA_BUFFER[i] = vga_entry(' ', vga_color);
+    uint16_t blank = vga_entry(' ', vga_color);
+    for (size_t i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) cells[i] = blank;
+    if (fb_active()) {
+        fb_clear(0x000000);
+    } else if (text_visible) {
+        for (size_t i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) VGA_BUFFER[i] = blank;
     }
     vga_row = 0;
     vga_col = 0;
+    cursor_prev_row = cursor_prev_col = 0xFFFF;
+    vga_update_cursor();
+}
+
+/* Repaint the whole shadow grid (after the framebuffer becomes available). */
+void vga_repaint(void) {
+    if (!fb_active()) return;
+    for (uint16_t r = 0; r < VGA_HEIGHT; r++) {
+        for (uint16_t c = 0; c < VGA_WIDTH; c++)
+            fb_put_cell(r, c, cells[r * VGA_WIDTH + c]);
+    }
+    cursor_prev_row = cursor_prev_col = 0xFFFF;
     vga_update_cursor();
 }
 
 void vga_scroll(void) {
-    if (vga_row >= VGA_HEIGHT) {
-        /* Move all lines up by one */
-        for (size_t i = 0; i < (VGA_HEIGHT - 1) * VGA_WIDTH; i++) {
-            VGA_BUFFER[i] = VGA_BUFFER[i + VGA_WIDTH];
-        }
-        /* Clear the last line */
-        for (size_t i = (VGA_HEIGHT - 1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++) {
-            VGA_BUFFER[i] = vga_entry(' ', vga_color);
-        }
-        vga_row = VGA_HEIGHT - 1;
+    if (vga_row < VGA_HEIGHT) return;
+    memcpy(cells, cells + VGA_WIDTH,
+           (VGA_HEIGHT - 1) * VGA_WIDTH * sizeof(uint16_t));
+    uint16_t blank = vga_entry(' ', vga_color);
+    for (size_t i = (VGA_HEIGHT - 1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++)
+        cells[i] = blank;
+    vga_row = VGA_HEIGHT - 1;
+
+    if (fb_active()) {
+        vga_repaint();
+    } else if (text_visible) {
+        for (size_t i = 0; i < (VGA_HEIGHT - 1) * VGA_WIDTH; i++)
+            VGA_BUFFER[i] = cells[i];
+        for (size_t i = (VGA_HEIGHT - 1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++)
+            VGA_BUFFER[i] = blank;
     }
 }
 
 void vga_update_cursor(void) {
+    if (fb_active()) {
+        if (cursor_prev_row != 0xFFFF)
+            fb_put_cell(cursor_prev_row, cursor_prev_col,
+                        cells[cursor_prev_row * VGA_WIDTH + cursor_prev_col]);
+        cursor_prev_row = vga_row;
+        cursor_prev_col = vga_col;
+        fb_set_cursor((uint16_t)vga_row, (uint16_t)vga_col);
+        return;
+    }
+    if (pending) return;
     uint16_t pos = vga_row * VGA_WIDTH + vga_col;
     outb(0x3D4, 0x0F);
     outb(0x3D5, (uint8_t)(pos & 0xFF));
@@ -91,10 +154,12 @@ void vga_putchar(char c) {
     } else if (c == '\b') {
         if (vga_col > 0) {
             vga_col--;
-            VGA_BUFFER[vga_row * VGA_WIDTH + vga_col] = vga_entry(' ', vga_color);
+            render_cell((uint16_t)vga_row, (uint16_t)vga_col,
+                        vga_entry(' ', vga_color));
         }
     } else {
-        VGA_BUFFER[vga_row * VGA_WIDTH + vga_col] = vga_entry((unsigned char)c, vga_color);
+        render_cell((uint16_t)vga_row, (uint16_t)vga_col,
+                    vga_entry((unsigned char)c, vga_color));
         vga_col++;
     }
 

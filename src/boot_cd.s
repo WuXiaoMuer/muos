@@ -32,6 +32,73 @@ real_start:
     or al, 2
     out 0x92, al
 
+    ; ── VBE: ask the BIOS for a linear framebuffer graphics mode ──
+    ; Descriptor goes to 0x6F00, VBE info block to 0x7000, mode info to
+    ; 0x7200. Nothing here is used by the kernel image at 0x100000.
+    xor ax, ax
+    mov es, ax
+    mov di, 0x7000
+    mov ax, 0x4F00
+    mov cx, 0x5642            ; 'VB'
+    mov dx, 0x4532            ; 'E2' -> VBE 2.0 info
+    int 0x10
+    cmp ax, 0x004F
+    jne vbe_done
+    cmp dword [0x7000], 0x41534556   ; 'VESA'
+    jne vbe_done
+
+    mov si, vbe_modes
+vbe_try:
+    mov cx, [si]
+    cmp cx, 0xFFFF
+    je vbe_done
+    add si, 2
+
+    mov ax, 0x4F01            ; get mode information
+    mov di, 0x7200
+    int 0x10
+    cmp ax, 0x004F
+    jne vbe_try
+
+    mov ax, [0x7200]          ; mode attributes
+    test ax, 0x0080           ; linear framebuffer supported
+    jz vbe_try
+    test ax, 0x0001           ; mode supported
+    jz vbe_try
+    mov al, [0x7200 + 0x19]   ; bits per pixel
+    cmp al, 16
+    jb vbe_try
+
+    mov bx, cx
+    or bx, 0x4000             ; use linear framebuffer
+    mov ax, 0x4F02
+    int 0x10
+    cmp ax, 0x004F
+    jne vbe_try
+
+    ; Mode is set: publish the descriptor for the kernel.
+    xor eax, eax
+    mov dword [0x6F04], eax
+    mov dword [0x6F08], eax
+    mov dword [0x6F0C], eax
+    mov dword [0x6F10], eax
+    mov dword [0x6F14], eax
+    mov dword [0x6F18], eax
+
+    mov eax, [0x7200 + 0x28]  ; PhysBasePtr
+    mov [0x6F04], eax
+    mov ax, [0x7200 + 0x12]   ; XResolution
+    mov [0x6F08], ax
+    mov ax, [0x7200 + 0x14]   ; YResolution
+    mov [0x6F0C], ax
+    mov al, [0x7200 + 0x19]   ; bits per pixel
+    mov [0x6F10], al
+    mov ax, [0x7200 + 0x10]   ; BytesPerScanLine
+    mov [0x6F14], ax
+    mov [0x6F18], cx          ; mode number
+    mov dword [0x6F00], 0x31454256   ; 'VBE1' (written last)
+
+vbe_done:
     ; Load GDT
     lgdt [gdtr]
 
@@ -87,6 +154,15 @@ gdtr:
 
 ; ── Data ─────────────────────────────────────────────────────
 boot_drive: db 0
+
+; Preferred VBE modes (32/24/16 bpp, 800x600 and up); 0xFFFF terminates.
+vbe_modes:
+    dw 0x114        ; 800x600x32
+    dw 0x117        ; 1024x768x32
+    dw 0x113        ; 800x600x24
+    dw 0x116        ; 1024x768x24
+    dw 0x112        ; 800x600x16
+    dw 0xFFFF
 
 ; Kernel size placeholder at fixed offset 4092 (patched by Python)
 times 4092 - ($ - $$) db 0

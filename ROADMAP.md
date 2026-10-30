@@ -15,11 +15,11 @@
 - 内核自检 **88/0**;`build/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
 - `src/syscall.c` 已定义 **120+ 个 Linux i386 系统调用号**,覆盖进程/stdio、信号、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。
 - 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
-- 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run net`(RTL8139 + ICMP/UDP socket ABI)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。
+- 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run net`(RTL8139 + ICMP/UDP socket ABI)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。ISO 路径额外用 QMP `screendump` 验证 VBE 文本渲染。
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`build/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(仅 SysV hash + 自有 `.so`,不兼容 glibc/musl 的 `.gnu.hash`/TLS/COPY 重定位);网络只有 RTL8139 + ARP/ICMP/UDP(无 TCP/DHCP);无帧缓冲图形。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(仅 SysV hash + 自有 `.so`,不兼容 glibc/musl 的 `.gnu.hash`/TLS/COPY 重定位);网络只有 RTL8139 + ARP/ICMP/UDP(无 TCP/DHCP);帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式)。
 
 ## 后续计划(建议顺序)
 
@@ -50,8 +50,8 @@
 - [x] 持久化文件系统 MuFS:扇区 0 超级块、扇区 2–8 文件/目录元数据表、扇区 16 起 16×64KB 数据槽;每次变更写穿(元数据表 + 涉及扇区),`fsync/sync` 全量刷新,开机 `fs_persist_mount` 挂载或首次格式化;`run fsata` → 重启 `run fsread` 验证
 - [x] 网络:PCI 枚举 + RTL8139(轮询 ISR,32K RX 环)+ ARP/IPv4/ICMP echo/UDP;`run net` 实测 ping 网关与 DNS 查询成功
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/sendto(369)/recvfrom(371)/shutdown(373)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽
-- [ ] TCP、DHCP、多网卡与真实网卡(非 RTL8139)支持
-- [ ] 图形帧缓冲:当前 multiboot `-kernel` 与自研 ISO 引导均未设置 VBE 线性帧缓冲,需引入 GRUB/VBE 引导阶段或 BIOS 模式切换
+- [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
+- [ ] TCP/DHCP、多网卡与其他真实网卡支持
 
 ## 阶段 0:地基(已完成,2026-09)
 
@@ -152,7 +152,7 @@
 - [ ] fs 截断告警(fs_write 返回实际写入量,调用方检查)
 - [ ] 内核堆 Grow(耗尽时向 vmm 要新页)
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
-- [x] 网卡(RTL8139)与 IPv4 socket ABI(ARP/ICMP/UDP);[ ] TCP/DHCP 与 VBE 帧缓冲(见 P4 说明);MuFS 仍是整槽布局,无块分配位图/碎片整理
+- [x] 网卡(RTL8139)与 IPv4 socket ABI(ARP/ICMP/UDP);[x] VBE 线性帧缓冲(ISO 路径);[ ] TCP/DHCP 与其他网卡;MuFS 仍是整槽布局,无块分配位图/碎片整理
 - [ ] 动态链接器兼容真实 libc 产物(`.gnu.hash`/TLS/`R_386_COPY`/版本化符号);当前 `ld-mu.so` 只覆盖自研 `.so`
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)

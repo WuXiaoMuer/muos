@@ -43,9 +43,9 @@ high_entry:     mov esp, stack_top  ; 16KB 内核栈(高地址)
 ### 2.2 boot_cd.s(El Torito 光盘路径)
 
 1. BIOS 加载引导扇区(boot.img 前半,由 make_iso.py 在偏移 4092 处补丁内核大小)到 0x7C00
-2. 实模式:读光盘其余部分到 0x8C00 → 开 A20 → 建平坦 GDT → 置 PE 进入保护模式
+2. 实模式:读光盘其余部分到 0x8C00 → 开 A20 → **VBE 4F00/4F01/4F02 设置线性帧缓冲(0x6F00 处留下描述符)** → 建平坦 GDT → 置 PE 进入保护模式
 3. 把内核 flat binary 拷到 0x100000,远跳 `(0x08, 0x100000)`
-4. **EBX = 0**(无 multiboot 信息):mm.c 检测后回退 mem_upper 默认值
+4. **EBX = 0**(无 multiboot 信息):mm.c 检测后回退 mem_upper 默认值;内核据 0x6F00 的 `VBE1` 魔数启用帧缓冲(`-kernel` 路径没有该魔数,保持 VGA 文本)
 
 ### 2.3 kernel_main 初始化序列
 
@@ -54,6 +54,7 @@ serial → vga → GDT → IDT(256 项)→ PIC(重映射+全屏蔽)
 → modules_init(mb)                [Multiboot -initrd 模块表提前解析]
 → mm_init(mb, kernel_end)         [mmap 解析 + 位图 + 全 RAM 恒等映射 + 模块页预留]
 → mm_enable_paging()              [CR0.PG|WP]
+→ fb_enable() + vga_repaint()     [仅 ISO 路径:映射 VBE 显存并重绘影子网格]
 → kheap_init()                    [1MB 内核堆]
 → tss_init()                      [TSS + 8KB Ring0 入口栈 + ltr]
 → PIT 100Hz + IRQ0 → ATA 探测(primary master)→ keyboard → mouse(8042 aux / IRQ12)
@@ -233,6 +234,13 @@ USER_SIGTRAMP = 0x08847000
 - syscall:直接编号 `socket(359)/bind(361)/connect(362)/shutdown(373)/sendto(369)/recvfrom(371)`,以及旧式 `socketcall(102)`(1/2/3/9/10/11/12 等);socket fd 固定为 16–23,`close(6)` 会先识别该区间再释放 socket 槽。固定配置 10.0.2.15/24、网关 10.0.2.2、DNS 10.0.2.3(QEMU user-net 默认值)。
 - 用户侧 `hello.c net`:构造 ICMP echo(校验和按大端写入)发往 10.0.2.2,`recvfrom` 校验 type=0/id/seq;再用 UDP 向 10.0.2.3:53 发 DNS A 查询(`example.com`),校验事务号与 QR 位;输出 `PING-OK`/`UDP-OK`/`NET-OK`。
 
+### 7.9 VBE 线性帧缓冲(fb.c / boot_cd.s)
+
+- 引导:`boot_cd.s` 在实模式用 `INT 10h` 先 `4F00`(CX:DX='VBE2')取 VBE 信息(校验 `VESA` 魔数),再按 `0x114→0x117→0x113→0x116→0x112` 顺序 `4F01` 取模式信息,要求 attributes 的 bit7(LFB)与 bit0(supported)、bpp≥16,最后 `4F02` 带 `0x4000`(LFB)设模式。成功时把 PhysBasePtr/XResolution/YResolution/bpp/BytesPerScanLine/mode 写到 `0x6F00`,魔数 `'VBE1'` **最后写**,失败则不写(内核回退文本模式)。
+- 内核:`fb_pending()` 只检查魔数与合理性;`fb_enable()` 在 `mm_enable_paging()` 之后把 `pitch*height` 按页 `mm_map_page(phys, phys, PAGE_KERNEL|PCD)` 恒等映射(uncached),设置原点把 640×400 文本区居中;按 bpp 写像素(32/24/16 bpp,16bpp 为 5-6-5)。字模来自 `include/font8x8.h`(公有领域 8×8),每个 8×8 字形纵向复制 2 次得到 8×16 单元。
+- `vga.c` 现在维护 80×25 的 `cells[]` 影子网格:文本模式下同步写 `0xB8000`;有 VBE 但尚未映射时只写影子;`fb_active()` 后每个单元直接 `fb_put_cell`。滚动在影子上 memmove 后整屏重绘;光标在帧缓冲下画白色下划线并先重绘旧单元。`vga_repaint()` 用于 `fb_enable()` 之后把启动早期已写入影子的横幅补画到屏幕。
+- 桌面/编辑器:所有 `0xB8000` 直写改为 `vga_put_cell/vga_get_cell`(`win7.c` 的 put_cell/fd/ft/ftn、鼠标反色保存恢复,`editor.c` 的行/状态/帮助/光标),因此两种显示后端行为一致。
+
 ## 八、Shell / FS / 桌面
 
 - **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault|pie|dyn|net]` 运行内嵌 ELF(其中 `dyn` 先写 `/lib` 再跑动态程序;`net` 走 socket 自测),`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
@@ -241,7 +249,7 @@ USER_SIGTRAMP = 0x08847000
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
 - **win7.c**:文本模式 Win7 风格桌面——行 0 标题、1..23 桌面、24 任务栏;窗口按 z-order 绘制(活动窗口最后),鼠标点击/标题栏拖拽/最小化/最大化/关闭,开始菜单鼠标/键盘双操作,桌面图标可见;任务栏显示实时内存与 CMOS RTC `HH:MM:SS`。`gui`/`win7`/`desktop` 命令共用此实现;`run` 之外的 Text Editor/Calculator 可从菜单或图标启动(Calculator 聚焦时直接吃数字/运算符)。
 - **mouse.c + rtc.c**:PS/2 鼠标初始化(0xA8/命令字节/0xF6/0xF4)与 3 字节包解析(9 位 dx/dy、溢出位、按键),映射为 80×25 文本单元;`rtc_read_time` 处理 UIP、BCD/12 小时制,失败时任务栏回退 `UP:MM`。
-- **vga.c**:`vga_hide_cursor/show_cursor` 用 CRTC start/end 保存/恢复 BIOS 光标形状,桌面与编辑器绘制自己的光标。
+- **vga.c**:维护 80×25 影子 `cells[]`;文本模式同步写 `0xB8000`,VBE 模式下改由 `fb.c` 逐单元渲染;`vga_hide_cursor/show_cursor` 用 CRTC start/end 保存/恢复 BIOS 光标形状(仅文本模式),桌面与编辑器绘制自己的光标。
 
 ## 九、构建系统
 
@@ -284,17 +292,19 @@ USER_SIGTRAMP = 0x08847000
 | `io_base / present / mac_addr` | net.c | RTL8139 I/O 基址、探测结果与 MAC |
 | `rx_buffer / tx_buffer` | net.c | 32K 接收环与发送 DMA 缓冲(物理地址交给网卡) |
 | `socks[] / arp_cache[]` | net.c | 8 个 socket 槽与 4 项 ARP 缓存 |
+| `info / fb / active` | fb.c | VBE 模式信息、恒等映射后的显存指针与启用状态 |
+| `cells[] / pending` | vga.c | 80×25 影子文本网格与"等待帧缓冲"标志 |
 
 ## 十一、已知局限(真实清单)
 
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
 3. 动态链接由自研 `ld-mu.so` 完成,只支持 SysV hash(`DT_HASH`)与自有 `.so`;`.gnu.hash`、TLS 重定位、`R_386_COPY`、符号版本化未实现,因此还不能加载真实 libc 的共享库;`MAP_SHARED` 不写回
-4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);网络仅 RTL8139 + ARP/ICMP/UDP(无 TCP/DHCP、无多网卡,地址固定 10.0.2.15);无 VBE 帧缓冲,桌面仍是 80×25 文本模式(需要 GRUB 或 BIOS VBE 引导阶段)
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);网络仅 RTL8139 + ARP/ICMP/UDP(无 TCP/DHCP、无多网卡,地址固定 10.0.2.15);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
-8. 桌面仍是 80×25 文本模式,无图形帧缓冲、字体渲染与动画;窗口内容除 Calculator 外主要是状态展示
+8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本),无图形控件/字体渲染/动画;窗口内容除 Calculator 外主要是状态展示
 9. 单处理器(PIC,非 APIC);用户进程由 IRQ0 抢占,内核 shell 本身仍在启动栈上协作运行
 10. 无内核栈溢出保护(16KB 栈,GUI 深调用链靠它撑着;用户态入口另有 8KB TSS 栈)
 11. 无 guard page / 无 KASLR / panic 信息只有寄存器 dump(有 -g,可 addr2line)
