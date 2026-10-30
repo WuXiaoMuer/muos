@@ -12,6 +12,8 @@ typedef struct {
 bool_t mouse_init(void);
 
 mouse_state_t mouse_get_state(void);
+/* Raw 640x400 virtual-pixel position (used by the graphical UI). */
+void mouse_get_pixels(int* x, int* y);
 
 /* Called from the shared 8042 IRQ/poll path for auxiliary-port bytes. */
 void mouse_handle_byte(uint8_t data);

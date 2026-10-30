@@ -21,6 +21,7 @@ SECTIONS
     .dynsym   : { *(.dynsym) }                      :load
     .dynstr   : { *(.dynstr) }                      :load
     .hash     : { *(.hash) }                        :load
+    .gnu.hash : { *(.gnu.hash) }                    :load
     .dynamic  : { *(.dynamic) }                     :load :dynamic
     .rel.dyn  : { *(.rel.dyn) }                     :load
     .rel.plt  : { *(.rel.plt) }                     :load
@@ -30,5 +31,5 @@ SECTIONS
     .bss      : { *(COMMON) *(.bss) *(.bss.*) }     :load
 
     /DISCARD/ : { *(.eh_frame) *(.eh_frame_hdr) *(.comment) *(.note*)
-                 *(.interp) *(.gnu.hash) }
+                 *(.interp) }
 }

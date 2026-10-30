@@ -26,6 +26,13 @@ bool_t fb_active(void);
 void fb_clear(uint32_t rgb);
 void fb_put_cell(uint16_t row, uint16_t col, uint16_t entry);
 void fb_set_cursor(uint16_t row, uint16_t col);
+
+/* Pixel-level helpers for a graphical UI prototype. */
+void     fb_pixel(int x, int y, uint32_t rgb);
+uint32_t fb_get_pixel(int x, int y);
+void     fb_fill_rect(int x, int y, int w, int h, uint32_t rgb);
+void     fb_text(int x, int y, const char* s, uint32_t fg, uint32_t bg);
+uint32_t fb_palette(uint8_t index);
 uint32_t fb_width(void);
 uint32_t fb_height(void);
 uint32_t fb_bpp(void);

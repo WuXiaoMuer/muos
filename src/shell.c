@@ -7,6 +7,7 @@
 #include "fs.h"
 #include "editor.h"
 #include "win7.h"
+#include "gui.h"
 #include "test.h"
 #include "task.h"
 #include "string.h"
@@ -49,7 +50,7 @@ static void isrt(char c){
 }
 
 /* ── Tab Completion ──────────────────── */
-static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod",NULL};
+static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod","pixel",NULL};
 static void tab(void){
     if(!cmd_pos)return;
     int ws=0;
@@ -128,7 +129,7 @@ static void cmd_help(void){
     vga_print("  exec <file>                 - run an ELF from the RAM FS\n");
     vga_print("  mods / execmod <n>          - run a Multiboot -initrd module\n");
     vga_print("  help clear echo mem tasks time ps disk logo\n");
-    vga_print("  version gui win7 desktop test reboot halt crash\n");
+    vga_print("  version gui win7 desktop pixel test reboot halt crash\n");
 }
 static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
 static void slog_u32(uint32_t v);
@@ -333,6 +334,7 @@ static void execute(void){
     else if(streq(cmd,"version"))cmd_version();
     else if(streq(cmd,"gui")||streq(cmd,"desktop"))win7_run();
     else if(streq(cmd,"win7"))win7_run();
+    else if(streq(cmd,"pixel"))gui_run();
     else if(streq(cmd,"reboot"))cmd_reboot();
     else if(streq(cmd,"halt"))cmd_halt();
     else if(streq(cmd,"crash"))cmd_crash();

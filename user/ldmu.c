@@ -36,6 +36,7 @@ typedef unsigned int   u32;
 #define DT_RELSZ    18
 #define DT_PLTREL   20
 #define DT_JMPREL   23
+#define DT_GNU_HASH 0x6ffffef5
 
 #define R_386_NONE     0
 #define R_386_32       1
@@ -76,6 +77,7 @@ typedef struct obj {
     u32 bias;
     u32 dyn;
     u32 symtab, strtab, hash, syment;
+    u32 gnu_hash;
     u32 rel, relsz, jmprel, pltrelsz;
     const char* name;
 } obj_t;
@@ -176,6 +178,7 @@ static void parse_dynamic(obj_t* o, u32 phdr_addr, u32 phnum) {
             case DT_SYMTAB:   o->symtab = d[i].d_val; break;
             case DT_STRTAB:   o->strtab = d[i].d_val; break;
             case DT_HASH:     o->hash   = d[i].d_val; break;
+            case DT_GNU_HASH: o->gnu_hash = d[i].d_val; break;
             case DT_SYMENT:   o->syment = d[i].d_val; break;
             case DT_REL:      o->rel    = d[i].d_val; break;
             case DT_RELSZ:    o->relsz  = d[i].d_val; break;
@@ -187,6 +190,7 @@ static void parse_dynamic(obj_t* o, u32 phdr_addr, u32 phnum) {
     if (o->symtab) o->symtab += o->bias;
     if (o->strtab) o->strtab += o->bias;
     if (o->hash)   o->hash   += o->bias;
+    if (o->gnu_hash) o->gnu_hash += o->bias;
     if (o->rel)    o->rel    += o->bias;
     if (o->jmprel) o->jmprel += o->bias;
 }
@@ -204,7 +208,49 @@ static u32 elf_hash(const char* s) {
     return h;
 }
 
+static u32 gnu_hash_(const char* s) {
+    u32 h = 0x1505u;
+    while (*s) h = (h << 5) + h + (u32)(*s++);
+    return h;
+}
+
+static u32 sym_value(obj_t* o, const sym_t* sym) {
+    if (sym->st_shndx == SHN_UNDEF) return 0;
+    return (sym->st_shndx == SHN_ABS) ? sym->st_value : o->bias + sym->st_value;
+}
+
+/* .gnu.hash: nbuckets, symoffset, bloom_size, bloom_shift, bloom[],
+ * buckets[], chain[]. Names in the hash table are not sorted. */
+static u32 lookup_gnu(obj_t* o, const char* name) {
+    const u32* gh = (const u32*)o->gnu_hash;
+    u32 nbucket = gh[0], symoff = gh[1], bloom_size = gh[2];
+    u32 bloom_shift = gh[3];
+    const u32* bloom = gh + 4;
+    const u32* buckets = bloom + bloom_size;
+    const u32* chain = buckets + nbucket;
+    if (nbucket == 0 || bloom_size == 0) return 0;
+
+    u32 h = gnu_hash_(name);
+    u32 w = bloom[(h >> 5) % bloom_size];
+    u32 mask = (1u << (h & 31)) | (1u << ((h >> bloom_shift) & 31));
+    if ((w & mask) != mask) return 0;
+
+    u32 idx = buckets[h % nbucket];
+    if (idx < symoff) return 0;
+    for (u32 guard = 0; guard < 4096; guard++, idx++) {
+        const sym_t* sym = (const sym_t*)(o->symtab + idx * o->syment);
+        u32 c = chain[idx - symoff];
+        if ((c & ~1u) == h &&
+            sym->st_shndx != SHN_UNDEF &&
+            strcmp_((const char*)(o->strtab + sym->st_name), name) == 0)
+            return sym_value(o, sym);
+        if (c & 1) break;
+    }
+    return 0;
+}
+
 static u32 lookup_in(obj_t* o, const char* name) {
+    if (o->gnu_hash) return lookup_gnu(o, name);
     if (!o->hash || !o->symtab || !o->strtab || !o->syment) return 0;
     const u32* ht = (const u32*)o->hash;
     u32 nbucket = ht[0], nchain = ht[1];
@@ -215,8 +261,7 @@ static u32 lookup_in(obj_t* o, const char* name) {
         const sym_t* sym = (const sym_t*)(o->symtab + idx * o->syment);
         if (sym->st_shndx != SHN_UNDEF &&
             strcmp_((const char*)(o->strtab + sym->st_name), name) == 0) {
-            return (sym->st_shndx == SHN_ABS) ? sym->st_value
-                                              : o->bias + sym->st_value;
+            return sym_value(o, sym);
         }
         idx = chain[idx];
     }
@@ -242,6 +287,16 @@ static int apply_one(obj_t* o, u32 type, u32 symix, u32 where) {
         case R_386_RELATIVE:
             *dst += o->bias;
             return 0;
+        case R_386_COPY: {
+            /* Executable copies a data object defined in a shared library
+             * (classic COPY relocation). */
+            const sym_t* sym = (const sym_t*)(o->symtab + symix * o->syment);
+            const char* name = (const char*)(o->strtab + sym->st_name);
+            u32 src = lookup_global(name);
+            if (!src) fail("unresolved COPY symbol", name);
+            memcpy((void*)where, (const void*)src, sym->st_size);
+            return 0;
+        }
         case R_386_32:
         case R_386_PC32:
         case R_386_GLOB_DAT:
@@ -261,7 +316,7 @@ static int apply_one(obj_t* o, u32 type, u32 symix, u32 where) {
             return 0;
         }
         default:
-            return -1;      /* COPY/IRELATIVE/TLS are not used by our builds */
+            return -1;      /* TLS/IRELATIVE are not used by our builds */
     }
 }
 
@@ -269,9 +324,11 @@ static void apply_table(obj_t* o, u32 addr, u32 size) {
     if (!addr || !size) return;
     const rel_t* r = (const rel_t*)addr;
     u32 n = size / sizeof(rel_t);
-    for (u32 i = 0; i < n; i++)
-        apply_one(o, r[i].r_info & 0xFF, r[i].r_info >> 8,
-                  o->bias + r[i].r_offset);
+    for (u32 i = 0; i < n; i++) {
+        if (apply_one(o, r[i].r_info & 0xFF, r[i].r_info >> 8,
+                      o->bias + r[i].r_offset) != 0)
+            fail("unsupported relocation in", o->name);
+    }
 }
 
 static void apply_relocs(obj_t* o) {

@@ -114,3 +114,8 @@ mouse_state_t mouse_get_state(void) {
     s.btn_middle = btn_m;
     return s;
 }
+
+void mouse_get_pixels(int* x, int* y) {
+    if (x) *x = px;
+    if (y) *y = py;
+}

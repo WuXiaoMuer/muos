@@ -201,7 +201,7 @@ USER_SIGTRAMP = 0x08847000
 - `dyn.c` + `libmu.c`:`run dyn` 运行 `dyn.elf`,它只声明未定义的 `mu_hello()`;共享库里的实现通过 `DT_NEEDED` 由 `ld-mu.so` 在运行时装载并解析,输出的 `DYN-LIB-OK`/`DYN-OK` 证明跨对象符号绑定与 RELATIVE 重定位都生效。
 - `linker.ld`(ET_EXEC,0x08048000)与 `linker_pie.ld`(ET_DYN,从 `SIZEOF_HEADERS` 开始、`load PT_LOAD FILEHDR PHDRS` + `dynamic PT_DYNAMIC`);build.ps1 用 `-fPIE -pie` 产出 `hello-pie.elf` 并作为第二个 blob 嵌入。
 - **动态链接集**:`linker_so.ld`(共享对象,`FILEHDR PHDRS`,从 `SIZEOF_HEADERS` 起)产出 `libmu.so`(导出 `mu_hello`,数据指针经 `R_386_RELATIVE` 修正)与 `ld-mu.so`(`ld_start.s` 取原始 esp 调 `ld_main`);`linker_dyn.ld` 增加 `interp PT_INTERP` 与独立的 `.rel.dyn/.rel.plt`,配合 `-Wl,--dynamic-linker=/lib/ld-mu.so -L build -lmu` 产出 `dyn.elf`(DT_NEEDED libmu.so)。三者都以 `objcopy -I binary` 嵌入内核。
-- `ldmu.c`(ld-mu.so,无依赖):从栈解析 auxv → 由 `AT_PHDR` + `PROG_BASE` 反推主程序 bias → 解析 `PT_DYNAMIC` → 按 `DT_NEEDED` 从 `/lib/<name>` 用 `open/read` 读入 `fbuf` 并映射到 `0x08400000` 起的空位 → SysV hash(`DT_HASH`)解析符号 → 对依赖库和主程序依次应用 `RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT` → `jmp AT_ENTRY`(不改动栈)。`.gnu.hash`/TLS/`R_386_COPY` 未实现。
+- `ldmu.c`(ld-mu.so,无依赖):从栈解析 auxv → 由 `AT_PHDR` + `PROG_BASE` 反推主程序 bias → 解析 `PT_DYNAMIC` → 按 `DT_NEEDED` 从 `/lib/<name>` 用 `open/read` 读入 `fbuf` 并映射到 `0x08400000` 起的空位 → 符号解析(SysV `DT_HASH` 或 `DT_GNU_HASH`:gnu 走 bloom 过滤 + bucket/chain 链)→ 对依赖库和主程序依次应用 `RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY`(COPY 按 `st_size` 从提供者复制数据)→ `jmp AT_ENTRY`(不改动栈)。未知重定位(TLS/IRELATIVE)会打印 `unsupported relocation` 并退出,不再静默跳过。
 - 用户态异常在 `isr_handler` 开头分流:`(regs->cs & 3) == 3 && user_is_active()` → `user_handle_fault` 打印 EIP/CS/CR2 后回 Shell,内核 panic 路径不受影响。
 
 ### 7.6 i386 TLS 与真实 libc 启动
@@ -243,9 +243,14 @@ USER_SIGTRAMP = 0x08847000
 - `vga.c` 现在维护 80×25 的 `cells[]` 影子网格:文本模式下同步写 `0xB8000`;有 VBE 但尚未映射时只写影子;`fb_active()` 后每个单元直接 `fb_put_cell`。滚动在影子上 memmove 后整屏重绘;光标在帧缓冲下画白色下划线并先重绘旧单元。`vga_repaint()` 用于 `fb_enable()` 之后把启动早期已写入影子的横幅补画到屏幕。
 - 桌面/编辑器:所有 `0xB8000` 直写改为 `vga_put_cell/vga_get_cell`(`win7.c` 的 put_cell/fd/ft/ftn、鼠标反色保存恢复,`editor.c` 的行/状态/帮助/光标),因此两种显示后端行为一致。
 
+### 7.10 像素桌面原型(gui.c)
+
+- `fb.c` 额外导出 `fb_pixel/fb_get_pixel/fb_fill_rect/fb_text/fb_palette`,按 bpp 读写任意像素;`mouse_get_pixels` 暴露 640×400 的原始鼠标坐标(文本桌面用的是 8×16 单元坐标)。
+- `pixel` 命令:进入前用 `vga_get_cell` 保存 80×25 影子网格;画 4 行一格的渐变桌面、顶部提示条、两个带标题栏/关闭按钮/阴影的窗口、底部任务栏;文字用 8×8 字模原尺寸绘制。鼠标箭头以 10×14 掩码绘制,移动前用保存的像素恢复旧位置;ESC/q 退出后恢复影子网格并 `vga_repaint()`。仅 VBE 路径可用,`-kernel` 下提示需要 ISO。无窗口管理/控件/事件分发,属于视觉原型。
+
 ## 八、Shell / FS / 桌面
 
-- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;29 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault|pie|dyn|net]` 运行内嵌 ELF(其中 `dyn` 先写 `/lib` 再跑动态程序;`net` 走 socket 自测),`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
+- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;30 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault|pie|dyn|net]` 运行内嵌 ELF(其中 `dyn` 先写 `/lib` 再跑动态程序;`net` 走 socket 自测),`pixel` 进入像素桌面原型,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
 - **fs.c**:16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。文件槽位带 `refs` 与 `deleted` 标志:unlink 时若仍有 fd 打开则清空名字但保留数据,最后一个 `fs_unref` 才释放槽位;`fs_rename_dir` 整棵子树改名(先校验全部新名字长度、拒绝目标已存在/移入自身)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
 - **MuFS 持久化(同一文件底部)**:磁盘布局 = 扇区 0 超级块(`MUFS` 魔数/版本/generation)、扇区 2–5 文件元数据表(16×88B)、扇区 6–8 目录元数据表(16×68B)、扇区 16 起 16 个 64KB 数据槽。`fs_persist_mount()` 在 `fs_init` 后调用:魔数/版本/槽参数匹配则读入命名空间与文件体,否则格式化为空;之后每个变更点(`create/write(_at)/truncate/delete/rename*/mkdir/rmdir/set_times/unref 释放`)调用 `persist_meta()` 并只写涉及的数据扇区(`persist_slot/persist_slot_range`)。`fs_sync()` 递增 generation、重写超级块 + 全部元数据 + 全部已用槽;`fsync(118)/sync(36)` 调用它。无盘时 `persist_active=false`,全部是内存操作。
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
@@ -301,12 +306,12 @@ USER_SIGTRAMP = 0x08847000
 
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
-3. 动态链接由自研 `ld-mu.so` 完成,只支持 SysV hash(`DT_HASH`)与自有 `.so`;`.gnu.hash`、TLS 重定位、`R_386_COPY`、符号版本化未实现,因此还不能加载真实 libc 的共享库;`MAP_SHARED` 不写回
+3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash 与 `R_386_COPY` 已支持;TLS 重定位、`R_386_IRELATIVE`、符号版本化未实现,遇到未知重定位会明确报错,因此仍不能加载真实 libc 的共享库;`MAP_SHARED` 不写回
 4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + 最小 TCP(无重传/超时/拥塞控制,用户态 listen/accept 未做并发验证);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
-8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本),无图形控件/字体渲染/动画;窗口内容除 Calculator 外主要是状态展示
+8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 只是静态桌面原型,无窗口管理/控件/事件分发;窗口内容除 Calculator 外主要是状态展示
 9. 单处理器(PIC,非 APIC);用户进程由 IRQ0 抢占,内核 shell 本身仍在启动栈上协作运行
 10. 无内核栈溢出保护(16KB 栈,GUI 深调用链靠它撑着;用户态入口另有 8KB TSS 栈)
 11. 无 guard page / 无 KASLR / panic 信息只有寄存器 dump(有 -g,可 addr2line)

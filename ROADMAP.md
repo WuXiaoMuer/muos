@@ -19,7 +19,7 @@
 - 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`build/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(仅 SysV hash + 自有 `.so`,不兼容 glibc/musl 的 `.gnu.hash`/TLS/COPY 重定位);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + 最小 TCP(无重传/拥塞控制);帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式)。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash 与 COPY 已支持,TLS/IRELATIVE/版本化未做);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + 最小 TCP(无重传/拥塞控制);帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 只是桌面原型。
 
 ## 后续计划(建议顺序)
 
@@ -42,8 +42,8 @@
 - [x] `ET_DYN`/静态 PIE 加载:load bias、`PT_DYNAMIC`、`R_386_RELATIVE/GLOB_DAT/JMP_SLOT/32` 重定位
 - [x] 完整 auxv(`AT_PHDR/PHENT/PHNUM/PAGESZ/BASE/ENTRY`);`run pie` 实测 `PIE-RELOC-OK`
 - [x] `PT_INTERP` 解释器路径解析(MuFS `/lib/...` 优先,回退内嵌 blob),解释器映射到 `0x08200000`,`AT_BASE` 指向其 load bias
-- [x] 共享库(`ET_DYN .so`)映射 + 动态链接器 `ld-mu.so`(`DT_NEEDED` 递归装载、SysV hash 符号解析、`R_386_RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT`);`run dyn` 实测 `DYN-OK`
-- [ ] 与真实 libc 生态的兼容(`.gnu.hash`、TLS、`R_386_COPY`、版本符号)仍未做
+- [x] 共享库(`ET_DYN .so`)映射 + 动态链接器 `ld-mu.so`(`DT_NEEDED` 递归装载、SysV hash **与 .gnu.hash** 符号解析、`R_386_RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY`);`run dyn` 实测 `DYN-OK`(libmu.so 用 GNU hash 构建)
+- [ ] 与真实 libc 生态的兼容(TLS 重定位、`R_386_IRELATIVE`、符号版本化)仍未做;遇到未知重定位类型会明确报错而不是继续执行
 
 ### P4 平台外设
 - [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`build/test_ata.py` 两次启动验证持久化
@@ -51,7 +51,9 @@
 - [x] 网络:PCI 枚举 + RTL8139(轮询 ISR,32K RX 环)+ ARP/IPv4/ICMP echo/UDP + DHCP 客户端;`run net` 实测 ping 网关与 DNS 查询成功
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/sendto(369)/recvfrom(371)/shutdown(373)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽
 - [x] 最小 TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;`run tcp` 实测 `TCP-OK`
-- [ ] TCP 重传/超时/拥塞控制、用户态 `listen/accept` 的并发服务端;多网卡与其他真实网卡
+- [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
+- [x] 像素桌面原型:`pixel` 命令(fb_fill_rect/fb_pixel/fb_text + PS/2 鼠标箭头与存屏/恢复),ESC 返回文本 shell
+- [ ] 真正的图形窗口系统(per-window 缓冲、裁剪、控件、事件分发);TCP 重传/并发服务端;其他网卡
 
 ## 阶段 0:地基(已完成,2026-09)
 

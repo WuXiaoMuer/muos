@@ -109,7 +109,7 @@ $CFiles = @(
     "kernel", "vga", "serial", "gdt", "idt", "isr", "pic",
     "pit", "keyboard", "mouse", "mm", "kheap", "string", "fs", "editor",
     "win7", "task", "shell", "irq", "test", "elf", "tss", "user", "syscall",
-    "rtc", "module", "proc", "pipe", "ata", "pci", "net", "fb"
+    "rtc", "module", "proc", "pipe", "ata", "pci", "net", "fb", "gui"
 )
 
 $ObjFiles = @()
@@ -204,7 +204,7 @@ Write-Host ">>> [$step] Building libmu.so (shared library) ..." -ForegroundColor
 if ($LASTEXITCODE -ne 0) { throw "GCC libmu.c failed" }
 & $LD -m elf_i386 -shared -T "$UserDir\linker_so.ld" `
       "$BuildDir\libmu_pic.o" -o "$BuildDir\libmu.so" `
-      --hash-style=sysv --build-id=none
+      --hash-style=gnu --build-id=none
 if ($LASTEXITCODE -ne 0) { throw "Link libmu.so failed" }
 Write-Host "      OK -> build\libmu.so" -ForegroundColor Green
 $step++

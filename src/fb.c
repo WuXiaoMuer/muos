@@ -57,6 +57,54 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     }
 }
 
+void fb_pixel(int x, int y, uint32_t rgb) {
+    if (!active || x < 0 || y < 0 ||
+        (uint32_t)x >= info.width || (uint32_t)y >= info.height) return;
+    put_pixel((uint32_t)x, (uint32_t)y, rgb);
+}
+
+uint32_t fb_get_pixel(int x, int y) {
+    if (!active || x < 0 || y < 0 ||
+        (uint32_t)x >= info.width || (uint32_t)y >= info.height) return 0;
+    uint8_t* p = fb + (uint32_t)y * info.pitch + (uint32_t)x * (info.bpp / 8);
+    if (info.bpp == 32) return *(volatile uint32_t*)p;
+    if (info.bpp == 24)
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+    uint16_t v = *(volatile uint16_t*)p;
+    uint32_t r = (v >> 11) & 0x1F, g = (v >> 5) & 0x3F, b = v & 0x1F;
+    return ((r << 3) << 16) | ((g << 2) << 8) | ((b << 3));
+}
+
+void fb_fill_rect(int x, int y, int w, int h, uint32_t rgb) {
+    if (!active || w <= 0 || h <= 0 || x >= (int)info.width || y >= (int)info.height)
+        return;
+    uint32_t x0 = x < 0 ? 0 : (uint32_t)x;
+    uint32_t y0 = y < 0 ? 0 : (uint32_t)y;
+    uint32_t w0 = (uint32_t)(x + w) > info.width ? info.width - x0 : (uint32_t)w;
+    uint32_t h0 = (uint32_t)(y + h) > info.height ? info.height - y0 : (uint32_t)h;
+    fill_rect(x0, y0, w0, h0, rgb);
+}
+
+uint32_t fb_palette(uint8_t index) { return palette[index & 0x0F]; }
+
+/* 8x8 text at arbitrary pixel coordinates (used by the GUI prototype). */
+void fb_text(int x, int y, const char* s, uint32_t fg, uint32_t bg) {
+    if (!active) return;
+    for (; *s; s++, x += 8) {
+        unsigned char ch = (unsigned char)*s;
+        const unsigned char* glyph =
+            (ch >= 0x20 && ch < 0x7F) ? font8x8_basic[ch - 0x20]
+                                      : font8x8_basic[0];
+        for (int gy = 0; gy < 8; gy++) {
+            uint32_t bits = glyph[gy];
+            for (int gx = 0; gx < 8; gx++) {
+                fb_pixel(x + gx, y + gy,
+                         (bits & (1u << gx)) ? fg : bg);
+            }
+        }
+    }
+}
+
 bool_t fb_enable(void) {
     if (active) return true;
     if (!fb_pending()) return false;

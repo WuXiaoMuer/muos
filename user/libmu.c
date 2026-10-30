@@ -7,6 +7,9 @@
  */
 
 __attribute__((visibility("default")))
+int mu_magic = 0x4D754F53;      /* 'MuOS': COPY-relocation test data */
+
+__attribute__((visibility("default")))
 int mu_hello(void) {
     /* A pointer initialised with a link-time address needs an R_386_RELATIVE
      * relocation, which is what proves the user-mode linker relocated us. */
