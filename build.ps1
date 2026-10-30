@@ -136,7 +136,9 @@ Write-Host ">>> [$step] Compiling user runtime + hello.c ..." -ForegroundColor C
 if ($LASTEXITCODE -ne 0) { throw "GCC user runtime.c failed" }
 & $GCC @UserCFlags -c "$UserDir\hello.c" -o "$BuildDir\user_hello.o"
 if ($LASTEXITCODE -ne 0) { throw "GCC user hello.c failed" }
-Write-Host "      OK -> build\user_runtime.o, build\user_hello.o" -ForegroundColor Green
+& $NASM -f elf32 "$UserDir\syscall6.s" -o "$BuildDir\user_syscall6.o"
+if ($LASTEXITCODE -ne 0) { throw "NASM user syscall6.s failed" }
+Write-Host "      OK -> build\user_runtime.o, build\user_hello.o, build\user_syscall6.o" -ForegroundColor Green
 $step++
 
 Write-Host ">>> [$step] Linking hello.elf (0x08048000) ..." -ForegroundColor Cyan
@@ -144,6 +146,7 @@ Write-Host ">>> [$step] Linking hello.elf (0x08048000) ..." -ForegroundColor Cya
 if ($LASTEXITCODE -ne 0) { throw "NASM user start.s failed" }
 & $GCC -m32 -nostdlib -no-pie -T "$UserDir\linker.ld" `
        "$BuildDir\user_start.o" "$BuildDir\user_runtime.o" "$BuildDir\user_hello.o" `
+       "$BuildDir\user_syscall6.o" `
        -o "$BuildDir\hello.elf" "-Wl,--build-id=none" "-Wl,--no-warn-rwx-segments"
 if ($LASTEXITCODE -ne 0) { throw "Link hello.elf failed" }
 Write-Host "      OK -> build\hello.elf" -ForegroundColor Green

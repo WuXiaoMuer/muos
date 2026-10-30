@@ -47,6 +47,15 @@ static int syscall4(int nr, int a, int b, int c, int d) {
     return ret;
 }
 
+static int syscall5(int nr, int a, int b, int c, int d, int e) {
+    int ret;
+    __asm__ volatile ("int $0x80"
+                      : "=a"(ret)
+                      : "a"(nr), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e)
+                      : "memory");
+    return ret;
+}
+
 int muos_write(int fd, const void* buf, unsigned len) {
     return syscall3(4, fd, (int)buf, (int)len);
 }
@@ -166,6 +175,21 @@ int muos_getrlimit(int resource, unsigned* out) {
 
 int muos_prlimit64(int resource, unsigned* out) {
     return syscall4(340, 0, resource, 0, (int)out);
+}
+
+int muos_poll(muos_pollfd_t* fds, int nfds, int timeout) {
+    return syscall3(168, (int)fds, nfds, timeout);
+}
+
+int muos_select(int nfds, unsigned* r, unsigned* w, unsigned* e, unsigned* tv) {
+    return syscall5(82, nfds, (int)r, (int)w, (int)e, (int)tv);
+}
+
+/* muos_pselect6 lives in syscall6.s: its 6th argument must travel in ebp,
+ * which C inline asm cannot reserve while also pinning the other five. */
+
+int muos_ppoll(muos_pollfd_t* fds, int nfds, unsigned* ts) {
+    return syscall5(309, (int)fds, nfds, (int)ts, 0, 0);
 }
 
 int muos_munmap(unsigned addr, unsigned len) {

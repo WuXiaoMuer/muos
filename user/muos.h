@@ -56,6 +56,23 @@ int  muos_fsync(int fd);
 int  muos_getrlimit(int resource, unsigned* out /* 2 words */);
 int  muos_prlimit64(int resource, unsigned* out /* 4 words: cur/max u64 */);
 
+/* poll/select readiness (non-blocking: a timeout is treated as elapsed) */
+typedef struct {
+    int   fd;
+    short events;
+    short revents;
+} muos_pollfd_t;
+
+#define MUOS_POLLIN   0x001
+#define MUOS_POLLOUT  0x004
+#define MUOS_POLLNVAL 0x020
+
+int muos_poll(muos_pollfd_t* fds, int nfds, int timeout);
+int muos_select(int nfds, unsigned* r, unsigned* w, unsigned* e, unsigned* tv);
+int muos_pselect6(int nfds, unsigned* r, unsigned* w, unsigned* e,
+                  unsigned* ts, unsigned* sig);
+int muos_ppoll(muos_pollfd_t* fds, int nfds, unsigned* ts);
+
 void muos_puts(const char* s);
 void muos_putdec(int value);
 void muos_puthex(unsigned value);

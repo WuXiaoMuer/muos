@@ -42,6 +42,7 @@
 - [x] int 0x80 分发器:eax=调用号,ebx/ecx/edx 传参,返回值 eax;错误约定 `-errno`;未知号返回 `-ENOSYS` 并串口记录
 - [x] 第一批中的 `exit(1) read(3) write(4) open(5) close(6) getpid(20) getuid(24) brk(45)`;`fork(2)`、`waitpid(7)/wait4(114)`、`execve(11)` 已实现(顺序快照模型)
 - [x] 用户态堆:brk 与匿名 mmap 在沙箱内 bump(页级 vmm 分配待做);文件 mmap 已支持(见阶段 4)
+- [x] poll/select 就绪语义:`poll(168)/ppoll(309)/select(82)/_newselect(142)/pselect6(308)` 返回当前可读/可写状态(文件与设备恒就绪、pipe 看缓冲区、stdin 看键盘缓冲);无调度器故不睡眠,超时按已到期处理
 - [x] 用户 fd 表:stdio 0/1/2 + 文件 fd 从 3 起,映射 RAM FS 槽位并维护偏移;尚未挂进 task_t
 - [ ] fs 句柄引用计数(open 计数/close 释放),防止文件被删除后 fd 悬空
 - [ ] 基本信号占位(SIGKILL/SIGTERM 直接生效即可)

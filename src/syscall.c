@@ -148,6 +148,21 @@
 #define RLIM_INFINITY   0xFFFFFFFFu
 #define RLIMIT64_SIZE   16
 
+/* poll/select readiness. There is no scheduler yet, so these calls report
+ * the current readiness state instead of sleeping: a timeout is treated as
+ * already elapsed. */
+#define SYS_select      82
+#define SYS_newselect  142
+#define SYS_poll       168
+#define SYS_pselect6   308
+#define SYS_ppoll      309
+#define POLLIN    0x001
+#define POLLOUT   0x004
+#define POLLERR   0x008
+#define POLLHUP   0x010
+#define POLLNVAL  0x020
+#define SELECT_MAX_FDS 1024
+
 #define ERR_EPERM      1
 #define ERR_ENOENT     2
 #define ERR_ESRCH      3
@@ -1862,6 +1877,137 @@ static uint32_t do_dup(uint32_t fd) {
     return (uint32_t)nfd;
 }
 
+/* ---- poll/select readiness ----
+ * Regular files and devices are always ready like Linux; a pipe read end is
+ * ready only when it holds bytes, its write end only when it has space;
+ * stdin/console are ready only when the keyboard buffer already has a char
+ * (waiting would block the whole single-address-space machine). */
+
+static bool_t fd_read_ready(int fd) {
+    switch (user_fd_kind(fd)) {
+        case USER_FD_STDIN:
+        case USER_FD_DEV_CONSOLE:
+            return keyboard_haschar();
+        case USER_FD_FILE:
+        case USER_FD_VFILE:
+        case USER_FD_DIR:
+        case USER_FD_DEV_NULL:
+        case USER_FD_DEV_ZERO:
+            return true;
+        case USER_FD_PIPE_READ: {
+            int id = user_fd_pipe_id(fd);
+            return (id >= 0 && pipe_fill(id) > 0) ? true : false;
+        }
+        default:
+            return false;
+    }
+}
+
+static bool_t fd_write_ready(int fd) {
+    switch (user_fd_kind(fd)) {
+        case USER_FD_FILE:
+        case USER_FD_STDOUT:
+        case USER_FD_STDERR:
+        case USER_FD_DEV_CONSOLE:
+        case USER_FD_DEV_NULL:
+        case USER_FD_DEV_ZERO:
+            return true;
+        case USER_FD_PIPE_WRITE: {
+            int id = user_fd_pipe_id(fd);
+            return (id >= 0 && pipe_fill(id) < PIPE_BUF_SIZE) ? true : false;
+        }
+        default:
+            return false;     /* reading ends, VFILE and DIR are not writable */
+    }
+}
+
+typedef struct {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+} pollfd_t;
+
+static uint32_t do_poll(uint32_t fds_ptr, uint32_t nfds, uint32_t timeout) {
+    (void)timeout;   /* treated as 0: report readiness without sleeping */
+    if (nfds > SELECT_MAX_FDS) return err(ERR_EINVAL);
+    if (nfds && !user_ptr_ok(fds_ptr, nfds * 8)) return err(ERR_EFAULT);
+
+    uint32_t ready = 0;
+    for (uint32_t i = 0; i < nfds; i++) {
+        pollfd_t p;
+        memcpy(&p, (const void*)(fds_ptr + i * 8), sizeof(p));
+
+        int16_t rev = 0;
+        if (p.fd >= 0) {
+            if (user_fd_kind(p.fd) < 0) {
+                rev = POLLNVAL;
+            } else {
+                if ((p.events & POLLIN) && fd_read_ready(p.fd)) rev |= POLLIN;
+                if ((p.events & POLLOUT) && fd_write_ready(p.fd)) rev |= POLLOUT;
+            }
+        }
+        p.revents = rev;
+        memcpy((void*)(fds_ptr + i * 8), &p, sizeof(p));
+        if (rev) ready++;
+    }
+    return ready;
+}
+
+static bool_t fdset_test(uint32_t set_ptr, uint32_t fd) {
+    uint32_t v;
+    memcpy(&v, (const void*)(set_ptr + (fd / 32) * 4), 4);
+    return (v & (1u << (fd % 32))) ? true : false;
+}
+
+static void fdset_clear(uint32_t set_ptr, uint32_t fd) {
+    uint32_t v;
+    memcpy(&v, (const void*)(set_ptr + (fd / 32) * 4), 4);
+    v &= ~(1u << (fd % 32));
+    memcpy((void*)(set_ptr + (fd / 32) * 4), &v, 4);
+}
+
+/* select(82)/_newselect(142): the fd_set words are read and rewritten in
+ * place; the timeout is accepted but never waited on. */
+static uint32_t do_select(uint32_t nfds, uint32_t rp, uint32_t wp,
+                          uint32_t ep, uint32_t tp) {
+    if (nfds > SELECT_MAX_FDS) return err(ERR_EINVAL);
+    uint32_t bytes = ((nfds + 31) / 32) * 4;
+    if (rp && !user_ptr_ok(rp, bytes)) return err(ERR_EFAULT);
+    if (wp && !user_ptr_ok(wp, bytes)) return err(ERR_EFAULT);
+    if (ep && !user_ptr_ok(ep, bytes)) return err(ERR_EFAULT);
+    if (tp && !user_ptr_ok(tp, 8)) return err(ERR_EFAULT);
+
+    uint32_t ready = 0;
+    for (uint32_t fd = 0; fd < nfds; fd++) {
+        bool_t r = rp && fdset_test(rp, fd);
+        bool_t w = wp && fdset_test(wp, fd);
+        bool_t e = ep && fdset_test(ep, fd);
+        if (!r && !w && !e) continue;
+
+        bool_t valid = user_fd_kind((int)fd) >= 0;
+        bool_t rr = r && valid && fd_read_ready((int)fd);
+        bool_t ww = w && valid && fd_write_ready((int)fd);
+
+        if (r && !rr) fdset_clear(rp, fd);
+        if (w && !ww) fdset_clear(wp, fd);
+        if (e) fdset_clear(ep, fd);   /* no exceptional conditions tracked */
+        if (rr || ww) ready++;
+    }
+    return ready;
+}
+
+static uint32_t do_pselect6(uint32_t nfds, uint32_t rp, uint32_t wp,
+                            uint32_t ep, uint32_t ts, uint32_t sig) {
+    (void)ts; (void)sig;
+    return do_select(nfds, rp, wp, ep, 0);
+}
+
+static uint32_t do_ppoll(uint32_t fds_ptr, uint32_t nfds, uint32_t ts,
+                         uint32_t sigmask, uint32_t sigsize) {
+    (void)ts; (void)sigmask; (void)sigsize;
+    return do_poll(fds_ptr, nfds, 0);
+}
+
 /* ---- sequential fork/wait model ----
  * Only one address space is live. fork() copies the 8MB sandbox plus fd,
  * cwd and brk state into a child snapshot; when the parent calls waitpid,
@@ -2561,6 +2707,20 @@ void syscall_handler(registers_t* regs) {
         case SYS_pipe:
         case SYS_pipe2:
             ret = do_pipe(regs->ebx, regs->ecx);
+            break;
+        case SYS_poll:
+            ret = do_poll(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_select:
+        case SYS_newselect:
+            ret = do_select(regs->ebx, regs->ecx, regs->edx, regs->esi, regs->edi);
+            break;
+        case SYS_pselect6:
+            ret = do_pselect6(regs->ebx, regs->ecx, regs->edx, regs->esi,
+                              regs->edi, regs->ebp);
+            break;
+        case SYS_ppoll:
+            ret = do_ppoll(regs->ebx, regs->ecx, regs->edx, regs->esi, regs->edi);
             break;
         case SYS_brk:
             ret = (regs->ebx == 0 || !user_set_brk(regs->ebx))

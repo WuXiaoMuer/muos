@@ -81,6 +81,92 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "poll")) {
+        /* poll/select/pselect6/ppoll readiness on pipe read/write ends. */
+        int ok = 1;
+        int rc;
+        int fds[2] = { -1, -1 };
+        muos_pollfd_t pf[2];
+        unsigned rset;
+        char c = 'Z';
+        char rb = 0;
+
+        rc = muos_pipe(fds);
+        muos_puts("poll: pipe="); muos_putdec(rc);
+        muos_puts(" fds="); muos_putdec(fds[0]); muos_puts("/"); muos_putdec(fds[1]);
+        muos_puts("\n");
+        ok = ok && rc == 0;
+
+        if (rc == 0) {
+            pf[0].fd = fds[0]; pf[0].events = MUOS_POLLIN;  pf[0].revents = 0;
+            pf[1].fd = fds[1]; pf[1].events = MUOS_POLLOUT; pf[1].revents = 0;
+            rc = muos_poll(pf, 2, 0);
+            muos_puts("poll: empty="); muos_putdec(rc);
+            muos_puts(" revents="); muos_putdec(pf[0].revents);
+            muos_puts("/"); muos_putdec(pf[1].revents); muos_puts("\n");
+            ok = ok && rc == 1 && pf[0].revents == 0
+                 && pf[1].revents == MUOS_POLLOUT;
+
+            muos_write(fds[1], &c, 1);
+            pf[0].revents = pf[1].revents = 0;
+            rc = muos_poll(pf, 2, 0);
+            muos_puts("poll: filled="); muos_putdec(rc);
+            muos_puts(" revents="); muos_putdec(pf[0].revents);
+            muos_puts("/"); muos_putdec(pf[1].revents); muos_puts("\n");
+            ok = ok && rc == 2 && (pf[0].revents & MUOS_POLLIN)
+                 && (pf[1].revents & MUOS_POLLOUT);
+
+            rset = 1u << fds[0];
+            rc = muos_select(fds[0] + 1, &rset, 0, 0, 0);
+            muos_puts("poll: select="); muos_putdec(rc);
+            muos_puts(" set="); muos_puthex(rset); muos_puts("\n");
+            ok = ok && rc == 1 && rset == (1u << fds[0]);
+
+            muos_read(fds[0], &rb, 1);
+            rset = 1u << fds[0];
+            rc = muos_select(fds[0] + 1, &rset, 0, 0, 0);
+            muos_puts("poll: select-empty="); muos_putdec(rc);
+            muos_puts(" set="); muos_puthex(rset); muos_puts("\n");
+            ok = ok && rc == 0 && rset == 0;
+
+            muos_write(fds[1], &c, 1);
+            rset = 1u << fds[0];
+            rc = muos_pselect6(fds[0] + 1, &rset, 0, 0, 0, 0);
+            muos_puts("poll: pselect6="); muos_putdec(rc);
+            muos_puts(" set="); muos_puthex(rset); muos_puts("\n");
+            ok = ok && rc == 1;
+
+            pf[0].fd = fds[0]; pf[0].events = MUOS_POLLIN; pf[0].revents = 0;
+            rc = muos_ppoll(pf, 1, 0);
+            muos_puts("poll: ppoll="); muos_putdec(rc);
+            muos_puts(" revents="); muos_putdec(pf[0].revents); muos_puts("\n");
+            ok = ok && rc == 1 && (pf[0].revents & MUOS_POLLIN);
+
+            muos_read(fds[0], &rb, 1);
+
+            pf[0].fd = 99; pf[0].events = MUOS_POLLIN; pf[0].revents = 0;
+            rc = muos_poll(pf, 1, 0);
+            muos_puts("poll: invalid="); muos_putdec(rc);
+            muos_puts(" revents="); muos_putdec(pf[0].revents); muos_puts("\n");
+            ok = ok && rc == 1 && pf[0].revents == MUOS_POLLNVAL;
+
+            pf[0].fd = -1; pf[0].events = MUOS_POLLIN; pf[0].revents = 0;
+            rc = muos_poll(pf, 1, 0);
+            muos_puts("poll: negative="); muos_putdec(rc); muos_puts("\n");
+            ok = ok && rc == 0;
+
+            rc = muos_poll(0, 0, 0);
+            muos_puts("poll: nfds0="); muos_putdec(rc); muos_puts("\n");
+            ok = ok && rc == 0;
+
+            muos_close(fds[0]);
+            muos_close(fds[1]);
+        }
+
+        muos_puts(ok ? "POLL-READY-OK\n" : "POLL-READY-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "mmapfile")) {
         /* File-backed mmap, truncate (shrink/grow), chmod, fsync and rlimits. */
         int ok = 1;
