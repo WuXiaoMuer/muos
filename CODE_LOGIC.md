@@ -143,9 +143,9 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 - Linux i386 ABI:eax=调用号,ebx/ecx/edx(以及 esi/edi/ebp)传参;错误用 `-errno`。
 - 已实现(按用途分组):
   - 进程/stdio:`exit(1) exit_group(252) read(3) write(4) readv(145) writev(146) getpid(20) getppid(64) getuid/getgid/geteuid/getegid(24/47/49/50) 及其 32 位变体(199-202) getgroups(80/205)`;`pipe(42)/pipe2(331)`、`poll(168)/ppoll(309)/select(82)/_newselect(142)/pselect6(308)`;`rt_sigaction/rt_sigprocmask(174/175)` 空实现,`modify_ldt(123)` 返回 ENOSYS(由 set_thread_area 取代)
-  - 文件:`open(5) close(6) lseek(19) llseek(140) dup(41) dup2(63,含 stdio 重定向) fcntl(55/221) access(33) getcwd(183) chdir(12) unlink(10) rename(38) sendfile(187/239) chmod(15) fchmod(94) truncate(92/193) ftruncate(93/194) fsync(118) fdatasync(144) sync(36)`;`*at` 族:`openat(295) mkdirat(296) fstatat64(300) unlinkat(301) renameat(302) readlinkat(305) fchmodat(306) faccessat(307)`
+  - 文件:`open(5) close(6) lseek(19) llseek(140) dup(41) dup2(63,含 stdio 重定向) fcntl(55/221) access(33) getcwd(183) chdir(12) unlink(10) rename(38) sendfile(187/239) chmod(15) fchmod(94) chown(16)/lchown(182)/chown32(212)/lchown32(198) fchown(95/207) fchownat(298) readlink(85) truncate(92/193) ftruncate(93/194) fsync(118) fdatasync(144) sync(36)`;`*at` 族:`openat(295) mkdirat(296) fstatat64(300) unlinkat(301) renameat(302) readlinkat(305) fchmodat(306) faccessat(307)`
   - 目录/元数据:`getdents(141) getdents64(220) stat/lstat/fstat(106-108) stat64/lstat64/fstat64(195-197) statx(383) statfs/fstatfs(99/100) statfs64/fstatfs64(268/269) utimes(271) futimesat(299) utimensat(320)`
-  - 内存/其他:`brk(45) old_mmap(90) mmap2(192) munmap(91) mprotect(125) uname(122) sysinfo(116) set/get_thread_area(243/244) getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340) time(13) gettimeofday(78) clock_gettime(265/403)`
+  - 内存/其他:`brk(45) old_mmap(90) mmap2(192) munmap(91) mprotect(125) uname(122) sysinfo(116) set/get_thread_area(243/244) getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340) nanosleep(162) times(43) getrusage(77) time(13) gettimeofday(78) clock_gettime(265/403)`
   - 未知号返回 `-ENOSYS(-38)` 并在串口打印一次编号,作为 ROADMAP 阶段 4 的待办清单。
 - fd 表在 user.c 统一管理 0..10:启动时 0/1/2 是 `USER_FD_STDIN/STDOUT/STDERR`,其余条目可为 RAM FS 文件、目录、`/dev` 节点、`/proc` 快照或已关闭(FREE)。新 fd 从 3 起分配;`dup(41)` 复制任意条目,`dup2(63)` 可把文件/设备重定向到 0..2(或反向),`dd` 的 `dup2(if_fd,0)` 由此可用。
 - 路径解析 `vfs_normalize`:以进程 cwd(`user_cwd_get/set`,启动时 `/`)为基准处理绝对/相对路径、`.`、`..`(越界停在 `/`),输出规范绝对路径。命名空间:`/` 是 RAM FS(支持多级目录,路径去掉前导 `/` 后存于 fs.c),另有虚拟 `/dev`、`/proc`、`/etc`、`/bin`。
@@ -159,6 +159,7 @@ USER_SIZE = 8MB,sandbox 末端的 64KB 留给用户栈
 - `sendfile64(239)` 从 in_fd(可选用户 offset 指针)读入内核缓冲并写 out_fd,更新偏移;BusyBox 的 fd 拷贝优先用它,失败再退回 read/write。
 - `poll/select` 是**非阻塞就绪检查**:单地址空间顺序模型下睡眠会锁死整机,因此超时按已到期处理。`fd_read_ready`:文件/VFILE/目录/`/dev/null|zero` 恒真,pipe 读端看 `pipe_fill>0`,stdin/console 看 `keyboard_haschar()`;`fd_write_ready`:文件/stdio/console/null/zero 恒真,pipe 写端看缓冲区未满。`poll(168)` 逐项填 `revents`(只回填请求的 `POLLIN/POLLOUT`,坏 fd 给 `POLLNVAL`),`select/_newselect` 按 32 位 fd_set 字就地置位/清零,`pselect6/ppoll` 忽略 sigmask/timespec;`select` 的 nfds 上限 1024,`poll` 的 nfds 上限同为 1024。
 - `mmap` 是沙箱内模拟:匿名取 bump 区,文件映射把 RAM FS/`/proc` 快照按页拷入并零填充,`mmap2` 的 ebp 页号乘 4096,`MAP_FIXED` 校验页对齐与顶部 64KB 栈保留区;映射不写回,`munmap/mprotect` 为空操作。`truncate/ftruncate` 调用 `fs_truncate`(增长零填充、缩小只改 size),64 位变体在 hi 非零时返回 EFBIG;`fsync/fdatasync/sync` 因 RAM FS 已在内核内存中直接成功。
+- `nanosleep` 在无调度器时把秒/纳秒换算成 100Hz PIT tick,用 `sti; hlt; cli` 等待(整机停在该进程,中断仍可唤醒);换算全程 32 位避免 `__udivdi3`。`times(43)` 返回启动以来 tick,`getrusage(77)` 校验 who 后清空 72 字节结构,`chown` 族复用 `do_chmod`/`do_fchmod` 只校验目标存在与类型,`readlink(85)` 对非符号链接返回 EINVAL。
 - `uname` 按 Linux i386 的 6×65 字节 utsname 填充 MuOS/muos/1.2.0/i386;`unlink/rename` 真正修改 RAM FS;`utimes/futimesat/utimensat` 会写入 atime/mtime(支持 `UTIME_NOW/OMIT`),`fs_set_times` 同时刷新 ctime。
 - 时钟:CMOS RTC 读出完整年月日(处理 BCD/12h/世纪寄存器),`rtc_datetime_to_epoch` 用 civil-days 算法换算 UTC 秒;`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)` 返回真实 epoch,monotonic 时钟用 PIT ticks,亚秒精度 10ms。
 

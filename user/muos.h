@@ -73,6 +73,14 @@ int muos_pselect6(int nfds, unsigned* r, unsigned* w, unsigned* e,
                   unsigned* ts, unsigned* sig);
 int muos_ppoll(muos_pollfd_t* fds, int nfds, unsigned* ts);
 
+int  muos_nanosleep(unsigned* req /* {sec,nsec} */, unsigned* rem);
+int  muos_readlink(const char* path, char* buf, unsigned size);
+int  muos_chown(const char* path, int uid, int gid);
+int  muos_fchown(int fd, int uid, int gid);
+int  muos_fchownat(int dirfd, const char* path, int uid, int gid, int flags);
+int  muos_getrusage(int who, void* out /* 72 bytes */);
+unsigned muos_times(void* out /* 16 bytes or 0 */);
+
 void muos_puts(const char* s);
 void muos_putdec(int value);
 void muos_puthex(unsigned value);

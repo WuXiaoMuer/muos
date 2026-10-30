@@ -10,6 +10,38 @@
 多任务地基 + mmap          Ring3 用户态             基础 POSIX 语义           fork/execve              (busybox/hello)
 ```
 
+## 当前进度快照(2026-10-30)
+
+- 内核自检 **88/0**;`build/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
+- `src/syscall.c` 已定义 **111 个 Linux i386 系统调用号**,覆盖进程/stdio、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。
+- 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
+- 验证用例:`run`(内嵌 ELF)、`exec hello.elf`、`run fork`、`run pipefork`、`run execbin`、`run at`、`run mmapfile`、`run poll`、`run extra`。
+- 结构性限制:固定 8MB 单地址空间 + 顺序快照进程模型(无抢占/线程/信号投递)、无动态链接、无磁盘/网络/图形。
+
+## 后续计划(建议顺序)
+
+### P1 收尾 ABI 小缺口(低风险,继续按真实二进制驱动)
+- [ ] 目录 `rename/renameat`(源为目录时整棵子树改名)
+- [ ] fs fd 引用计数(防 `open` 后 unlink 造成悬空槽位)
+- [ ] `waitid(284)`、`clock_nanosleep(407)` 等剩余常用调用
+- [ ] `/proc/stat` 全量 CPU/内存字段,支撑 `vmstat/top`
+- [ ] `poll` 的 `POLLHUP`(pipe 写端全关)与阻塞等待语义
+
+### P2 进程模型升级(结构性)
+- [ ] 每进程页目录 + higher-half 内核(0xC0000000)
+- [ ] 抢占调度:多 Ring3 进程真正并发,`waitpid` 阻塞让出 CPU
+- [ ] `clone` 线程(`CLONE_VM/CLONE_FS/CLONE_FILES`)、每线程 TLS
+- [ ] 信号投递:`SIGKILL/SIGTERM/SIGCHLD` + `rt_sigreturn`
+
+### P3 动态链接与更大程序
+- [ ] `PT_DYN`/`PT_INTERP` 加载、`ld-linux.so.2` 所需 syscall(文件 mmap 已就绪)
+- [ ] 共享库映射、重定位、GOT/PLT
+
+### P4 平台外设
+- [ ] 磁盘(ATA/AHCI)+ 持久化文件系统
+- [ ] 网络(NE2000/RTL8139)+ socket ABI
+- [ ] 图形帧缓冲,替代 80×25 文本桌面
+
 ## 阶段 0:地基(已完成,2026-09)
 
 - [x] multiboot mmap(E820)解析,物理位图分配器边界修复
@@ -69,7 +101,8 @@
 - [x] 真实静态 i386 BusyBox 1.36.1 进入 Ring3 并运行 `echo`(i386 TLS、exit_group、uid32、ioctl、dup2、envp/auxv 栈)
 - [x] BusyBox `ls/cat` 需求集:根目录 fd + `getdents(141)/getdents64(220)`、`stat/lstat/fstat(64)`、`statx(383)`、`access(33)`、`getcwd(183)`、`writev/readv(145/146)`、`rt_sigaction(174)`、`fcntl(64)`、`llseek(140)`、`sendfile(64)`、可关闭的 stdio fd
 - [x] 扁平 VFS 文件变更:`unlink(10)`、`rename(38)`、`fs_rename`;`utimes/futimesat/utimensat` 校验路径后成功(时间戳不持久化)
-- [x] 元数据/截断/同步:`chmod(15)/fchmod(94)`、`truncate(92/193)/ftruncate(93/194)`(增长零填充、缩小改 size)、`fsync(118)/fdatasync(144)/sync(36)`;`getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340)`,`ulimit -n` 实测返回 11
+- [x] 元数据/截断/同步:`chmod(15)/fchmod(94)`、`chown(16)/lchown(182)/chown32(212)/lchown32(198)`、`fchown(95/207)/fchownat(298)`、`readlink(85)`、`truncate(92/193)/ftruncate(93/194)`(增长零填充、缩小改 size)、`fsync(118)/fdatasync(144)/sync(36)`;`getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340)`,`ulimit -n` 实测返回 11
+- [x] 睡眠/统计:`nanosleep(162)`(`sti; hlt` 等 PIT tick)、`times(43)`、`getrusage(77)`;BusyBox `sleep 0.1` 与 `chown 0 /notes.txt` 实测通过
 - [x] 文件 mmap:RAM FS 槽位与 `/proc` 快照按页拷入沙箱并零填充,`old_mmap` 字节偏移、`mmap2` 页偏移,`MAP_FIXED` 在沙箱内允许;映射是副本,`MAP_SHARED` 写回待做
 - [x] 验收:`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a` 与 20+ applet(含 `ls -l`、`wc`、`grep`、`sed`、`od`、`cp/rm/mv/touch`)全部通过;`ENOENT`/`ENOTDIR`/`EBADF` 路径也符合 Linux 行为
 - [x] 设备与虚拟文件:`/dev/null` `/dev/zero` `/dev/console` 内核态字符设备;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/etc/mtab` 只读快照

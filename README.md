@@ -109,22 +109,24 @@ muos> exec hello.elf      # 从 RAM FS 读取并运行同一个 ELF
 muos> run at              # *at 族测试:mkdirat/openat/fstatat64/renameat/unlinkat
 muos> run mmapfile        # 文件 mmap + truncate/chmod/fsync/getrlimit 测试
 muos> run poll            # poll/select/pselect6/ppoll 就绪语义测试
+muos> run extra           # nanosleep/readlink/chown/getrusage/times 测试
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```
 
-hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位。
+hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用。
 
 - 用户地址空间是固定的 8MB 沙箱 `0x08048000`(经典的 Linux i386 ET_EXEC 地址),从物理分配器整段预留并置 U/S 位;内核其余页保持 supervisor,用户无法读写内核。
 - 进入 Ring3 使用 TSS.esp0 切换内核栈;`int 0x80`(DPL3 门)按 Linux i386 ABI 分发(eax=号,ebx/ecx/edx 传参);退出/故障时恢复 `user_enter` 保存的内核上下文返回 Shell。
 - 已实现调用(按用途分组):
   - 进程/stdio:`exit(1)`、`exit_group(252)`、`fork(2)`、`vfork(190)`、`clone(120,非线程)`、`waitpid(7)`、`wait4(114)`、`execve(11)`、`pipe(42)`、`pipe2(331)`、`poll(168)`、`ppoll(309)`、`select(82)`、`_newselect(142)`、`pselect6(308)`、`kill(37,不投递)`、`getpid(20)`、`getppid(64)`、`setpgid/getpgrp/setsid/getpgid/getsid`、`read(3)`、`write(4)`、`readv(145)`、`writev(146)`、uid/gid 及其 32 位变体(24/47/49/50、199-202)、`getgroups(80/205)`;`close(6)` 可关闭 0/1/2
-  - 文件/目录:`open(5)`、`close(6)`、`lseek(19)`、`llseek(140)`、`sendfile(187/239)`、`dup(41)`、`dup2(63,含 stdio 重定向)`、`fcntl(55/221)`、`access(33)`、`getcwd(183)`、`chdir(12)`、`mkdir(39)`、`rmdir(40)`、`unlink(10)`、`rename(38)`、`chmod(15)`、`fchmod(94)`、`truncate(92/193)`、`ftruncate(93/194)`、`fsync(118)`、`fdatasync(144)`、`sync(36)`;`*at` 族 `openat(295)`、`mkdirat(296)`、`fstatat64(300)`、`unlinkat(301,含 AT_REMOVEDIR)`、`renameat(302)`、`readlinkat(305)`、`fchmodat(306)`、`faccessat(307)`
+  - 文件/目录:`open(5)`、`close(6)`、`lseek(19)`、`llseek(140)`、`sendfile(187/239)`、`dup(41)`、`dup2(63,含 stdio 重定向)`、`fcntl(55/221)`、`access(33)`、`getcwd(183)`、`chdir(12)`、`mkdir(39)`、`rmdir(40)`、`unlink(10)`、`rename(38)`、`chmod(15)`、`fchmod(94)`、`chown(16)/lchown(182)/chown32(212)/lchown32(198)`、`fchown(95/207)`、`fchownat(298)`、`truncate(92/193)`、`ftruncate(93/194)`、`fsync(118)`、`fdatasync(144)`、`sync(36)`、`readlink(85)`;`*at` 族 `openat(295)`、`mkdirat(296)`、`fstatat64(300)`、`unlinkat(301,含 AT_REMOVEDIR)`、`renameat(302)`、`readlinkat(305)`、`fchmodat(306)`、`faccessat(307)`
   - 目录/元数据:`getdents(141)`、`getdents64(220)`、`stat/lstat/fstat(106-108)`、`stat64/lstat64/fstat64(195-197)`、`statx(383)`、`statfs/fstatfs(99/100)`、`statfs64/fstatfs64(268/269)`;`utimes(271)`、`futimesat(299)`、`utimensat(320)` 校验路径后返回成功(时间戳暂未持久化)
-  - 内存/其他:`brk(45)`、`old_mmap(90)`、`mmap2(192)`、`munmap(91)`、`mprotect(125)`、`uname(122)`、`sysinfo(116)`、`set/get_thread_area(243/244)`、`modify_ldt(123,ENOSYS)`、`rt_sigaction/rt_sigprocmask(174/175,空实现)`、`getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340)`、`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)`
+  - 内存/其他:`brk(45)`、`old_mmap(90)`、`mmap2(192)`、`munmap(91)`、`mprotect(125)`、`uname(122)`、`sysinfo(116)`、`set/get_thread_area(243/244)`、`modify_ldt(123,ENOSYS)`、`rt_sigaction/rt_sigprocmask(174/175,空实现)`、`getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340)`、`nanosleep(162)`、`times(43)`、`getrusage(77)`、`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)`
   - 未知调用返回 `-ENOSYS` 并在串口记录编号,便于用真实二进制驱动后续补齐。
 - fd 表统一管理 0..10:`0/1/2` 初始为 stdin/stdout/stderr,`dup/dup2` 可把任意文件/设备 fd 重定向到 0..2(或反之);文件 fd 映射 RAM FS 槽位并维护字节偏移,目录 fd 保存绝对路径与目录项序号。
 - `mmap` 支持匿名与文件映射:匿名走沙箱 bump 区;文件映射把 RAM FS/`/proc` 快照内容按页拷入沙箱并零填充尾部,`old_mmap` 偏移按字节、`mmap2` 偏移按页;`MAP_FIXED` 在沙箱范围内允许覆盖(动态加载器可自行选址)。映射是**内存副本**,`MAP_SHARED` 写回尚未实现。
 - `poll/select` 只做**就绪检查**,不睡眠(无抢占调度时睡眠会锁死整机),超时按"已到期"处理:文件/设备恒可读写,pipe 读端仅在缓冲区有数据时 `POLLIN`、写端仅在还有空间时 `POLLOUT`,stdin/console 仅在键盘缓冲已有字符时 `POLLIN`,坏 fd 返回 `POLLNVAL`。`pselect6`/`ppoll` 忽略 sigmask 与 timespec。
+- `nanosleep` 在无调度器时用 `sti; hlt` 等 PIT tick(100Hz),整机暂停到时间到期;`times` 返回 tick 数,`getrusage` 返回全零结构,`chown/lchown/fchown/fchownat` 只校验目标(不跟踪所有权),`readlink` 对非符号链接返回 `EINVAL`。
 - `*at` 路径解析:绝对路径忽略 dirfd;相对路径在 `AT_FDCWD(-100)` 时按 cwd,在目录 fd 时拼接该 fd 的绝对路径;`fstatat64` 空路径 + `AT_EMPTY_PATH` 直接 stat dirfd,`unlinkat` 的 `AT_REMOVEDIR` 走 rmdir 语义。VFS 暂无符号链接,`readlinkat` 对已存在目标返回 `EINVAL`。
 - 路径统一规范化:支持绝对/相对路径、`.` 与 `..`(父目录越界时停在 `/`)。命名空间 = 扁平 RAM FS 根目录 + `/dev`、`/proc`、`/etc` 虚拟目录;`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`。
 - 沙箱要求物理 RAM > 128MB;ISO 路径因无 multiboot 信息回退 32MB,`run`/`exec` 会明确提示内存不足。
@@ -155,7 +157,7 @@ Built with GCC 15 + NASM
 已验证对象是 Alpine v3.20 的 **busybox-static 1.36.1-r31(i386, musl 静态)**。
 `busybox-static-1.36.1-r31.apk` 解包后的 `bin/busybox.static`。为跑通它补齐了 i386 TLS(`set_thread_area` + GDT slot 6)、`exit_group`、`set_tid_address`、uid32、`ioctl`、`dup2`、`envp`/`auxv` 初始栈,以及扁平 VFS 的 `getdents64`/`stat64`/`statx`/`writev`/`sendfile64` 等调用。
 
-已实测 applet:`ls`(含 `-l`)、`cat`、`pwd`、`id`、`uname`、`wc`、`grep`、`head`、`tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp`、`rm`、`mv`、`touch`、`free`、`df`、`dd`、`uptime`、`ps`;不存在的路径会正确返回 `ENOENT`。
+已实测 applet:`ls`(含 `-l`)、`cat`、`pwd`、`id`、`uname`、`wc`、`grep`、`head`、`tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp`、`rm`、`mv`、`touch`、`chown`、`sleep`、`free`、`df`、`dd`、`uptime`、`ps`;不存在的路径会正确返回 `ENOENT`。
 
 ```text
 muos> execmod 0 free
@@ -236,7 +238,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 88 项)。
 
-**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 顺序快照进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)**,`ls /tmp`、`cat /tmp/x` 通过。下一步:真正的 clone/线程、信号投递、抢占调度、动态链接与网络/图形。
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 顺序快照进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink**。下一步:真正的 clone/线程、信号投递、抢占调度、动态链接与网络/图形。
 
 ## 参考资源
 

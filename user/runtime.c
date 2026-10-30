@@ -192,6 +192,34 @@ int muos_ppoll(muos_pollfd_t* fds, int nfds, unsigned* ts) {
     return syscall5(309, (int)fds, nfds, (int)ts, 0, 0);
 }
 
+int muos_nanosleep(unsigned* req, unsigned* rem) {
+    return syscall2(162, (int)req, (int)rem);
+}
+
+int muos_readlink(const char* path, char* buf, unsigned size) {
+    return syscall3(85, (int)path, (int)buf, (int)size);
+}
+
+int muos_chown(const char* path, int uid, int gid) {
+    return syscall3(16, (int)path, uid, gid);
+}
+
+int muos_fchown(int fd, int uid, int gid) {
+    return syscall3(95, fd, uid, gid);
+}
+
+int muos_fchownat(int dirfd, const char* path, int uid, int gid, int flags) {
+    return syscall5(298, dirfd, (int)path, uid, gid, flags);
+}
+
+int muos_getrusage(int who, void* out) {
+    return syscall2(77, who, (int)out);
+}
+
+unsigned muos_times(void* out) {
+    return (unsigned)syscall1(43, (int)out);
+}
+
 int muos_munmap(unsigned addr, unsigned len) {
     return syscall2(91, (int)addr, (int)len);
 }

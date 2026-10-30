@@ -81,6 +81,72 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "extra")) {
+        /* nanosleep, readlink, chown family, getrusage and times. */
+        int ok = 1;
+        int rc;
+        unsigned req[2], rem[2];
+        unsigned rusage[18];
+        unsigned tms[4];
+        char rdbuf[16];
+
+        req[0] = 0; req[1] = 30000000;      /* 30ms */
+        rem[0] = 0xAAAAAAAA; rem[1] = 0xAAAAAAAA;
+        rc = muos_nanosleep(req, rem);
+        muos_puts("extra: nanosleep="); muos_putdec(rc);
+        muos_puts(" rem="); muos_putdec((int)rem[0]);
+        muos_puts("/"); muos_putdec((int)rem[1]); muos_puts("\n");
+        ok = ok && rc == 0 && rem[0] == 0 && rem[1] == 0;
+
+        req[1] = 1000000000;                /* nsec out of range */
+        rc = muos_nanosleep(req, rem);
+        muos_puts("extra: nanosleep-EINVAL="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == -22;
+
+        rc = muos_readlink("/notes.txt", rdbuf, sizeof(rdbuf));
+        muos_puts("extra: readlink="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == -22;               /* not a symlink */
+
+        rc = muos_chown("/notes.txt", 0, 0);
+        muos_puts("extra: chown="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        rc = muos_chown("/missing.txt", 0, 0);
+        muos_puts("extra: chown-ENOENT="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == -2;
+
+        int fd = muos_open("/notes.txt", 0);
+        muos_puts("extra: open="); muos_putdec(fd); muos_puts("\n");
+        ok = ok && fd >= 0;
+        if (fd >= 0) {
+            rc = muos_fchown(fd, 0, 0);
+            muos_puts("extra: fchown="); muos_putdec(rc); muos_puts("\n");
+            ok = ok && rc == 0;
+            muos_close(fd);
+        }
+
+        rc = muos_fchownat(MUOS_AT_FDCWD, "notes.txt", 0, 0, 0);
+        muos_puts("extra: fchownat="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        rc = muos_getrusage(0, rusage);
+        muos_puts("extra: getrusage="); muos_putdec(rc);
+        muos_puts(" utime="); muos_putdec((int)rusage[0]); muos_puts("\n");
+        ok = ok && rc == 0 && rusage[0] == 0;
+
+        rc = muos_getrusage(5, rusage);
+        muos_puts("extra: getrusage-EINVAL="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == -22;
+
+        unsigned ticks = muos_times(tms);
+        muos_puts("extra: times="); muos_putdec((int)ticks);
+        muos_puts(" tms0="); muos_putdec((int)tms[0]); muos_puts("\n");
+        ok = ok && ticks > 0 && tms[0] == 0;
+
+        muos_puts(ok ? "EXTRA-API-OK\n" : "EXTRA-API-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "poll")) {
         /* poll/select/pselect6/ppoll readiness on pipe read/write ends. */
         int ok = 1;

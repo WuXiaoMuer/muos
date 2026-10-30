@@ -163,6 +163,20 @@
 #define POLLNVAL  0x020
 #define SELECT_MAX_FDS 1024
 
+/* Small remaining POSIX surface: sleep, resource/times, readlink and chown. */
+#define SYS_chown       16
+#define SYS_times       43
+#define SYS_getrusage   77
+#define SYS_readlink    85
+#define SYS_fchown      95
+#define SYS_nanosleep  162
+#define SYS_lchown     182
+#define SYS_lchown32   198
+#define SYS_fchown32   207
+#define SYS_chown32    212
+#define SYS_fchownat   298
+#define RUSAGE_SIZE     72
+
 #define ERR_EPERM      1
 #define ERR_ENOENT     2
 #define ERR_ESRCH      3
@@ -2008,6 +2022,85 @@ static uint32_t do_ppoll(uint32_t fds_ptr, uint32_t nfds, uint32_t ts,
     return do_poll(fds_ptr, nfds, 0);
 }
 
+/* ---- sleep, resource stats, readlink and ownership ---- */
+
+/* There is no scheduler to put the process to sleep, so nanosleep parks the
+ * CPU on `sti; hlt` until the PIT has ticked the requested 10ms units. */
+static uint32_t do_nanosleep(uint32_t req_ptr, uint32_t rem_ptr) {
+    if (!user_ptr_ok(req_ptr, 8)) return err(ERR_EFAULT);
+    uint32_t sec, nsec;
+    memcpy(&sec, (const void*)req_ptr, 4);
+    memcpy(&nsec, (const void*)(req_ptr + 4), 4);
+    if (nsec >= 1000000000u) return err(ERR_EINVAL);
+
+    /* 100Hz PIT ticks; keep all arithmetic 32-bit (no __udivdi3 in-kernel). */
+    uint32_t ticks;
+    if (sec > 0x7FFFFFFFu / 100u) {
+        ticks = 0x7FFFFFFFu;
+    } else {
+        ticks = sec * 100u;
+        uint32_t ns_ticks = (nsec + 9999999u) / 10000000u;
+        ticks = (ticks > 0x7FFFFFFFu - ns_ticks) ? 0x7FFFFFFFu : ticks + ns_ticks;
+    }
+    uint32_t start = pit_get_ticks();
+    while ((uint32_t)(pit_get_ticks() - start) < ticks)
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+
+    if (rem_ptr) {
+        if (!user_ptr_ok(rem_ptr, 8)) return err(ERR_EFAULT);
+        memset((void*)rem_ptr, 0, 8);
+    }
+    return 0;
+}
+
+/* times(43): PIT ticks since boot; the four tms fields stay zero. */
+static uint32_t do_times(uint32_t ptr) {
+    if (ptr) {
+        if (!user_ptr_ok(ptr, 16)) return err(ERR_EFAULT);
+        memset((void*)ptr, 0, 16);
+    }
+    return pit_get_ticks();
+}
+
+static uint32_t do_getrusage(uint32_t who, uint32_t ptr) {
+    if (who != 0 && who != (uint32_t)-1 && who != (uint32_t)-2)
+        return err(ERR_EINVAL);
+    if (!user_ptr_ok(ptr, RUSAGE_SIZE)) return err(ERR_EFAULT);
+    memset((void*)ptr, 0, RUSAGE_SIZE);
+    return 0;
+}
+
+static uint32_t do_readlink(uint32_t path_ptr) {
+    char buf[128];
+    if (!copy_user_string(path_ptr, buf, sizeof(buf))) return err(ERR_EFAULT);
+    vfs_ent_t e;
+    uint32_t rc = vfs_lookup(buf, &e);
+    if ((int32_t)rc < 0) return rc;
+    return err(ERR_EINVAL);          /* no symlinks in the VFS yet */
+}
+
+/* Ownership is not tracked; chown validates the target like chmod. */
+static uint32_t do_chown(uint32_t path_ptr) {
+    return do_chmod(path_ptr, 0);
+}
+
+static uint32_t do_fchown(uint32_t fd) {
+    return do_fchmod(fd, 0);
+}
+
+static uint32_t do_fchownat(uint32_t dirfd, uint32_t path_ptr, uint32_t flags) {
+    char raw[USER_FD_PATH_MAX];
+    if (!copy_user_string(path_ptr, raw, sizeof(raw))) return err(ERR_EFAULT);
+    if (raw[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH)) return err(ERR_ENOENT);
+        return do_fchmod(dirfd, 0);
+    }
+    char buf[128];
+    uint32_t rc = at_resolve_raw((int32_t)dirfd, raw, buf, sizeof(buf));
+    if ((int32_t)rc < 0) return rc;
+    return do_chmod_buf(buf);
+}
+
 /* ---- sequential fork/wait model ----
  * Only one address space is live. fork() copies the 8MB sandbox plus fd,
  * cwd and brk state into a child snapshot; when the parent calls waitpid,
@@ -2555,6 +2648,31 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_fchmod:
             ret = do_fchmod(regs->ebx, regs->ecx);
+            break;
+        case SYS_chown:
+        case SYS_lchown:
+        case SYS_chown32:
+        case SYS_lchown32:
+            ret = do_chown(regs->ebx);
+            break;
+        case SYS_fchown:
+        case SYS_fchown32:
+            ret = do_fchown(regs->ebx);
+            break;
+        case SYS_fchownat:
+            ret = do_fchownat(regs->ebx, regs->ecx, regs->edi);
+            break;
+        case SYS_readlink:
+            ret = do_readlink(regs->ebx);
+            break;
+        case SYS_times:
+            ret = do_times(regs->ebx);
+            break;
+        case SYS_getrusage:
+            ret = do_getrusage(regs->ebx, regs->ecx);
+            break;
+        case SYS_nanosleep:
+            ret = do_nanosleep(regs->ebx, regs->ecx);
             break;
         case SYS_truncate:
             ret = do_truncate(regs->ebx, regs->ecx);
