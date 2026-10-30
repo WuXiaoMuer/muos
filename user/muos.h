@@ -93,6 +93,27 @@ int  muos_gettid(void);
  * helper); returns the thread id to the caller and 0 inside the thread. */
 int  muos_thread_start(void (*fn)(void*), void* arg, void* stack_top);
 
+/* ---- sockets (IPv4 only; values mirror Linux i386) ---- */
+#define MUOS_AF_INET      2
+#define MUOS_SOCK_STREAM  1
+#define MUOS_SOCK_DGRAM   2
+#define MUOS_SOCK_RAW     3
+#define MUOS_IPPROTO_ICMP 1
+
+typedef struct {
+    unsigned short sin_family;
+    unsigned short sin_port;    /* network byte order */
+    unsigned       sin_addr;    /* network byte order */
+    unsigned       pad[2];
+} muos_sockaddr_in_t;
+
+int muos_socket(int domain, int type, int proto);
+int muos_bind(int fd, const void* addr, int len);
+int muos_sendto(int fd, const void* buf, unsigned len, int flags,
+                const void* addr, int alen);
+int muos_recvfrom(int fd, void* buf, unsigned len, int flags,
+                  void* addr, int* alen);
+
 void muos_puts(const char* s);
 void muos_putdec(int value);
 void muos_puthex(unsigned value);

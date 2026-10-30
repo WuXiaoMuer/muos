@@ -27,6 +27,54 @@ muos_pselect6:
     ret
 
 ; ---------------------------------------------------------------------------
+; muos_sendto(int fd, const void* buf, unsigned len, int flags,
+;             const void* addr, int alen)   -> SYS_sendto (369)
+; ---------------------------------------------------------------------------
+global muos_sendto
+muos_sendto:
+    push ebp
+    push ebx
+    push esi
+    push edi
+    mov eax, 369
+    mov ebx, [esp + 20]
+    mov ecx, [esp + 24]
+    mov edx, [esp + 28]
+    mov esi, [esp + 32]
+    mov edi, [esp + 36]
+    mov ebp, [esp + 40]
+    int 0x80
+    pop edi
+    pop esi
+    pop ebx
+    pop ebp
+    ret
+
+; ---------------------------------------------------------------------------
+; muos_recvfrom(int fd, void* buf, unsigned len, int flags,
+;               void* addr, int* alen)        -> SYS_recvfrom (371)
+; ---------------------------------------------------------------------------
+global muos_recvfrom
+muos_recvfrom:
+    push ebp
+    push ebx
+    push esi
+    push edi
+    mov eax, 371
+    mov ebx, [esp + 20]
+    mov ecx, [esp + 24]
+    mov edx, [esp + 28]
+    mov esi, [esp + 32]
+    mov edi, [esp + 36]
+    mov ebp, [esp + 40]
+    int 0x80
+    pop edi
+    pop esi
+    pop ebx
+    pop ebp
+    ret
+
+; ---------------------------------------------------------------------------
 ; muos_thread_start(void* fn, void* arg, void* stack_top)
 ; clone(CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD) with a prepared
 ; child stack. The child resumes inside this same int 0x80 continuation

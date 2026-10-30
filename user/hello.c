@@ -16,6 +16,27 @@ static int arg_is(const char* s, const char* t) {
     return *s == '\0' && *t == '\0';
 }
 
+/* Internet checksum for the ICMP echo request built below. */
+static unsigned short inet_cksum(const unsigned char* p, int len) {
+    unsigned sum = 0;
+    while (len > 1) {
+        sum += ((unsigned)p[0] << 8) | p[1];
+        p += 2;
+        len -= 2;
+    }
+    if (len) sum += (unsigned)p[0] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (unsigned short)~sum;
+}
+
+/* Memory-order IPv4 address: bytes a.b.c.d on a little-endian host. */
+#define IP4(a,b,c,d) ((unsigned)(a) | ((unsigned)(b) << 8) | \
+                      ((unsigned)(c) << 16) | ((unsigned)(d) << 24))
+/* Convert a host port to the network-byte-order value stored in structs. */
+static unsigned short htons16(unsigned p) {
+    return (unsigned short)(((p << 8) & 0xFF00) | ((p >> 8) & 0xFF));
+}
+
 /* ---- PIE test state: an absolute pointer needs R_386_RELATIVE ---- */
 static const char* volatile pie_ptr = "PIE-RELOC-OK";
 static volatile int sig_count = 0;
@@ -173,6 +194,90 @@ int main(int argc, char** argv) {
             muos_close(fd);
         }
         muos_puts(ok ? "ATA-PERSIST-OK\n" : "ATA-PERSIST-BAD\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "net")) {
+        /* IPv4 socket ABI: raw ICMP echo to the QEMU gateway and a UDP DNS
+         * query to slirp's resolver (10.0.2.3). Run with
+         * `-nic user,model=rtl8139`. */
+        int ok = 1;
+        int rc;
+        unsigned char pkt[64];
+        unsigned char rbuf[256];
+        muos_sockaddr_in_t sa;
+        int alen = 16;
+
+        int s = muos_socket(MUOS_AF_INET, MUOS_SOCK_RAW, MUOS_IPPROTO_ICMP);
+        muos_puts("net: raw socket="); muos_putdec(s); muos_puts("\n");
+        ok = ok && s >= 0;
+
+        for (unsigned i = 0; i < sizeof(pkt); i++) pkt[i] = 0;
+        pkt[0] = 8;                     /* echo request */
+        pkt[4] = 0x4D; pkt[5] = 0x55;   /* id */
+        pkt[6] = 0;    pkt[7] = 1;      /* seq */
+        unsigned short ck = inet_cksum(pkt, 32);
+        pkt[2] = (unsigned char)(ck >> 8);      /* checksum is big-endian */
+        pkt[3] = (unsigned char)(ck & 0xFF);
+
+        sa.sin_family = MUOS_AF_INET;
+        sa.sin_port = 0;
+        sa.sin_addr = IP4(10,0,2,2);    /* QEMU user-net gateway */
+        sa.pad[0] = sa.pad[1] = 0;
+        rc = muos_sendto(s, pkt, 32, 0, &sa, 16);
+        muos_puts("net: icmp send="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 32;
+
+        int n = muos_recvfrom(s, rbuf, sizeof(rbuf), 0, &sa, &alen);
+        int ping_ok = (n >= 8 && rbuf[0] == 0 &&
+                       rbuf[4] == 0x4D && rbuf[5] == 0x55 &&
+                       rbuf[6] == 0 && rbuf[7] == 1);
+        muos_puts("net: icmp recv="); muos_putdec(n);
+        muos_puts(ping_ok ? " PING-OK\n" : " PING-BAD\n");
+        ok = ok && ping_ok;
+        muos_close(s);
+
+        /* DNS A query for example.com over UDP. */
+        int u = muos_socket(MUOS_AF_INET, MUOS_SOCK_DGRAM, 0);
+        muos_puts("net: udp socket="); muos_putdec(u); muos_puts("\n");
+        ok = ok && u >= 0;
+        sa.sin_family = MUOS_AF_INET;
+        sa.sin_port = htons16(12345);
+        sa.sin_addr = 0;
+        sa.pad[0] = sa.pad[1] = 0;
+        rc = muos_bind(u, &sa, 16);
+        muos_puts("net: bind="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        unsigned char q[48];
+        for (unsigned i = 0; i < sizeof(q); i++) q[i] = 0;
+        q[0] = 0x4D; q[1] = 0x55;       /* transaction id */
+        q[2] = 0x01;                    /* recursion desired */
+        q[5] = 1;                       /* QDCOUNT */
+        int qn = 12;
+        q[qn++] = 7; for (int i = 0; i < 7; i++) q[qn++] = "example"[i];
+        q[qn++] = 3; for (int i = 0; i < 3; i++) q[qn++] = "com"[i];
+        q[qn++] = 0;
+        q[qn++] = 0; q[qn++] = 1;       /* QTYPE A */
+        q[qn++] = 0; q[qn++] = 1;       /* QCLASS IN */
+
+        sa.sin_family = MUOS_AF_INET;
+        sa.sin_port = htons16(53);
+        sa.sin_addr = IP4(10,0,2,3);    /* slirp DNS */
+        rc = muos_sendto(u, q, (unsigned)qn, 0, &sa, 16);
+        muos_puts("net: dns send="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == qn;
+
+        alen = 16;
+        n = muos_recvfrom(u, rbuf, sizeof(rbuf), 0, &sa, &alen);
+        int dns_ok = (n >= 12 && rbuf[0] == 0x4D && rbuf[1] == 0x55 &&
+                      (rbuf[2] & 0x80) != 0);
+        muos_puts("net: dns recv="); muos_putdec(n);
+        muos_puts(dns_ok ? " UDP-OK\n" : " UDP-BAD\n");
+        ok = ok && dns_ok;
+        muos_close(u);
+
+        muos_puts(ok ? "NET-OK\n" : "NET-BAD\n");
         return 0;
     }
 

@@ -109,7 +109,7 @@ $CFiles = @(
     "kernel", "vga", "serial", "gdt", "idt", "isr", "pic",
     "pit", "keyboard", "mouse", "mm", "kheap", "string", "fs", "editor",
     "win7", "task", "shell", "irq", "test", "elf", "tss", "user", "syscall",
-    "rtc", "module", "proc", "pipe", "ata"
+    "rtc", "module", "proc", "pipe", "ata", "pci", "net"
 )
 
 $ObjFiles = @()
@@ -286,8 +286,8 @@ if ($Run) {
     Write-Host "      Ctrl+Alt+G = release mouse" -ForegroundColor Gray
     Write-Host ""
     if ($Iso -and (Test-Path "$PSScriptRoot\muos.iso")) {
-        & $QEMU -cdrom "$PSScriptRoot\muos.iso" -m 256M
+        & $QEMU -cdrom "$PSScriptRoot\muos.iso" -m 256M -nic user,model=rtl8139
     } else {
-        & $QEMU -kernel "$BuildDir\kernel.elf" -m 256M
+        & $QEMU -kernel "$BuildDir\kernel.elf" -m 256M -nic user,model=rtl8139
     }
 }

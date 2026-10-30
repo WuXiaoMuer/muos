@@ -21,6 +21,7 @@
 #include "proc.h"
 #include "pipe.h"
 #include "ata.h"
+#include "net.h"
 #include "task.h"
 #include "shell.h"
 #include "test.h"
@@ -144,6 +145,15 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     } else {
         vga_print("[WARN] No ATA disk on the primary bus\n");
         serial_write("[WARN] No ATA disk\n");
+    }
+
+    /* 6c. RTL8139 network card + minimal IPv4 stack */
+    if (net_init()) {
+        vga_print("[OK] Network: RTL8139, 10.0.2.15/24\n");
+        serial_write("[OK] RTL8139 network initialized\n");
+    } else {
+        vga_print("[WARN] No supported network card (RTL8139)\n");
+        serial_write("[WARN] No RTL8139 network card\n");
     }
 
     /* 7. Keyboard */

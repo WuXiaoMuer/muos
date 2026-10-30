@@ -224,6 +224,16 @@ int muos_waitid(int idtype, int id, void* infop, int options) {
     return syscall4(284, idtype, id, (int)infop, options);
 }
 
+int muos_socket(int domain, int type, int proto) {
+    return syscall3(359, domain, type, proto);
+}
+
+int muos_bind(int fd, const void* addr, int len) {
+    return syscall3(361, fd, (int)addr, len);
+}
+
+/* muos_sendto/muos_recvfrom are 6-argument calls and live in syscall6.s. */
+
 int muos_kill(int pid, int sig) {
     return syscall2(37, pid, sig);
 }

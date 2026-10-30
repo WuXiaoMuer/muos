@@ -16,6 +16,7 @@
 #include "module.h"
 #include "pipe.h"
 #include "ata.h"
+#include "net.h"
 
 /* Linux i386 syscall numbers (the ABI MuOS targets). This is the starter
  * set needed by freestanding user programs; anything else is rejected
@@ -236,6 +237,27 @@
 #define ERR_ENAMETOOLONG 36
 #define ERR_ENOSYS    38
 #define ERR_ENOTEMPTY 39
+#define ERR_EAFNOSUPPORT 97
+#define ERR_ENOTCONN 107
+
+/* ---- socket ABI ---- */
+#define SYS_socketcall  102
+#define SYS_socket      359
+#define SYS_socketpair  360
+#define SYS_bind        361
+#define SYS_connect     362
+#define SYS_listen      363
+#define SYS_accept4     364
+#define SYS_getsockopt  365
+#define SYS_setsockopt  366
+#define SYS_getsockname 367
+#define SYS_getpeername 368
+#define SYS_sendto      369
+#define SYS_sendmsg     370
+#define SYS_recvfrom    371
+#define SYS_recvmsg     372
+#define SYS_shutdown    373
+#define AF_INET          2
 
 /* open(2) flags and mmap(2) constants (Linux i386 values) */
 #define O_WRONLY    0x01
@@ -1051,9 +1073,133 @@ static uint32_t do_open(uint32_t path, uint32_t flags, uint32_t mode) {
 }
 
 static uint32_t do_close(uint32_t fd) {
+    if ((int)fd >= NET_FD_BASE && (int)fd < NET_FD_MAX) {
+        int id = (int)fd - NET_FD_BASE;
+        if (!net_socket_ok(id)) return err(ERR_EBADF);
+        net_close(id);
+        return 0;
+    }
     if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
     user_fd_close((int)fd);
     return 0;
+}
+
+/* ---- socket syscalls (IPv4 only, see net.c) ---- */
+
+static int sock_id(uint32_t fd) {
+    int f = (int)fd;
+    if (f < NET_FD_BASE || f >= NET_FD_MAX) return -1;
+    int id = f - NET_FD_BASE;
+    return net_socket_ok(id) ? id : -1;
+}
+
+/* Parse an i386 sockaddr_in. Our IP words store the four octets in memory
+ * order, which matches the little-endian u32 copied straight out of the
+ * user structure. Ports are big-endian on the wire. */
+static bool_t read_sockaddr(uint32_t addr, uint32_t len,
+                            uint32_t* ip, uint16_t* port) {
+    if (!addr || len < 16 || !user_ptr_ok(addr, 16)) return false;
+    uint16_t fam;
+    memcpy(&fam, (const void*)addr, 2);
+    if (fam != AF_INET) return false;
+    uint16_t p;
+    memcpy(&p, (const void*)(addr + 2), 2);
+    *port = (uint16_t)((p >> 8) | (p << 8));
+    memcpy(ip, (const void*)(addr + 4), 4);
+    return true;
+}
+
+static void write_sockaddr(uint32_t addr, uint32_t addrlen_ptr,
+                           uint32_t ip, uint16_t port) {
+    if (!addr || !user_ptr_ok(addr, 16)) return;
+    memset((void*)addr, 0, 16);
+    uint16_t fam = AF_INET, p = (uint16_t)((port >> 8) | (port << 8));
+    memcpy((void*)addr, &fam, 2);
+    memcpy((void*)(addr + 2), &p, 2);
+    memcpy((void*)(addr + 4), &ip, 4);
+    if (addrlen_ptr && user_ptr_ok(addrlen_ptr, 4)) {
+        uint32_t len = 16;
+        memcpy((void*)addrlen_ptr, &len, 4);
+    }
+}
+
+static uint32_t do_socket(int domain, int type, int proto) {
+    if (domain != AF_INET) return err(ERR_EAFNOSUPPORT);
+    int id = net_socket(type, proto);
+    if (id < 0) return err(id == -1 ? ERR_EMFILE : ERR_ENOSYS);
+    return (uint32_t)(id + NET_FD_BASE);
+}
+
+static uint32_t do_bind(uint32_t fd, uint32_t addr, uint32_t alen) {
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (!read_sockaddr(addr, alen, &ip, &port)) return err(ERR_EINVAL);
+    if (net_bind(id, ip, port) < 0) return err(ERR_EINVAL);
+    return 0;
+}
+
+static uint32_t do_connect(uint32_t fd, uint32_t addr, uint32_t alen) {
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (!read_sockaddr(addr, alen, &ip, &port)) return err(ERR_EINVAL);
+    if (net_connect(id, ip, port) < 0) return err(ERR_ENOTCONN);
+    return 0;
+}
+
+static uint32_t do_sendto(uint32_t fd, uint32_t buf, uint32_t len,
+                          uint32_t flags, uint32_t addr, uint32_t alen) {
+    (void)flags;
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    if (len && !user_ptr_ok(buf, len)) return err(ERR_EFAULT);
+    if (len > 1400) len = 1400;
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (addr) {
+        if (!read_sockaddr(addr, alen, &ip, &port)) return err(ERR_EINVAL);
+    }
+    int n = net_sendto(id, (const void*)buf, len, ip, port);
+    if (n < 0) return err(ERR_EAGAIN);
+    return (uint32_t)n;
+}
+
+static uint32_t do_recvfrom(uint32_t fd, uint32_t buf, uint32_t len,
+                            uint32_t flags, uint32_t addr, uint32_t alenp) {
+    (void)flags;
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    if (len && !user_ptr_ok(buf, len)) return err(ERR_EFAULT);
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    int n = net_recvfrom(id, (void*)buf, len, &ip, &port);
+    if (n == NET_EAGAIN) return err(ERR_EAGAIN);
+    if (n < 0) return err(ERR_EBADF);
+    if (addr) write_sockaddr(addr, alenp, ip, port);
+    return (uint32_t)n;
+}
+
+/* i386 socketcall(102): huge switch over the old multiplexed ABI. */
+static uint32_t do_socketcall(uint32_t call, uint32_t args) {
+    if (!args || !user_ptr_ok(args, 6 * 4)) return err(ERR_EFAULT);
+    uint32_t a[6];
+    memcpy(a, (const void*)args, 6 * 4);
+    switch (call) {
+        case 1:  return do_socket((int)a[0], (int)a[1], (int)a[2]);
+        case 2:  return do_bind(a[0], a[1], a[2]);
+        case 3:  return do_connect(a[0], a[1], a[2]);
+        case 6:  return 0;                      /* getsockname: no-op */
+        case 7:  return 0;                      /* getpeername: no-op */
+        case 9:  return do_sendto(a[0], a[1], a[2], a[3], 0, 0);
+        case 10: return do_recvfrom(a[0], a[1], a[2], a[3], 0, 0);
+        case 11: return do_sendto(a[0], a[1], a[2], a[3], a[4], a[5]);
+        case 12: return do_recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]);
+        case 13: case 14: case 15: return 0;    /* shutdown/getsockopt/setsockopt */
+        default: return err(ERR_ENOSYS);
+    }
 }
 
 /* ---- stat / dirent support for the flat RAM FS ---- */
@@ -2992,6 +3138,42 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_close:
             ret = do_close(regs->ebx);
+            break;
+        case SYS_socket:
+            ret = do_socket((int)regs->ebx, (int)regs->ecx, (int)regs->edx);
+            break;
+        case SYS_bind:
+            ret = do_bind(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_connect:
+            ret = do_connect(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_sendto:
+            ret = do_sendto(regs->ebx, regs->ecx, regs->edx,
+                            regs->esi, regs->edi, regs->ebp);
+            break;
+        case SYS_recvfrom:
+            ret = do_recvfrom(regs->ebx, regs->ecx, regs->edx,
+                              regs->esi, regs->edi, regs->ebp);
+            break;
+        case SYS_socketcall:
+            ret = do_socketcall(regs->ebx, regs->ecx);
+            break;
+        case SYS_shutdown:
+            ret = 0;
+            break;
+        case SYS_setsockopt:
+        case SYS_getsockopt:
+            ret = 0;
+            break;
+        case SYS_socketpair:
+        case SYS_listen:
+        case SYS_accept4:
+        case SYS_getsockname:
+        case SYS_getpeername:
+        case SYS_sendmsg:
+        case SYS_recvmsg:
+            ret = err(ERR_ENOSYS);
             break;
         case SYS_unlink:
             ret = do_unlink(regs->ebx);
