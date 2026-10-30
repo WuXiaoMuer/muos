@@ -1191,6 +1191,13 @@ static uint32_t do_socketcall(uint32_t call, uint32_t args) {
         case 1:  return do_socket((int)a[0], (int)a[1], (int)a[2]);
         case 2:  return do_bind(a[0], a[1], a[2]);
         case 3:  return do_connect(a[0], a[1], a[2]);
+        case 4:  return net_listen(sock_id(a[0])) < 0 ? err(ERR_EBADF) : 0;
+        case 5: {
+            int id = net_accept(sock_id(a[0]));
+            if (id == NET_EAGAIN) return err(ERR_EAGAIN);
+            if (id < 0) return err(ERR_EBADF);
+            return (uint32_t)(id + NET_FD_BASE);
+        }
         case 6:  return 0;                      /* getsockname: no-op */
         case 7:  return 0;                      /* getpeername: no-op */
         case 9:  return do_sendto(a[0], a[1], a[2], a[3], 0, 0);
@@ -3159,6 +3166,18 @@ void syscall_handler(registers_t* regs) {
         case SYS_socketcall:
             ret = do_socketcall(regs->ebx, regs->ecx);
             break;
+        case SYS_listen:
+            ret = net_listen(sock_id(regs->ebx));
+            if ((int32_t)ret < 0) ret = err(ERR_EBADF);
+            else ret = 0;
+            break;
+        case SYS_accept4: {
+            int id = net_accept(sock_id(regs->ebx));
+            if (id == NET_EAGAIN) ret = err(ERR_EAGAIN);
+            else if (id < 0) ret = err(ERR_EBADF);
+            else ret = (uint32_t)(id + NET_FD_BASE);
+            break;
+        }
         case SYS_shutdown:
             ret = 0;
             break;
@@ -3167,8 +3186,6 @@ void syscall_handler(registers_t* regs) {
             ret = 0;
             break;
         case SYS_socketpair:
-        case SYS_listen:
-        case SYS_accept4:
         case SYS_getsockname:
         case SYS_getpeername:
         case SYS_sendmsg:

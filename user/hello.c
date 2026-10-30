@@ -281,6 +281,42 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "tcp")) {
+        /* SOCK_STREAM over the local loopback against the kernel's demo
+         * echo service on 127.0.0.1:7: handshake, send, receive echo, FIN. */
+        int ok = 1;
+        muos_sockaddr_in_t sa;
+
+        int c = muos_socket(MUOS_AF_INET, MUOS_SOCK_STREAM, 0);
+        muos_puts("tcp: client="); muos_putdec(c); muos_puts("\n");
+        ok = ok && c >= 0;
+
+        sa.sin_family = MUOS_AF_INET;
+        sa.sin_port = htons16(7);
+        sa.sin_addr = IP4(127,0,0,1);
+        sa.pad[0] = sa.pad[1] = 0;
+        int rc = muos_connect(c, &sa, 16);
+        muos_puts("tcp: connect="); muos_putdec(rc); muos_puts("\n");
+        ok = ok && rc == 0;
+
+        const char msg[] = "TCP-ECHO-REQ";
+        int n = muos_send(c, msg, sizeof(msg) - 1, 0);
+        muos_puts("tcp: send="); muos_putdec(n); muos_puts("\n");
+        ok = ok && n == (int)sizeof(msg) - 1;
+
+        char rb[64];
+        int rn = muos_recv(c, rb, sizeof(rb) - 1, 0);
+        int same = (rn == (int)sizeof(msg) - 1) ? 1 : 0;
+        for (int i = 0; same && i < rn; i++) if (rb[i] != msg[i]) same = 0;
+        muos_puts("tcp: recv="); muos_putdec(rn);
+        muos_puts(same ? " echo-ok\n" : " echo-bad\n");
+        ok = ok && same;
+        muos_close(c);
+
+        muos_puts(ok ? "TCP-OK\n" : "TCP-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "pie")) {
         /* Runs from the ET_DYN image: the kernel loaded the lowest
          * segment at USER_BASE and applied its RELATIVE relocations. */

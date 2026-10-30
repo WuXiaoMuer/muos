@@ -38,7 +38,7 @@ muos/
 │   ├── proc.c       进程表、页目录切换、抢占调度、信号、阻塞等待
 │   ├── ata.c        ATA PIO 块设备(identify/read/write,28-bit LBA)
 │   ├── pci.c        PCI 配置空间访问(0xCF8/0xCFC)+ 设备查找
-│   ├── net.c        RTL8139 驱动 + ARP/IPv4/ICMP/UDP + socket 表
+│   ├── net.c        RTL8139 驱动 + ARP/IPv4/ICMP/UDP/TCP + DHCP + socket 表
 │   ├── string.c     freestanding 字符串/内存函数(标准名)
 │   ├── fs.c editor.c win7.c shell.c task.c test.c ...(fs:16×64KB)
 │   │   editor: 128×79、10KB 存盘缓冲、PgUp/PgDn;win7: z-order/鼠标/RTC
@@ -129,13 +129,14 @@ muos> run blkpoll         # 真阻塞 poll:子进程写管道唤醒 / PIT 超时
 muos> run pie             # ET_DYN(PIE) 镜像:内核 bias + R_386_RELATIVE 重定位
 muos> run dyn             # 动态链接:PT_INTERP + 共享库 libmu.so(DT_NEEDED/符号解析)
 muos> run net             # 网卡:raw ICMP echo + UDP DNS 查询(QEMU -nic user,model=rtl8139)
+muos> run tcp             # TCP 回环:三次握手 + 发送/接收回显(内核 demo echo,127.0.0.1:7)
 muos> run fsata           # MuFS 持久文件:创建/写/fsync/回读(重启后 run fsread)
 muos> run ata             # /dev/hda 写入并回读 PERSIST-DATA
 muos> disk                # ATA 型号、扇区数与 MuFS generation
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```
 
-hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用,`run p1` 验证目录改名、打开后 unlink、pipe HUP、超时等待与 `waitid`。`run sig/thread/blkpoll` 覆盖 P2 的进程模型,`run pie` 覆盖 P3 的 ET_DYN 装载,`run dyn` 覆盖 P3 的动态链接(PT_INTERP → ld-mu.so → libmu.so),`run ata` 覆盖 P4 的 ATA 块设备(配合 `build/test_ata.py` 做两次启动的持久化验证),`run net` 覆盖 P4 的网卡与 socket ABI(ICMP ping + UDP DNS)。
+hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用,`run p1` 验证目录改名、打开后 unlink、pipe HUP、超时等待与 `waitid`。`run sig/thread/blkpoll` 覆盖 P2 的进程模型,`run pie` 覆盖 P3 的 ET_DYN 装载,`run dyn` 覆盖 P3 的动态链接(PT_INTERP → ld-mu.so → libmu.so),`run ata` 覆盖 P4 的 ATA 块设备(配合 `build/test_ata.py` 做两次启动的持久化验证),`run net` 覆盖 P4 的网卡与 socket ABI(ICMP ping + UDP DNS),`run tcp` 覆盖 TCP 握手与回显。
 
 - 用户地址空间固定为 `0x08048000` 起 8MB 的**虚拟**窗口(经典 Linux i386 ET_EXEC 地址),但每个进程拥有独立 8MB 物理块和页目录:分配时仅该窗口的 PDE 32–34 指向进程块,其余 PDE 与内核页目录共享恒等映射;调度器切换 CR3 即可切换进程。窗口最后一页是内核提供的只读 sigreturn trampoline(类似 vDSO)。
 - 进入 Ring3 使用 TSS.esp0 切换内核栈;`int 0x80`(DPL3 门)按 Linux i386 ABI 分发(eax=号,ebx/ecx/edx 传参);Ring3 进程可被 IRQ0 抢占,`wait4/waitid/poll/read` 阻塞时让出 CPU;退出/故障时若无其他可运行进程则恢复 `user_enter` 保存的内核上下文返回 Shell。
@@ -150,7 +151,7 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - fd 表统一管理 0..10:`0/1/2` 初始为 stdin/stdout/stderr,`dup/dup2` 可把任意文件/设备 fd 重定向到 0..2(或反之);文件 fd 映射 RAM FS 槽位并维护字节偏移,目录 fd 保存绝对路径与目录项序号。文件槽位带引用计数:`unlink` 后数据保留到最后一个 fd 关闭,`dup/fork` 快照都会计数;目录 `rename` 会整棵子树改名(校验目标不存在、禁止移入自身)。
 - `mmap` 支持匿名与文件映射:匿名走沙箱 bump 区;文件映射把 RAM FS/`/proc` 快照内容按页拷入沙箱并零填充尾部,`old_mmap` 偏移按字节、`mmap2` 偏移按页;`MAP_FIXED` 在沙箱范围内允许覆盖(动态加载器可自行选址)。映射是**内存副本**,`MAP_SHARED` 写回尚未实现。
 - 动态链接:`PT_INTERP` 镜像由内核只映射段(不自行重定位),再把解释器 `ld-mu.so` 映射到 `0x08200000`、以 auxv 的 `AT_PHDR/AT_ENTRY/AT_BASE` 传给用户态链接器;`ld-mu.so` 按 `DT_NEEDED` 从 `/lib` 读 `.so`(SysV hash 解析符号)、应用 `R_386_RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT`,最后跳到 `AT_ENTRY`。`run dyn` 会先把内嵌的 `ld-mu.so`/`libmu.so` 写入 MuFS 再运行;解释器路径优先取 MuFS,缺失时回退到内嵌 blob。
-- 网络:`pci.c` 用 0xCF8/0xCFC 枚举并找到 RTL8139(10EC:8139),`net.c` 轮询 ISR 处理 32K RX 环与 4 个 TX 描述符;实现了 ARP 缓存/请求应答、IPv4 收发与校验和、ICMP echo 应答、UDP;地址固定为 QEMU user-net 默认的 10.0.2.15/24、网关 10.0.2.2、DNS 10.0.2.3。socket ABI 提供 `socket/bind/connect/sendto/recvfrom/shutdown`(以及旧式 `socketcall(102)`),fd 16–23 对应 8 个 socket 槽;`run net` 实测 ICMP ping 网关与 UDP DNS 查询。无 TCP/DHCP,`-nic user,model=rtl8139` 才会启用。
+- 网络:`pci.c` 用 0xCF8/0xCFC 枚举并找到 RTL8139(10EC:8139),`net.c` 轮询 ISR 处理 32K RX 环与 4 个 TX 描述符;实现了 ARP 缓存/请求应答、IPv4 收发与校验和、ICMP echo 应答、UDP、**DHCP 客户端**(DISCOVER/OFFER/REQUEST/ACK,开机自动配置 10.0.2.x,失败时回退静态 10.0.2.15)以及**最小 TCP**(SYN/SYN-ACK/ACK 握手、PSH 数据、FIN/ACK 关闭,无重传/拥塞控制)和 127.0.0.1 回环;内核内置 port 7 echo 服务用于自测。socket ABI 提供 `socket/bind/connect/listen/accept/send/recv/sendto/recvfrom/shutdown`(以及旧式 `socketcall(102)`),fd 16–23 对应 8 个 socket 槽;`run net` 实测 ICMP ping 与 UDP DNS,`run tcp` 实测握手与回显。`-nic user,model=rtl8139` 才会启用。
 - 帧缓冲:ISO 引导在实模式设置 VBE 模式(优先 800×600×32,回退 1024×768×32 / 800×600×24/16),把 PhysBasePtr/分辨率/bpp/pitch 写到 `0x6F00`;内核在开分页后用 `mm_map_page` 以恒等、uncached 方式映射显存,`vga_*` 改为维护 80×25 影子单元数组并按 8×8 字模(纵向 2 倍)渲染;桌面/编辑器不再直接写 `0xB8000`,统一走 `vga_put_cell`。`-kernel` 路径无 VBE,自动保持 VGA 文本模式。
 - `poll/select` 的**就绪检查**:文件/设备(含 `/dev/hda`)恒可读写,pipe 读端在缓冲区有数据时 `POLLIN`、无写端时 `POLLIN|POLLHUP`、写端在还有空间时 `POLLOUT`,stdin/console 仅在键盘缓冲已有字符时 `POLLIN`,坏 fd 返回 `POLLNVAL`。`poll/ppoll` 在用户进程里会真正阻塞(`PROC_WAIT_POLL`):唤醒方(pipe 写、键盘 IRQ、PIT 超时)用目标进程保存的 fd 表计算 `revents`,把结果写进它的内存并置 `eax`,再唤醒它;没有其他可运行进程时退回 `sti; hlt` 有界等待。`select/pselect6` 仍是即时扫描 + 有界等待,`pselect6/ppoll` 忽略 sigmask。
 - 阻塞 `read`:pipe 读端为空且仍有写端、stdin/console 无字符时,用户进程阻塞在 `PROC_WAIT_READ`;写端写数据或 `close`(最后一次 `pipe_writer_add`)、键盘 IRQ 会替它完成读取(直接写进它的沙箱内存并置 `eax`)。所有阻塞点都可被信号打断,返回 `-EINTR`。
@@ -272,7 +273,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 88 项)。
 
-**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)** → **MuFS 持久化文件系统(ATA 写穿 + 开机挂载)** → **动态链接:`PT_INTERP` + 用户态 `ld-mu.so`(`DT_NEEDED`/SysV hash 符号解析/共享库映射)** → **RTL8139 + ARP/IPv4/ICMP/UDP 与 socket ABI** → **VBE 线性帧缓冲文本控制台(ISO 引导 800×600×32)**。下一步:TCP/DHCP、真实 libc `.so` 兼容(见 ROADMAP P4/P3 剩余项)。
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)** → **MuFS 持久化文件系统(ATA 写穿 + 开机挂载)** → **动态链接:`PT_INTERP` + 用户态 `ld-mu.so`(`DT_NEEDED`/SysV hash 符号解析/共享库映射)** → **RTL8139 + ARP/IPv4/ICMP/UDP 与 socket ABI** → **VBE 线性帧缓冲文本控制台(ISO 引导 800×600×32)** → **DHCP 自动配置 + 最小 TCP(SOCK_STREAM)与回环**。下一步:真实 libc `.so` 兼容、TCP 重传/拥塞控制、图形 UI(见 ROADMAP)。
 
 ## 参考资源
 

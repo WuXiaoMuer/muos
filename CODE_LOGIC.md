@@ -230,9 +230,11 @@ USER_SIGTRAMP = 0x08847000
 - `pci.c`:机制 #1 配置空间读写(0xCF8 地址、0xCFC 数据),`pci_find(0x10EC,0x8139)` 扫 bus 0–7/slot 0–31,读 BAR0 得到 I/O 基址并置命令寄存器 bit0(I/O)+bit2(bus master)。
 - `net.c` 驱动:RTL8139 软复位(0x37 bit4)后读 MAC(0x00–0x05),设置 RBSTART(0x30,物理地址由 `mm_virt_to_phys` 给出)、RCR=0x100F(全接收 + 32K 环)、TCR、CAPR、CMD=0x0C(RE|TE)。**CAPR 在 RTL8139/QEMU 中比内部读指针超前 16 字节**,因此写入 `rx_capr - 0x10`(初始 0xFFF0),否则 QEMU 会判定 16 字节可用并触发 RxOverflow。接收走轮询:`ISR(0x3E) & ROK`,先写 0xFFFF 应答,再按 4 字节头部(状态/长度)读环,长度含 4 字节 CRC;发送用 4 个描述符轮转(TSAD/TSD,轮询 bit15 完成),发送缓冲与接收环都是内核静态 BSS 的物理地址。
 - 协议:ARP 缓存 4 项(请求/应答,收到请求且目标是自己时回 MAC);IPv4 20 字节头 + 校验和,按掩码判断是否经网关;ICMP echo 请求自动回 reply;UDP 无校验和。收到的报文按 socket 分发:RAW 存 IP 载荷(ICMP 消息),DGRAM 按本地端口存 UDP 载荷。
-- socket 表 8 槽:`net_socket(type,proto)`(仅 DGRAM/RAW,STREAM 返回 ENOSYS),`bind/connect/sendto/recvfrom`;`recvfrom` 在 syscall 内以 `sti; hlt; cli` 轮询约 3 秒,超时返回 `NET_EAGAIN`(-11),由 syscall 层转成 `-EAGAIN`。对端地址结构按 i386 `sockaddr_in`(family/网络序 port/4 字节 IP)解析与回填。
-- syscall:直接编号 `socket(359)/bind(361)/connect(362)/shutdown(373)/sendto(369)/recvfrom(371)`,以及旧式 `socketcall(102)`(1/2/3/9/10/11/12 等);socket fd 固定为 16–23,`close(6)` 会先识别该区间再释放 socket 槽。固定配置 10.0.2.15/24、网关 10.0.2.2、DNS 10.0.2.3(QEMU user-net 默认值)。
-- 用户侧 `hello.c net`:构造 ICMP echo(校验和按大端写入)发往 10.0.2.2,`recvfrom` 校验 type=0/id/seq;再用 UDP 向 10.0.2.3:53 发 DNS A 查询(`example.com`),校验事务号与 QR 位;输出 `PING-OK`/`UDP-OK`/`NET-OK`。
+- socket 表 8 槽:`net_socket(type,proto)` 支持 DGRAM/RAW/STREAM(其他类型 ENOSYS),`bind/connect/listen/accept/sendto/recvfrom`;`recvfrom/accept` 在 syscall 内以 `sti; hlt; cli` 轮询约 3 秒,超时返回 `NET_EAGAIN`(-11),由 syscall 层转成 `-EAGAIN`。对端地址结构按 i386 `sockaddr_in`(family/网络序 port/4 字节 IP)解析与回填。
+- syscall:直接编号 `socket(359)/bind(361)/connect(362)/shutdown(373)/sendto(369)/recvfrom(371)`,以及旧式 `socketcall(102)`(1/2/3/4/5/9/10/11/12 等);socket fd 固定为 16–23,`close(6)` 会先识别该区间再释放 socket 槽。`listen(363)/accept4(364)` 也已接入;`send/recv` 复用 `sendto/recvfrom`(无地址参数)。固定兜底配置 10.0.2.15/24、网关 10.0.2.2、DNS 10.0.2.3(QEMU user-net 默认值)。
+- DHCP:开机 `net_init` 末尾调用 `dhcp_run()`:UDP 68→67 广播(源 0.0.0.0、以太网广播、不做 ARP)`DISCOVER`,等 OFFER(解析 yiaddr/option 53/54),再发 `REQUEST`,等 ACK 后写回 `my_ip/my_mask/gateway`;任何一步失败都保留静态地址。`ip_handle` 对 UDP dport 68 调用 `dhcp_input` 而不是 socket 分发。
+- TCP(最小实现):`net_sock_t` 增加 `tcp_state/snd_nxt/rcv_nxt/echo_mode`;`net_connect` 对 STREAM 发 SYN 并等待 SYN-ACK(同步回环时状态在 send 返回前就已建立);`tcp_input` 处理 SYN→新建子连接(SYN-ACK)、ACK→ESTAB、数据段(校验 seq、按窗口存一段、回 ACK)、FIN→CLOSE_WAIT;`tcp_send_seg` 构造 20 字节头 + 伪首部校验和。SYN 到端口 7 且无监听者时创建 `echo_mode` 内核服务,收到数据立即回显,用于 `run tcp` 自测。`127.0.0.1`/本机地址在 `net_send_ip_raw` 里回环到 `ip_handle`(拷贝到独立的 `loop_frame`,避免与 `out_frame` 别名)。无重传/超时/拥塞控制。
+- 用户侧 `hello.c net` / `tcp`:net 构造 ICMP echo(校验和按大端写入)发往 10.0.2.2,`recvfrom` 校验 type=0/id/seq;再用 UDP 向 10.0.2.3:53 发 DNS A 查询,校验事务号与 QR 位。tcp 用 SOCK_STREAM 连接 127.0.0.1:7,完成后打印 `TCP-OK`。
 
 ### 7.9 VBE 线性帧缓冲(fb.c / boot_cd.s)
 
@@ -300,7 +302,7 @@ USER_SIGTRAMP = 0x08847000
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立物理块/页目录,内核已 higher-half,但用户态无地址随机化);每进程 8MB 物理块、最多 8 个进程/线程槽
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1
 3. 动态链接由自研 `ld-mu.so` 完成,只支持 SysV hash(`DT_HASH`)与自有 `.so`;`.gnu.hash`、TLS 重定位、`R_386_COPY`、符号版本化未实现,因此还不能加载真实 libc 的共享库;`MAP_SHARED` 不写回
-4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);网络仅 RTL8139 + ARP/ICMP/UDP(无 TCP/DHCP、无多网卡,地址固定 10.0.2.15);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理/日志),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区);网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + 最小 TCP(无重传/超时/拥塞控制,用户态 listen/accept 未做并发验证);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化

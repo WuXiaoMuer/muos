@@ -232,6 +232,26 @@ int muos_bind(int fd, const void* addr, int len) {
     return syscall3(361, fd, (int)addr, len);
 }
 
+int muos_listen(int fd, int backlog) {
+    return syscall2(363, fd, backlog);
+}
+
+int muos_accept(int fd) {
+    return syscall4(364, fd, 0, 0, 0);
+}
+
+int muos_connect(int fd, const void* addr, int len) {
+    return syscall3(362, fd, (int)addr, len);
+}
+
+int muos_send(int fd, const void* buf, unsigned len, int flags) {
+    return syscall5(369, fd, (int)buf, (int)len, flags, 0);
+}
+
+int muos_recv(int fd, void* buf, unsigned len, int flags) {
+    return syscall5(371, fd, (int)buf, (int)len, flags, 0);
+}
+
 /* muos_sendto/muos_recvfrom are 6-argument calls and live in syscall6.s. */
 
 int muos_kill(int pid, int sig) {

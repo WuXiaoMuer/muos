@@ -53,7 +53,28 @@ typedef struct {
     uint16_t sport;
     uint32_t plen;
     uint8_t  data[512];
+
+    /* TCP (SOCK_STREAM) state */
+    uint8_t  tcp_state;
+    int      parent;        /* listening socket that spawned us, -1 if none */
+    bool_t   echo_mode;     /* kernel demo echo service (port 7) */
+    uint32_t snd_nxt;
+    uint32_t rcv_nxt;
 } net_sock_t;
+
+#define TCP_CLOSED    0
+#define TCP_LISTEN    1
+#define TCP_SYN_SENT  2
+#define TCP_SYN_RCVD  3
+#define TCP_ESTAB     4
+#define TCP_FIN_WAIT  5
+#define TCP_CLOSE_WAIT 6
+
+#define TCP_F_FIN 0x01
+#define TCP_F_SYN 0x02
+#define TCP_F_RST 0x04
+#define TCP_F_PSH 0x08
+#define TCP_F_ACK 0x10
 
 static uint16_t io_base;
 static bool_t   present;
@@ -69,11 +90,31 @@ static uint8_t rx_buffer[RX_SIZE + 16] __attribute__((aligned(16)));
 static uint8_t tx_buffer[TX_MAX]       __attribute__((aligned(16)));
 static uint8_t rx_frame[1600]         __attribute__((aligned(4)));
 static uint8_t out_frame[1600]        __attribute__((aligned(4)));
+static uint8_t loop_frame[1600]       __attribute__((aligned(4)));
+static uint8_t tcp_seg[560]           __attribute__((aligned(4)));
+static uint8_t udp_hdr[8 + 512]       __attribute__((aligned(4)));
 
 /* ---------------- helpers ---------------- */
 
 static uint16_t be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static void put16be(uint8_t* p, uint16_t v) { p[0] = v >> 8; p[1] = v & 0xFF; }
+static uint32_t be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+static void put32be(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
+/* Implemented below; declared here because ip_handle dispatches to them. */
+static bool_t net_send_ip_raw(uint8_t proto, uint32_t dst,
+                              const uint8_t* payload, uint32_t plen);
+static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
+                         uint8_t flags, const uint8_t* data, uint32_t len);
+static void tcp_input(uint32_t src, uint32_t dst,
+                      const uint8_t* seg, uint32_t len);
+static void dhcp_input(const uint8_t* b, uint32_t len);
 
 static uint16_t net_cksum(const uint8_t* data, uint32_t len, uint32_t sum0) {
     uint32_t sum = sum0;
@@ -194,7 +235,7 @@ static void ip_handle(const uint8_t* ip, uint32_t len) {
     if (total > len) total = len;
     uint32_t dst;
     memcpy(&dst, ip + 16, 4);
-    if (dst != my_ip && dst != 0xFFFFFFFFu) return;
+    if (dst != my_ip && dst != 0xFFFFFFFFu && dst != NET_IP(127,0,0,1)) return;
 
     uint8_t proto = ip[9];
     const uint8_t* payload = ip + ihl;
@@ -249,7 +290,12 @@ static void ip_handle(const uint8_t* ip, uint32_t len) {
         if (ulen > plen) ulen = plen;
         uint32_t src;
         memcpy(&src, ip + 12, 4);
-        udp_deliver(dport, sport, src, payload + 8, ulen - 8);
+        if (dport == 68) dhcp_input(payload + 8, ulen - 8);
+        else udp_deliver(dport, sport, src, payload + 8, ulen - 8);
+    } else if (proto == 6) {                /* TCP */
+        uint32_t src;
+        memcpy(&src, ip + 12, 4);
+        tcp_input(src, dst, payload, plen);
     } else {
         uint32_t src;
         memcpy(&src, ip + 12, 4);
@@ -332,12 +378,59 @@ static bool_t arp_resolve(uint32_t ip, uint8_t* out) {
     return false;
 }
 
-/* Send one IPv4 packet carrying `payload`. dst may be off-subnet, in which
- * case the frame goes to the gateway but the IP header keeps dst. */
-static bool_t net_send_ip(uint8_t proto, uint32_t dst,
-                          const uint8_t* payload, uint32_t plen,
-                          uint16_t src_port, uint16_t dst_port) {
+static uint32_t local_ip_for(uint32_t dst) {
+    if (dst == NET_IP(127,0,0,1)) return dst;
+    if (dst == 0xFFFFFFFFu) return 0;       /* DHCP: source 0.0.0.0 */
+    return my_ip;
+}
+
+/* Build Ethernet + IPv4 around an already-formed transport payload. */
+static bool_t net_send_ip_raw(uint8_t proto, uint32_t dst,
+                              const uint8_t* payload, uint32_t plen) {
     if (!present) return false;
+
+    uint32_t tot = 20 + plen;
+    uint32_t srcip = local_ip_for(dst);
+
+    if (dst == 0xFFFFFFFFu) {
+        /* Broadcast (DHCP): Ethernet broadcast, no ARP, source 0.0.0.0. */
+        uint8_t* f = out_frame;
+        for (int i = 0; i < 6; i++) f[i] = 0xFF;
+        memcpy(f + 6, mac_addr, 6);
+        put16be(f + 12, ETH_TYPE_IP);
+        uint8_t* ip = f + 14;
+        memset(ip, 0, 20);
+        ip[0] = 0x45;
+        ip[8] = 64;
+        ip[9] = proto;
+        memcpy(ip + 12, &srcip, 4);
+        memcpy(ip + 16, &dst, 4);
+        put16be(ip + 2, (uint16_t)tot);
+        put16be(ip + 4, 0x1234);
+        put16be(ip + 10, net_cksum(ip, 20, 0));
+        if (plen) memcpy(ip + 20, payload, plen);
+        net_send_frame(f, 14 + tot);
+        return true;
+    }
+
+    if (dst == my_ip || dst == NET_IP(127,0,0,1)) {
+        /* Loopback: hand the datagram to our own receive path. Copy first
+         * because ip_handle (and the replies it sends) reuse out_frame. */
+        uint8_t* ip = loop_frame;
+        memset(ip, 0, 20);
+        ip[0] = 0x45;
+        ip[8] = 64;
+        ip[9] = proto;
+        memcpy(ip + 12, &srcip, 4);
+        memcpy(ip + 16, &dst, 4);
+        put16be(ip + 2, (uint16_t)tot);
+        put16be(ip + 4, 0x1234);
+        put16be(ip + 10, net_cksum(ip, 20, 0));
+        if (plen) memcpy(ip + 20, payload, plen);
+        ip_handle(ip, tot);
+        return true;
+    }
+
     uint8_t next_hop = ((dst & my_mask) == (my_ip & my_mask)) ? 0 : 1;
     uint32_t hop = next_hop ? gateway : dst;
     uint8_t dmac[6];
@@ -354,32 +447,292 @@ static bool_t net_send_ip(uint8_t proto, uint32_t dst,
     put16be(f + 12, ETH_TYPE_IP);
 
     uint8_t* ip = f + 14;
-    uint32_t tot = 20 + 8 * (proto == 17 ? 1 : 0) + plen;
     memset(ip, 0, 20);
     ip[0] = 0x45;
     ip[8] = 64;
     ip[9] = proto;
-    memcpy(ip + 12, &my_ip, 4);
+    memcpy(ip + 12, &srcip, 4);
     memcpy(ip + 16, &dst, 4);
     put16be(ip + 2, (uint16_t)tot);
     put16be(ip + 4, 0x1234);                /* id */
     put16be(ip + 10, net_cksum(ip, 20, 0));
-
-    const uint8_t* body;
-    if (proto == 17) {
-        uint8_t* udp = ip + 20;
-        put16be(udp + 0, src_port);
-        put16be(udp + 2, dst_port);
-        put16be(udp + 4, (uint16_t)(8 + plen));
-        put16be(udp + 6, 0);                /* checksum optional in IPv4 */
-        body = udp + 8;
-    } else {
-        body = ip + 20;
-    }
-    if (plen) memcpy((void*)body, payload, plen);
+    if (plen) memcpy((void*)(ip + 20), payload, plen);
 
     net_send_frame(f, 14 + tot);
     return true;
+}
+
+/* UDP convenience: prepend the 8-byte header, then send the IPv4 packet. */
+static bool_t net_send_ip(uint8_t proto, uint32_t dst,
+                          const uint8_t* payload, uint32_t plen,
+                          uint16_t src_port, uint16_t dst_port) {
+    if (proto != 17)                       /* raw ICMP and friends */
+        return net_send_ip_raw(proto, dst, payload, plen);
+    if (plen > 512) plen = 512;
+    put16be(udp_hdr + 0, src_port);
+    put16be(udp_hdr + 2, dst_port);
+    put16be(udp_hdr + 4, (uint16_t)(8 + plen));
+    put16be(udp_hdr + 6, 0);                /* checksum optional in IPv4 */
+    if (plen) memcpy(udp_hdr + 8, payload, plen);
+    return net_send_ip_raw(proto, dst, udp_hdr, 8 + plen);
+}
+
+/* ---------------- DHCP client ---------------- */
+
+static bool_t   dhcp_seen;
+static uint8_t  dhcp_type;
+static uint32_t dhcp_yiaddr, dhcp_server, dhcp_mask, dhcp_gw, dhcp_dns;
+
+static void dhcp_input(const uint8_t* b, uint32_t len) {
+    if (len < 240) return;
+    if (memcmp(b + 236, "\x63\x82\x53\x63", 4) != 0) return;
+    memcpy(&dhcp_yiaddr, b + 16, 4);
+    dhcp_type = 0;
+    dhcp_server = dhcp_mask = dhcp_gw = dhcp_dns = 0;
+
+    uint32_t i = 240;
+    while (i + 2 <= len) {
+        uint8_t code = b[i];
+        if (code == 0) { i++; continue; }
+        if (code == 255) break;
+        uint8_t olen = b[i + 1];
+        if (i + 2 + olen > len) break;
+        const uint8_t* v = b + i + 2;
+        if (code == 53 && olen >= 1) dhcp_type = v[0];
+        else if (code == 1 && olen >= 4) memcpy(&dhcp_mask, v, 4);
+        else if (code == 3 && olen >= 4) memcpy(&dhcp_gw, v, 4);
+        else if (code == 6 && olen >= 4) memcpy(&dhcp_dns, v, 4);
+        else if (code == 54 && olen >= 4) memcpy(&dhcp_server, v, 4);
+        i += 2 + olen;
+    }
+    dhcp_seen = true;
+}
+
+static void dhcp_build(uint8_t* p, uint8_t msgtype,
+                       uint32_t reqip, uint32_t server) {
+    memset(p, 0, 300);
+    p[0] = 1;                  /* BOOTREQUEST */
+    p[1] = 1;                  /* Ethernet */
+    p[2] = 6;                  /* hardware address length */
+    uint32_t xid = 0x4D554F53u;
+    memcpy(p + 4, &xid, 4);
+    p[10] = 0x80;              /* broadcast flag */
+    memcpy(p + 28, mac_addr, 6);
+    memcpy(p + 236, "\x63\x82\x53\x63", 4);
+
+    int i = 240;
+    p[i++] = 53; p[i++] = 1; p[i++] = msgtype;
+    if (reqip) {
+        p[i++] = 50; p[i++] = 4; memcpy(p + i, &reqip, 4); i += 4;
+    }
+    if (server) {
+        p[i++] = 54; p[i++] = 4; memcpy(p + i, &server, 4); i += 4;
+    }
+    p[i++] = 55; p[i++] = 3; p[i++] = 1; p[i++] = 3; p[i++] = 6;
+    p[i++] = 255;
+}
+
+static bool_t dhcp_run(void) {
+    uint8_t bootp[300];
+
+    dhcp_seen = false;
+    dhcp_build(bootp, 1, 0, 0);              /* DISCOVER */
+    net_send_ip(17, 0xFFFFFFFFu, bootp, 300, 68, 67);
+    for (int i = 0; i < 120000 && !dhcp_seen; i++) net_poll();
+    if (!dhcp_seen || dhcp_type != 2 || dhcp_yiaddr == 0) return false;
+
+    uint32_t offer = dhcp_yiaddr;
+    uint32_t server = dhcp_server;
+
+    dhcp_seen = false;
+    dhcp_build(bootp, 3, offer, server);     /* REQUEST */
+    net_send_ip(17, 0xFFFFFFFFu, bootp, 300, 68, 67);
+    for (int i = 0; i < 120000 && !dhcp_seen; i++) net_poll();
+    if (!dhcp_seen || dhcp_type != 5) return false;
+
+    my_ip = dhcp_yiaddr;
+    if (dhcp_mask) my_mask = dhcp_mask;
+    if (dhcp_gw) gateway = dhcp_gw;
+    return true;
+}
+
+/* ---------------- TCP (minimal client + loopback server) ---------------- */
+
+static uint16_t tcp_cksum(uint32_t src, uint32_t dst,
+                          const uint8_t* seg, uint32_t len) {
+    uint8_t ph[12];
+    memcpy(ph, &src, 4);
+    memcpy(ph + 4, &dst, 4);
+    ph[8] = 0;
+    ph[9] = 6;
+    ph[10] = (uint8_t)(len >> 8);
+    ph[11] = (uint8_t)len;
+    uint32_t sum = 0;
+    for (int i = 0; i < 12; i += 2)
+        sum += (uint16_t)((ph[i] << 8) | ph[i + 1]);
+    return net_cksum(seg, len, sum);
+}
+
+static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
+                         uint8_t flags, const uint8_t* data, uint32_t len) {
+    if (len > 512) len = 512;
+    uint8_t* t = tcp_seg;
+    put16be(t + 0, s->lport);
+    put16be(t + 2, s->rport);
+    put32be(t + 4, seq);
+    put32be(t + 8, ack);
+    t[12] = 0x50;                       /* data offset 5 words */
+    t[13] = flags;
+    put16be(t + 14, 2048);              /* window */
+    put16be(t + 16, 0);
+    put16be(t + 18, 0);
+    if (len) memcpy(t + 20, data, len);
+    put16be(t + 16, tcp_cksum(local_ip_for(s->rip), s->rip, t, 20 + len));
+    net_send_ip_raw(6, s->rip, t, 20 + len);
+}
+
+static net_sock_t* tcp_find(uint32_t dst, uint16_t sport, uint16_t dport,
+                            int* listener_id) {
+    net_sock_t* found = NULL;
+    if (listener_id) *listener_id = -1;
+    for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
+        net_sock_t* s = &socks[i];
+        if (!s->used || s->type != NET_SOCK_STREAM || s->lport != dport) continue;
+        if (s->tcp_state == TCP_LISTEN) {
+            if (listener_id) *listener_id = i;
+            continue;
+        }
+        if (s->rport == sport && s->rip == dst) found = s;
+    }
+    return found;
+}
+
+static net_sock_t* tcp_new_sock(void) {
+    for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
+        if (socks[i].used) continue;
+        memset(&socks[i], 0, sizeof(socks[i]));
+        socks[i].used = true;
+        socks[i].type = NET_SOCK_STREAM;
+        socks[i].proto = 6;
+        socks[i].parent = -1;
+        return &socks[i];
+    }
+    return NULL;
+}
+
+static void tcp_input(uint32_t src, uint32_t dst,
+                      const uint8_t* seg, uint32_t len) {
+    (void)dst;
+    if (len < 20) return;
+    uint16_t sport = be16(seg + 0);
+    uint16_t dport = be16(seg + 2);
+    uint32_t seq = be32(seg + 4);
+    uint32_t ack = be32(seg + 8);
+    uint32_t off = (uint32_t)(seg[12] >> 4) * 4;
+    if (off < 20 || off > len) return;
+    uint8_t flags = seg[13];
+    const uint8_t* data = seg + off;
+    uint32_t dlen = len - off;
+
+    int listener_id = -1;
+    net_sock_t* s = tcp_find(src, sport, dport, &listener_id);
+
+    if (!s) {
+        bool_t echo = (dport == 7);
+        if (listener_id >= 0 && (flags & TCP_F_SYN) && !(flags & TCP_F_ACK)) {
+            net_sock_t* child = tcp_new_sock();
+            if (!child) return;
+            child->lport = dport;
+            child->bound = true;
+            child->connected = true;
+            child->rip = src;
+            child->rport = sport;
+            child->parent = listener_id;
+            child->rcv_nxt = seq + 1;
+            child->snd_nxt = 0x20000000u + (uint32_t)(child - socks) * 0x1000u;
+            child->tcp_state = TCP_SYN_RCVD;
+            tcp_send_seg(child, child->snd_nxt, child->rcv_nxt,
+                         TCP_F_SYN | TCP_F_ACK, NULL, 0);
+            child->snd_nxt++;
+        } else if (echo && (flags & TCP_F_SYN) && !(flags & TCP_F_ACK)) {
+            net_sock_t* child = tcp_new_sock();
+            if (!child) return;
+            child->lport = dport;
+            child->bound = true;
+            child->connected = true;
+            child->rip = src;
+            child->rport = sport;
+            child->parent = -1;
+            child->echo_mode = true;
+            child->rcv_nxt = seq + 1;
+            child->snd_nxt = 0x30000000u + (uint32_t)(child - socks) * 0x1000u;
+            child->tcp_state = TCP_SYN_RCVD;
+            tcp_send_seg(child, child->snd_nxt, child->rcv_nxt,
+                         TCP_F_SYN | TCP_F_ACK, NULL, 0);
+            child->snd_nxt++;
+        }
+        return;
+    }
+
+    if (flags & TCP_F_RST) {
+        s->used = false;
+        return;
+    }
+
+    if (s->tcp_state == TCP_SYN_SENT && (flags & TCP_F_SYN) && (flags & TCP_F_ACK)) {
+        if (ack == s->snd_nxt) {
+            s->rcv_nxt = seq + 1;
+            s->tcp_state = TCP_ESTAB;
+            tcp_send_seg(s, s->snd_nxt, s->rcv_nxt, TCP_F_ACK, NULL, 0);
+        }
+        return;
+    }
+
+    if (s->tcp_state == TCP_SYN_RCVD && (flags & TCP_F_ACK)) {
+        if (ack == s->snd_nxt) s->tcp_state = TCP_ESTAB;
+    }
+
+    if ((s->tcp_state == TCP_ESTAB || s->tcp_state == TCP_CLOSE_WAIT) &&
+        dlen > 0) {
+        if (seq == s->rcv_nxt) {
+            if (s->echo_mode) {
+                /* Kernel demo echo service: send the bytes straight back. */
+                tcp_send_seg(s, s->snd_nxt, s->rcv_nxt,
+                             TCP_F_PSH | TCP_F_ACK, data, dlen);
+                s->snd_nxt += dlen;
+            } else if (!s->has) {
+                uint32_t n = dlen > sizeof(s->data) ? sizeof(s->data) : dlen;
+                memcpy(s->data, data, n);
+                s->plen = n;
+                s->sip = src;
+                s->sport = sport;
+                s->has = true;
+            }
+            s->rcv_nxt += dlen;
+        }
+        tcp_send_seg(s, s->snd_nxt, s->rcv_nxt, TCP_F_ACK, NULL, 0);
+    }
+
+    if ((flags & TCP_F_FIN) && seq + dlen == s->rcv_nxt) {
+        s->rcv_nxt++;
+        s->tcp_state = TCP_CLOSE_WAIT;
+        tcp_send_seg(s, s->snd_nxt, s->rcv_nxt, TCP_F_ACK, NULL, 0);
+    }
+}
+
+static int tcp_send_data(net_sock_t* s, const void* data, uint32_t len) {
+    if (s->tcp_state != TCP_ESTAB && s->tcp_state != TCP_CLOSE_WAIT) return -1;
+    uint32_t sent = 0;
+    while (sent < len) {
+        uint32_t chunk = len - sent;
+        if (chunk > 480) chunk = 480;
+        tcp_send_seg(s, s->snd_nxt, s->rcv_nxt,
+                     TCP_F_PSH | TCP_F_ACK,
+                     (const uint8_t*)data + sent, chunk);
+        s->snd_nxt += chunk;
+        sent += chunk;
+    }
+    return (int)sent;
 }
 
 /* ---------------- sockets ---------------- */
@@ -390,14 +743,18 @@ bool_t net_socket_ok(int id) {
 
 int net_socket(int type, int proto) {
     if (!present) return -1;
-    if (type != NET_SOCK_DGRAM && type != NET_SOCK_RAW) return -2;
+    if (type != NET_SOCK_DGRAM && type != NET_SOCK_RAW &&
+        type != NET_SOCK_STREAM) return -2;
     if (type == NET_SOCK_RAW && proto == 0) return -2;
     for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
         if (socks[i].used) continue;
         memset(&socks[i], 0, sizeof(socks[i]));
         socks[i].used = true;
         socks[i].type = type;
-        socks[i].proto = proto ? proto : (type == NET_SOCK_DGRAM ? 17 : 1);
+        if (proto) socks[i].proto = proto;
+        else socks[i].proto = (type == NET_SOCK_DGRAM) ? 17 :
+                              (type == NET_SOCK_STREAM) ? 6 : 1;
+        socks[i].parent = -1;
         return i;
     }
     return -1;
@@ -423,7 +780,21 @@ int net_connect(int id, uint32_t ip, uint16_t port) {
         s->lport = next_port++;
         s->bound = true;
     }
-    return 0;
+    if (s->type != NET_SOCK_STREAM) return 0;
+
+    s->tcp_state = TCP_SYN_SENT;
+    s->rcv_nxt = 0;
+    s->snd_nxt = 0x10000000u + (uint32_t)id * 0x1000u;
+    uint32_t seq = s->snd_nxt;
+    s->snd_nxt = seq + 1;            /* SYN consumes one sequence number */
+    tcp_send_seg(s, seq, 0, TCP_F_SYN, NULL, 0);
+    for (uint32_t loops = 0; loops < 100; loops++) {
+        if (s->tcp_state == TCP_ESTAB && s->used) return 0;
+        if (!s->used) return -1;
+        __asm__ volatile ("sti; hlt; cli");
+        net_poll();
+    }
+    return (s->tcp_state == TCP_ESTAB) ? 0 : -1;
 }
 
 int net_sendto(int id, const void* data, uint32_t len,
@@ -440,6 +811,8 @@ int net_sendto(int id, const void* data, uint32_t len,
     if (!dst && s->connected) { dst = s->rip; dport = s->rport; }
 
     uint8_t proto = (uint8_t)s->proto;
+    if (s->type == NET_SOCK_STREAM)
+        return tcp_send_data(s, data, len);
     if (!net_send_ip(proto, dst, (const uint8_t*)data, len,
                      s->lport, dport)) return -1;
     return (int)len;
@@ -450,6 +823,26 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
     if (!net_socket_ok(id)) return -1;
     if (!present) return -1;
     net_sock_t* s = &socks[id];
+
+    if (s->type == NET_SOCK_STREAM) {
+        for (uint32_t loops = 0; loops < 300; loops++) {   /* ~3 seconds */
+            net_poll();
+            if (s->has) {
+                uint32_t n = s->plen;
+                if (n > maxlen) n = maxlen;
+                memcpy(buf, s->data, n);
+                if (ip) *ip = s->sip;
+                if (port) *port = s->sport;
+                s->has = false;
+                s->plen = 0;
+                return (int)n;
+            }
+            if (s->tcp_state == TCP_CLOSE_WAIT) return 0;   /* EOF */
+            __asm__ volatile ("sti; hlt; cli");
+        }
+        return NET_EAGAIN;
+    }
+
     for (uint32_t loops = 0; loops < 300; loops++) {   /* ~3 seconds */
         net_poll();
         if (s->has) {
@@ -469,8 +862,44 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
 
 int net_close(int id) {
     if (!net_socket_ok(id)) return -1;
-    memset(&socks[id], 0, sizeof(socks[id]));
+    net_sock_t* s = &socks[id];
+    if (s->type == NET_SOCK_STREAM &&
+        (s->tcp_state == TCP_ESTAB || s->tcp_state == TCP_CLOSE_WAIT)) {
+        tcp_send_seg(s, s->snd_nxt, s->rcv_nxt, TCP_F_FIN | TCP_F_ACK, NULL, 0);
+        s->snd_nxt++;
+    }
+    memset(s, 0, sizeof(*s));
     return 0;
+}
+
+int net_listen(int id) {
+    if (!net_socket_ok(id)) return -1;
+    net_sock_t* s = &socks[id];
+    if (s->type != NET_SOCK_STREAM) return -1;
+    if (!s->bound) {
+        s->lport = next_port++;
+        s->bound = true;
+    }
+    s->tcp_state = TCP_LISTEN;
+    return 0;
+}
+
+int net_accept(int id) {
+    if (!net_socket_ok(id)) return -1;
+    net_sock_t* l = &socks[id];
+    if (l->type != NET_SOCK_STREAM || l->tcp_state != TCP_LISTEN) return -1;
+    for (uint32_t loops = 0; loops < 300; loops++) {   /* ~3 seconds */
+        net_poll();
+        for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
+            net_sock_t* c = &socks[i];
+            if (c->used && c->parent == id && c->tcp_state == TCP_ESTAB) {
+                c->parent = -1;
+                return i;
+            }
+        }
+        __asm__ volatile ("sti; hlt; cli");
+    }
+    return NET_EAGAIN;
 }
 
 /* ---------------- init ---------------- */
@@ -511,6 +940,12 @@ bool_t net_init(void) {
     outw(io_base + R_CAPR, 0xFFF0);            /* internal read pointer = 0 */
     outb(io_base + R_CMD, 0x0C);               /* RE|TE */
     present = true;
+
+    if (dhcp_run()) {
+        serial_write("[net] DHCP configured\n");
+    } else {
+        serial_write("[net] DHCP unavailable, using static 10.0.2.15\n");
+    }
     serial_write("[net] RTL8139 initialized\n");
     return true;
 }

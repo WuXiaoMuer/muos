@@ -38,6 +38,8 @@ uint32_t net_get_gateway(void);
 int net_socket(int type, int proto);
 int net_bind(int id, uint32_t ip, uint16_t port);
 int net_connect(int id, uint32_t ip, uint16_t port);
+int net_listen(int id);
+int net_accept(int id);
 int net_sendto(int id, const void* data, uint32_t len,
                uint32_t ip, uint16_t port);
 int net_recvfrom(int id, void* buf, uint32_t maxlen,

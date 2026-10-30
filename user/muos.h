@@ -109,6 +109,11 @@ typedef struct {
 
 int muos_socket(int domain, int type, int proto);
 int muos_bind(int fd, const void* addr, int len);
+int muos_listen(int fd, int backlog);
+int muos_accept(int fd);
+int muos_connect(int fd, const void* addr, int len);
+int muos_send(int fd, const void* buf, unsigned len, int flags);
+int muos_recv(int fd, void* buf, unsigned len, int flags);
 int muos_sendto(int fd, const void* buf, unsigned len, int flags,
                 const void* addr, int alen);
 int muos_recvfrom(int fd, void* buf, unsigned len, int flags,
