@@ -20,6 +20,31 @@
 #include "fat.h"
 #include "ext2.h"
 
+/* Mounted block-volume ids (VFS_T_EXT id / user_fd ext_vol). */
+#define VFS_VOL_FAT  1
+#define VFS_VOL_EXT2 2
+
+/* One 64KB staging buffer for writable mounted-volume files. Writes are
+ * read-modify-rewrite (FAT/ext2 drivers take whole-file images), and
+ * syscalls are not preempted, so a single buffer is safe and avoids per-fd
+ * heap ownership across fork/dup. */
+static uint8_t vfs_ext_wbuf[FS_MAX_SIZE];
+
+static int vfs_vol_write(int vol, const char* path, const void* data,
+                         uint32_t len) {
+    int r = vol == VFS_VOL_FAT
+            ? fat_write_file(path, data, len)
+            : ext2_write_file(path, data, len);
+    return r < 0 ? -1 : 0;
+}
+
+/* Defined with the virtual namespace below; do_read/do_write need them
+ * before that point. */
+static bool_t vfs_mount_prefix(const char* path, int* vol, const char** sub);
+static bool_t vfs_mount_present(int vol);
+static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
+                             uint32_t* size);
+
 /* Linux i386 syscall numbers (the ABI MuOS targets). This is the starter
  * set needed by freestanding user programs; anything else is rejected
  * with -ENOSYS and logged to serial so real binaries can drive the TODO
@@ -237,10 +262,6 @@
 #define ERR_EMFILE    24
 #define ERR_ENOSPC    28
 #define ERR_EROFS     30
-
-/* Mounted block-volume ids (VFS_T_EXT id / user_fd ext_vol). */
-#define VFS_VOL_FAT  1
-#define VFS_VOL_EXT2 2
 #define ERR_EFBIG     27
 #define ERR_ENOTTY    25
 #define ERR_ERANGE    34
@@ -342,8 +363,34 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
             return count;
         case USER_FD_VFILE:
             return err(ERR_EACCES);
-        case USER_FD_EXT:
-            return err(ERR_EROFS);     /* mounted volumes are read-only */
+        case USER_FD_EXT: {
+            int vol = 0;
+            const char* ep = NULL;
+            if (!user_fd_ext((int)fd, &vol, &ep)) return err(ERR_EBADF);
+            uint32_t off = user_fd_offset((int)fd);
+            if (off >= FS_MAX_SIZE || count > FS_MAX_SIZE - off)
+                return err(ERR_EFBIG);
+            bool_t is_dir = false;
+            uint32_t old = 0;
+            if (!vfs_mount_stat(vol, ep, &is_dir, &old) || is_dir)
+                return err(ERR_EBADF);
+            if (old > FS_MAX_SIZE) return err(ERR_EFBIG);
+
+            memset(vfs_ext_wbuf, 0, sizeof(vfs_ext_wbuf));
+            if (old) {
+                int n = vol == VFS_VOL_FAT
+                        ? fat_read_at(ep, 0, vfs_ext_wbuf, old)
+                        : ext2_read_at(ep, 0, vfs_ext_wbuf, old);
+                if (n < 0) return err(ERR_EIO);
+            }
+            memcpy(vfs_ext_wbuf + off, (const void*)buf, count);
+            uint32_t nlen = off + count;
+            if (nlen < old) nlen = old;     /* overwrite keeps the tail */
+            if (vfs_vol_write(vol, ep, vfs_ext_wbuf, nlen))
+                return err(ERR_EIO);
+            user_fd_set_offset((int)fd, off + count);
+            return count;
+        }
         case USER_FD_PIPE_WRITE: {
             int id = user_fd_pipe_id((int)fd);
             if (id < 0) return err(ERR_EBADF);
@@ -1198,7 +1245,15 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
 
         int mvol = 0;
         const char* msub = NULL;
-        if (vfs_mount_prefix(e.path, &mvol, &msub)) return err(ERR_EROFS);
+        if (vfs_mount_prefix(e.path, &mvol, &msub)) {
+            if (!vfs_mount_present(mvol)) return err(ERR_ENOENT);
+            if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
+            uint8_t empty = 0;
+            if (vfs_vol_write(mvol, msub, &empty, 0)) return err(ERR_EIO);
+            int fd = user_fd_alloc_ext(mvol, msub);
+            if (fd < 0) return err(ERR_EMFILE);
+            return (uint32_t)fd;
+        }
 
         const char* name = e.path + 1;
         if (!*name) return err(ERR_ENOTDIR);
@@ -1239,11 +1294,13 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
         }
         case VFS_T_EXT: {
             if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
-            if ((flags & O_ACCMODE) != 0 || (flags & O_TRUNC))
-                return err(ERR_EROFS);
             int vol = 0;
             const char* sub = NULL;
             if (!vfs_mount_prefix(e.path, &vol, &sub)) return err(ERR_ENOENT);
+            if ((flags & O_TRUNC) && (flags & O_ACCMODE) != 0) {
+                uint8_t empty = 0;
+                if (vfs_vol_write(vol, sub, &empty, 0)) return err(ERR_EIO);
+            }
             int fd = user_fd_alloc_ext(vol, sub);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;

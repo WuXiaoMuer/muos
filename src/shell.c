@@ -242,7 +242,7 @@ static void help_run_modes(void){
     vga_print("  pipe       pipe/pipe2\n");
     vga_print("  ata / ataread     ATA write / next-boot read\n");
     vga_print("  fsata / fsread    MuFS write / next-boot read\n");
-    vga_print("  vfs        open/read/stat/getdents on /fat or /ext2\n");
+    vga_print("  vfs        open/read/write/stat/getdents on /fat or /ext2\n");
 }
 static void help_detail(const char* q){
     if(streq(q,"run")||streq(q,"hello")){
@@ -286,7 +286,7 @@ static void cmd_help(char**a,int n){
             vga_print(d->desc);vga_putchar('\n');
         }
     }
-    vga_print("\nMounted volumes: /fat and /ext2 (read-only)\n");
+    vga_print("\nMounted volumes: /fat and /ext2 (read/write, 64KB per write)\n");
     vga_print("  ls /fat    ls /ext2    cat /fat/<file>    cat /ext2/<file>\n");
     vga_print("\nRun modes (run <mode>):\n");
     for(int i=0;run_modes[i];i++){

@@ -109,10 +109,28 @@ int main(int argc, char** argv) {
         muos_puts(" size="); muos_putdec((int)st.word[11]); muos_puts("\n");
         if (rc != 0 || st.word[11] == 0) ok = 0;
 
-        int ro = muos_open(path, MUOS_O_WRONLY);
-        muos_puts("vfs: write-open="); muos_putdec(ro); muos_puts("\n");
-        if (ro < 0) muos_puts("VFS-RO-OK\n");
-        else { muos_close(ro); ok = 0; }
+        /* Create/overwrite through the mount, then read it back. */
+        const char* wpath = (path[1] == 'f') ? "/fat/VFS.TXT" : "/ext2/vfs.txt";
+        const char wmsg[] = "VFS-WRITE-OK\n";
+        int wfd = muos_open(wpath, MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        muos_puts("vfs: write-open="); muos_putdec(wfd); muos_puts("\n");
+        if (wfd < 0) {
+            ok = 0;
+        } else {
+            int wn = muos_write(wfd, wmsg, sizeof(wmsg) - 1);
+            muos_close(wfd);
+            char rb[32];
+            int rfd = muos_open(wpath, 0);
+            int rn = rfd >= 0 ? muos_read(rfd, rb, sizeof(rb) - 1) : -1;
+            if (rfd >= 0) muos_close(rfd);
+            rb[rn > 0 ? rn : 0] = '\0';
+            muos_puts("vfs: write="); muos_putdec(wn);
+            muos_puts(" read="); muos_putdec(rn); muos_puts("\n");
+            if (wn == (int)sizeof(wmsg) - 1 && arg_is(rb, "VFS-WRITE-OK\n"))
+                muos_puts("VFS-WRITE-OK\n");
+            else
+                ok = 0;
+        }
 
         /* The mount root must enumerate through getdents64 too. */
         int dfd = muos_open("/fat", MUOS_O_DIRECTORY);

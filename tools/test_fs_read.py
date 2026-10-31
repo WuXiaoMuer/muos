@@ -48,7 +48,8 @@ def main():
                     "fatwrite /LongFileName.txt LONG-NAME-OK",
                     "fatcat /LongFileName.txt"], 4477, "fat")
     tfw = boot(fat, ["fatcat /NEW.TXT", "fatcat /HELLO.TXT",
-                     "fatcat /LongFileName.txt"], 4480, "fat2")
+                     "fatcat /LongFileName.txt", "cat /fat/VFS.TXT"],
+               4480, "fat2")
     tg = boot(gpt, ["part", "fatcat /HELLO.TXT"], 4478, "gpt")
     te = boot(ext, ["part", "ext2ls /", "ext2cat /hello.txt",
                     "ext2ls /subdir", "ext2cat /subdir/inside.txt",
@@ -56,7 +57,8 @@ def main():
                     "ext2write /new.txt EXT2-WRITE-OK", "ext2cat /new.txt",
                     "ext2write /hello.txt EXT2-OVERWRITE",
                     "ext2cat /hello.txt"], 4479, "ext2")
-    tew = boot(ext, ["ext2cat /new.txt", "ext2cat /hello.txt"], 4481, "ext2w")
+    tew = boot(ext, ["ext2cat /new.txt", "ext2cat /hello.txt",
+                     "cat /ext2/vfs.txt"], 4481, "ext2w")
 
     checks = {
         "fat part table": "[part] table ok" in tf,
@@ -83,9 +85,12 @@ def main():
         "ext2 overwrite": "EXT2-OVERWRITE" in te,
         "ext2 persist": "EXT2-WRITE-OK" in tew and "EXT2-OVERWRITE" in tew,
         "vfs fat open/read": "VFS-FAT-OK" in tf and "VFS-OK" in tf,
-        "vfs fat read-only": "VFS-RO-OK" in tf,
+        "vfs fat write": "VFS-WRITE-OK" in tf,
+        "vfs fat persist": "VFS-WRITE-OK" in tfw,
         "vfs fat getdents": "VFS-LIST-OK" in tf,
         "vfs ext2 open/read": "VFS-EXT2-OK" in te and "VFS-OK" in te,
+        "vfs ext2 write": "VFS-WRITE-OK" in te,
+        "vfs ext2 persist": "VFS-WRITE-OK" in tew,
         "vfs ext2 getdents": "VFS-LIST-OK" in te,
     }
     for k, v in checks.items():
