@@ -516,3 +516,8 @@ if ($Run) {
         & $QEMU -kernel "$BuildDir\kernel.elf" -m 256M -nic user,model=rtl8139
     }
 }
+
+# Deterministic exit code for wrappers (run.ps1/release.ps1): without this,
+# a build whose every step was "up to date" leaves $LASTEXITCODE unset, and
+# a caller's `$LASTEXITCODE -ne 0` test would mistake that for a failure.
+exit 0

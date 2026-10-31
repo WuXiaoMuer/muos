@@ -40,6 +40,7 @@ Write-Host ">>> MuOS release $ver" -ForegroundColor Cyan
 if (-not $NoBuild) {
     Write-Host ">>> Building kernel + ISO ..." -ForegroundColor Cyan
     & "$Root\build.ps1" -Iso
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "build failed" }
 }
 
 if (-not (Test-Path "$Root\muos.iso")) {

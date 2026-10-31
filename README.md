@@ -341,6 +341,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 | higher-half 内核一启动就三重故障 | e_entry 写成 0xC0100000,而装载器/CPU 关分页时跳到虚拟地址;或只映射了高半区却没保留 identity | `ENTRY(entry_phys)` 让 e_entry=0x100000;boot.s 保留 0..8MB identity 映射,再用绝对地址跳高半区;mm_init 建立全 RAM 的 0xC0000000 别名 |
 | shell 管道子进程 `mov %gs:0` Page Fault | `user_enter_regs` 把 GS 重置为 0x23,丢失 0x33 TLS 选择子 | 保存/恢复子进程 FS/GS 选择子,并按进程保存 GDT TLS base |
 | `sh -c ls` 报 `ls: not found` | BusyBox 通过 PATH 执行外部 applet,但没有 `/bin/busybox` | 虚拟 `/bin/*`、`/usr/bin/*`、`/sbin/*` 全部映射到 Multiboot module 0 |
+| 增量构建全部 “up to date” 时 `run.bat` 却报 `build failed` | `build.ps1` 没有执行任何外部命令,调用者的 `$LASTEXITCODE` 仍是 `$null`,而 `$null -ne 0` 为真 | `build.ps1` 结尾显式 `exit 0`;`run.ps1`/`release.ps1` 用 `if ($LASTEXITCODE -and $LASTEXITCODE -ne 0)` 判失败 |
 
 ## 版本
 

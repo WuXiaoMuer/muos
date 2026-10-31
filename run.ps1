@@ -36,7 +36,9 @@ function Find-Qemu {
 if (-not $NoBuild) {
     if ($Kernel) { & "$Root\build.ps1" }
     else        { & "$Root\build.ps1" -Iso }
-    if ($LASTEXITCODE -ne 0) { throw "build failed" }
+    # $LASTEXITCODE is $null when no native command ran; only a real
+    # non-zero value from build.ps1 (which ends with `exit 0`) is a failure.
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "build failed" }
 }
 
 $Qemu = Find-Qemu
