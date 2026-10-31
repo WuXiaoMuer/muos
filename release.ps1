@@ -8,7 +8,7 @@
 #   release\muos-<ver>\            staged tree (sources + muos.iso + scripts)
 #   release\muos-<ver>-win32-x86.zip
 #
-# The version is read from `#define MUOS_VERSION` in src\shell.c, so bumping
+# The version is read from `MUOS_VERSION` in include\logo.h, so bumping
 # that one line is enough to cut a new release.
 
 param(
@@ -29,7 +29,7 @@ function Find-Python {
 }
 
 $ver = "v1.3"
-$m = Select-String -Path "$Root\src\shell.c" -Pattern '#define\s+MUOS_VERSION\s+"([^"]+)"' |
+$m = Select-String -Path "$Root\include\logo.h" -Pattern '#define\s+MUOS_VERSION\s+"([^"]+)"' |
      Select-Object -First 1
 if ($m) { $ver = $m.Matches[0].Groups[1].Value }
 

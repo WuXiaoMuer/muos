@@ -6,7 +6,7 @@
 
 ```
 启动(汇编)          内核入口              硬件抽象                系统服务              用户可见
-boot.s          →   kernel.c         →   gdt/idt/isr/pic/irq  →  mm.c  kheap.c  →  shell.c(38 个命令名)
+boot.s          →   kernel.c         →   gdt/idt/isr/pic/irq  →  mm.c  kheap.c  →  shell.c(37 个命令名)
 boot_cd.s           初始化序列            pit keyboard mouse         string.c fs.c      editor.c
 isr_stubs.s                              vga serial rtc ata         task.c test.c      win7.c(桌面)
                                                                       tss/elf/proc/syscall/user → user/hello.c
@@ -277,12 +277,13 @@ USER_SIGTRAMP = 0x08847000
 
 ## 八、Shell / FS / 桌面
 
-- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;30 条命令 if/else 分发(与补全表 cmds[] 双份维护,改动时两处同步);`run [fault|pie|dyn|net]` 运行内嵌 ELF(其中 `dyn` 先写 `/lib` 再跑动态程序;`net` 走 socket 自测),`pixel` 进入像素桌面原型,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
+- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;34 条命令 if/else 分发(命令表 `cmd_docs[]` 同时驱动分组 help、`help <cmd>` 详情与 Tab 补全;未知命令给出提示);`run [mode]` 运行内嵌 ELF(模式覆盖 fault/pie/dyn/tls/net/tcp/perm/fork/sched/thread/blkpoll/sig/poll/mmapfile/at/pipe/ata 等,`dyn` 先写 `/lib` 再跑动态程序),`desktop` 进入文本桌面、`pixel` 进入像素窗口管理器,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
 - **fs.c**:16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。文件槽位带 `refs` 与 `deleted` 标志:unlink 时若仍有 fd 打开则清空名字但保留数据,最后一个 `fs_unref` 才释放槽位;`fs_rename_dir` 整棵子树改名(先校验全部新名字长度、拒绝目标已存在/移入自身)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
 - **MuFS 持久化(同一文件底部)**:磁盘布局 = 扇区 0 超级块(`MUFS` 魔数/版本/generation)、扇区 2–5 文件元数据表(16×88B)、扇区 6–8 目录元数据表(16×68B)、扇区 16 起 16 个 64KB 数据槽。`fs_persist_mount()` 在 `fs_init` 后调用:魔数/版本/槽参数匹配则读入命名空间与文件体,否则格式化为空;之后每个变更点(`create/write(_at)/truncate/delete/rename*/mkdir/rmdir/set_times/unref 释放`)调用 `persist_meta()` 并只写涉及的数据扇区(`persist_slot/persist_slot_range`)。`persist_meta()` 现在是写前日志提交:先把 meta/dir 副本写到扇区 10–12/13–15,再写扇区 9 的日志头(`MULJ` + generation),然后写真实元数据(扇区 2–4/6–8),最后清零日志头。`fs_persist_mount()` 在读取真实表之前先检查扇区 9:若日志头有效,就把副本重放回真实位置并清头,避免掉电时只写了一半的元数据。`fs_sync()` 递增 generation、重写超级块 + 全部元数据 + 全部已用槽;`fsync(118)/sync(36)` 调用它。无盘时 `persist_active=false`,全部是内存操作。槽位在最后一个 fd 关闭(`fs_unref`)且已删除时立即回收。
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
-- **win7.c**:文本模式 Win7 风格桌面——行 0 标题、1..23 桌面、24 任务栏;窗口按 z-order 绘制(活动窗口最后),鼠标点击/标题栏拖拽/最小化/最大化/关闭,开始菜单鼠标/键盘双操作,桌面图标可见;任务栏显示实时内存与 CMOS RTC `HH:MM:SS`。`gui`/`win7`/`desktop` 命令共用此实现;`run` 之外的 Text Editor/Calculator 可从菜单或图标启动(Calculator 聚焦时直接吃数字/运算符)。
+- **win7.c**:文本模式 Win7 风格桌面——行 0 标题、1..23 桌面、24 任务栏;窗口按 z-order 绘制(活动窗口最后),鼠标点击/标题栏拖拽/最小化/最大化/关闭,开始菜单鼠标/键盘双操作,桌面图标可见;任务栏显示实时内存与 CMOS RTC `HH:MM:SS`。`desktop`/`gui` 命令共用此实现;`run` 之外的 Text Editor/Calculator 可从菜单或图标启动(Calculator 聚焦时直接吃数字/运算符)。
 - **mouse.c + rtc.c**:PS/2 鼠标初始化(0xA8/命令字节/0xF6/0xF4)与 3 字节包解析(9 位 dx/dy、溢出位、按键),映射为 80×25 文本单元;`rtc_read_time` 处理 UIP、BCD/12 小时制,失败时任务栏回退 `UP:MM`。
+- **logo.c**:ASCII 立体字标(`muos_logo[]`,仅 0x20–0x7E,兼容 VGA 文本与 VBE 的 8×8 字模)。`logo_print_3d(row,col)` 先画右移 2 列、下移 1 行的深灰投影,再按行用白→青→蓝渐变覆盖字面;`logo_show()` 清屏并绘制 44×12 边框面板、版本/ABI 标语与操作提示,启动 shell 与 `logo` 命令共用,`MUOS_VERSION` 也在这里定义(win7 About 窗口用同一套字标)。
 - **vga.c**:维护 80×25 影子 `cells[]`;文本模式同步写 `0xB8000`,VBE 模式下改由 `fb.c` 逐单元渲染;`vga_hide_cursor/show_cursor` 用 CRTC start/end 保存/恢复 BIOS 光标形状(仅文本模式),桌面与编辑器绘制自己的光标。
 
 ## 九、构建系统

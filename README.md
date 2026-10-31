@@ -12,7 +12,7 @@
 - **分区与真实文件系统**:`part.c` 解析 MBR 与 GPT(保护性 MBR → GPT 表项,过滤 Basic Data GUID),`fat.c` 读取 FAT32(8.3 + VFAT 长名、簇链、子目录)并可创建/覆盖文件(8.3 或自动生成 `NAME~1` 别名 + LFN 项;分配/释放簇链、双 FAT 写穿),`ext2.c` 读取 ext2(超级块/组描述符/12 直接块 + 一级间接);检测到分区表时 MuFS 不再格式化该盘;MuFS 元数据提交带写前日志(扇区 9–15,挂载时重放未完成提交)。`tools/test_fs_read.py` 用生成的 MBR/GPT FAT32 与 ext2 镜像验证 `part/fatls/fatcat/fatwrite/ext2ls/ext2cat`,并二次启动验证写入持久化
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
-- **"MuOS 7" 桌面**:文本模式 Win7 风格 GUI(任务栏、开始菜单、窗口 z-order、Calculator)
+- **MuOS v1.3 桌面(`desktop`/`gui`)**:文本模式 Win7 风格 GUI(任务栏、开始菜单、窗口 z-order、Calculator),启动 logo 为立体 ASCII 字标
 - **像素窗口管理器(`pixel`,ISO/VBE)**:每个窗口独立 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`),鼠标拖动标题栏/点击关闭/聚焦置顶、键盘输入到焦点窗口;文字用 8×8 字模纵向 2 倍渲染成 8×16;ESC 返回文本 shell
 - **安全与电源**:SMEP(CPUID 可用时置 CR4 bit20)、弱 ASLR(栈顶 0..7 页随机 + `AT_RANDOM` 驱动库加载基址随机)、**uid/gid 凭据与文件权限**(MuFS 元数据保存 owner/mode,open/access 按 rwx 位检查、root 绕过读写)、ACPI FADT 定位与 S5 关机(`poweroff`) / 8042 复位(`reboot`);`run perm` 实测非 root 子进程读 0600 被拒、读 0644 成功
 - **88 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
@@ -256,7 +256,7 @@ hello.elf
 notes.txt
 readme.txt
 muos> execmod 0 cat /notes.txt
-MuOS 7 - x86 Microkernel
+MuOS v1.3 - x86 Microkernel
 Built with GCC 15 + NASM
 ```
 
@@ -344,7 +344,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 ## 版本
 
-当前 **v1.3**(2026-10-31):在 v1.2 的 Ring3/TSS/`int 0x80`/ELF32 加载器与 RAM FS 基础上,已加入 **higher-half 内核(0xC0100000)**、每进程页目录 + 抢占调度、**页级 COW fork** 与可配置沙箱(`-SandboxMB`)、信号与 `clone` 线程、**ATA PIO + MuFS 持久化(元数据日志)**、MBR/GPT + **FAT32 读写(含长名创建)** 与 ext2 只读、**PT_INTERP 动态链接 + 静态 TLS + 符号版本化**、RTL8139 + ARP/ICMP/UDP/DHCP + **TCP 8 段发送队列/退避/拥塞窗口**、**uid/gid 与文件权限检查**、SMEP + 弱 ASLR、**ACPI 关机/重启**、**VBE 帧缓冲 + 8×16 字体 + 合成器窗口管理器(`pixel`)**。v1.3 同时把 Shell 帮助重写为分组命令表(`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示),并提供批处理启动模式与 `release.bat` 打包。
+当前 **v1.3**(2026-10-31):在 v1.2 的 Ring3/TSS/`int 0x80`/ELF32 加载器与 RAM FS 基础上,已加入 **higher-half 内核(0xC0100000)**、每进程页目录 + 抢占调度、**页级 COW fork** 与可配置沙箱(`-SandboxMB`)、信号与 `clone` 线程、**ATA PIO + MuFS 持久化(元数据日志)**、MBR/GPT + **FAT32 读写(含长名创建)** 与 ext2 只读、**PT_INTERP 动态链接 + 静态 TLS + 符号版本化**、RTL8139 + ARP/ICMP/UDP/DHCP + **TCP 8 段发送队列/退避/拥塞窗口**、**uid/gid 与文件权限检查**、SMEP + 弱 ASLR、**ACPI 关机/重启**、**VBE 帧缓冲 + 8×16 字体 + 合成器窗口管理器(`pixel`)**。v1.3 同时把 Shell 帮助重写为分组命令表(`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示),启动/`logo` 界面升级为带边框、渐变与投影的立体 MuOS 字标,桌面命令统一为 `desktop`(保留 `gui` 别名),并提供批处理启动模式与 `release.bat` 打包。
 
 **v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)** → **MuFS 持久化文件系统(ATA 写穿 + 开机挂载)** → **动态链接:`PT_INTERP` + 用户态 `ld-mu.so`(`DT_NEEDED`/SysV hash 符号解析/共享库映射)** → **RTL8139 + ARP/IPv4/ICMP/UDP 与 socket ABI** → **VBE 线性帧缓冲文本控制台(ISO 引导 800×600×32)** → **DHCP 自动配置 + 最小 TCP(SOCK_STREAM)与回环** → **`.gnu.hash`/`R_386_COPY` 支持 + 像素桌面原型(`pixel`)**。
 

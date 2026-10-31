@@ -29,8 +29,6 @@
 #define HIST_LEN  128
 #define MAX_ARGS  16
 
-#define MUOS_VERSION "v1.3"
-
 /* ── Line Editor State ───────────────── */
 static char cmd_buf[CMD_MAX];
 static int  cmd_pos, cmd_len;
@@ -106,7 +104,7 @@ static const cmd_doc_t cmd_docs[] = {
     {"ext2ls","","","[p]","list ext2 root (read-only)",G_DISK},
     {"ext2cat","","","<file>","print an ext2 file",G_DISK},
     /* graphics */
-    {"gui","win7","desktop","","Win7-style text-mode desktop",G_GFX},
+    {"desktop","gui","","","text-mode desktop (windows, menu, calc)",G_GFX},
     {"pixel","","","","compositing WM (VBE, ISO boot only)",G_GFX},
     {NULL,NULL,NULL,NULL,NULL,0}
 };
@@ -494,16 +492,7 @@ static void cmd_time(void){uint32_t s=pit_get_ticks()/100;
     vga_print(" (");vga_print_dec(pit_get_ticks());vga_print("t)\n");
 }
 static void cmd_ps(void){task_t*t=task_get_current();if(t){vga_print(t->name);vga_print(" pid=");vga_print_dec(t->pid);vga_putchar('\n');}task_list();}
-static void cmd_logo(void){
-    vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));
-    vga_print("\n");
-    for (int i = 0; i < 5; i++) {
-        vga_print(muos_logo[i]);
-        vga_putchar('\n');
-    }
-    vga_print("\n");
-    vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
-}
+static void cmd_logo(void){ logo_show(); }
 static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS " MUOS_VERSION " (Ring3 + Linux ABI)\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
 static void cmd_reboot(void){
     vga_print("Reboot...\n");
@@ -590,8 +579,7 @@ static void execute(void){
     else if(streq(cmd,"ps"))cmd_ps();
     else if(streq(cmd,"logo"))cmd_logo();
     else if(streq(cmd,"version"))cmd_version();
-    else if(streq(cmd,"gui")||streq(cmd,"desktop"))win7_run();
-    else if(streq(cmd,"win7"))win7_run();
+    else if(streq(cmd,"desktop")||streq(cmd,"gui"))win7_run();
     else if(streq(cmd,"pixel"))wm_run();
     else if(streq(cmd,"reboot")){ vga_print("Reboot (ACPI)...\n"); serial_write("[shell] acpi reboot\n"); acpi_reboot(); }
     else if(streq(cmd,"poweroff"))cmd_poweroff();
@@ -632,10 +620,17 @@ void shell_run(void){
     /* Seed the demo files only on a fresh namespace so that edits made on
      * a persistent MuFS survive the next boot. */
     if (fs_count() == 0) {
+        const char* readme =
+            "Welcome to MuOS " MUOS_VERSION "!\n"
+            "Type 'help' for commands.\n"
+            "Type 'desktop' for the GUI.\n";
+        const char* notes =
+            "MuOS " MUOS_VERSION " - x86 Microkernel\n"
+            "Built with GCC 15 + NASM\n";
         fs_create("readme.txt");
-        fs_write(fs_open("readme.txt"), "Welcome to MuOS 7!\nType 'help' for commands.\nType 'win7' for desktop.", 69);
+        fs_write(fs_open("readme.txt"), readme, (uint32_t)strlen(readme));
         fs_create("notes.txt");
-        fs_write(fs_open("notes.txt"), "MuOS 7 - x86 Microkernel\nBuilt with GCC 15 + NASM", 49);
+        fs_write(fs_open("notes.txt"), notes, (uint32_t)strlen(notes));
     }
 
     /* Seed the RAM FS with the embedded Ring3 ELF so `exec hello.elf`
@@ -649,17 +644,6 @@ void shell_run(void){
         fs_write(elf_slot, (const char*)elf, elf_size);
     }
 
-    vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
-    vga_print("\n");
-    for (int i = 0; i < 5; i++) {
-        vga_print(muos_logo[i]);
-        vga_putchar('\n');
-    }
-    vga_print("\n");
-    vga_setcolor(vga_entry_color(VGA_YELLOW, VGA_BLACK));
-    vga_print("  MuOS " MUOS_VERSION " (Ring3 + Linux ABI)  |  ");
-    vga_print(__DATE__);
-    vga_print("\n  Type 'help' (Tab completes, 'help <cmd>' for details)\n\n");
-    vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+    logo_show();
     for(;;){readline();execute();}
 }

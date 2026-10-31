@@ -16,6 +16,7 @@
 #include "mm.h"
 #include "font8x8.h"
 #include "string.h"
+#include "logo.h"
 
 #define WIN_COUNT 3
 #define WIN_W     380
@@ -269,7 +270,7 @@ void wm_run(void) {
     wins[0].tlen = 0;
     { const char* s = "Terminal\nType here with the keyboard.\nESC leaves the window manager.\n";
       for (int i = 0; s[i] && i < TEXT_MAX; i++) { wins[0].text[i] = s[i]; wins[0].tlen++; } }
-    { const char* s = "System\nMuOS 7 window manager\n- per-window back buffers\n- compositor + double buffer\n- mouse drag / focus / close\n";
+    { const char* s = "System\nMuOS " MUOS_VERSION " window manager\n- per-window back buffers\n- compositor + double buffer\n- mouse drag / focus / close\n";
       wins[1].tlen = 0;
       for (int i = 0; s[i] && i < TEXT_MAX; i++) { wins[1].text[i] = s[i]; wins[1].tlen++; } }
     wins[2].tlen = 0;

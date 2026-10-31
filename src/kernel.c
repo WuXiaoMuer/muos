@@ -31,6 +31,7 @@
 #include "shell.h"
 #include "test.h"
 #include "string.h"
+#include "logo.h"
 
 /* Linker symbol - end of kernel image */
 extern uint32_t _kernel_end;
@@ -218,7 +219,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
 
     /* Boot animation */
     vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
-    vga_print("\n  Starting MuOS 7");
+    vga_print("\n  Starting MuOS " MUOS_VERSION);
     for (int i = 0; i < 6; i++) {
         for (volatile int d = 0; d < 2000000; d++) __asm__ volatile("nop");
         vga_putchar('.');

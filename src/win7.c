@@ -1,4 +1,4 @@
-/* win7.c - MuOS 7 Desktop (Windows 7 style text-mode GUI)
+/* win7.c - MuOS v1.3 Desktop (Windows 7 style text-mode GUI)
  *
  * Layout: row 0 = title bar, rows 1..23 = desktop, row 24 = taskbar.
  * Windows are drawn in z-order (active window last), then taskbar, then
@@ -190,7 +190,7 @@ static void draw_desktop(void) {
         fd(y, 0, SCR_W - 1, CLR_DESKTOP, ' ');
 
     fd(0, 0, SCR_W - 1, CLR_TASKBAR, ' ');
-    ft(3, 0, "MuOS 7  -  x86 Microkernel Desktop", CLR_TASKBAR);
+    ft(3, 0, "MuOS " MUOS_VERSION "  -  x86 Microkernel Desktop", CLR_TASKBAR);
 
     /* Desktop icons live left of the initial windows. Start at row 14:
      * the Terminal window's bottom shadow occupies row 13. */
@@ -203,7 +203,7 @@ static void draw_desktop(void) {
     ft(2, 19, "[6] Calculator", vga_entry_color(VGA_LIGHT_RED, VGA_DARK_GREY));
     ft(2, 20, "[7] About",      vga_entry_color(VGA_WHITE, VGA_DARK_GREY));
 
-    ft(2, 21, "MuOS 7 Ultimate", vga_entry_color(VGA_LIGHT_BLUE, VGA_DARK_GREY));
+    ft(2, 21, "MuOS " MUOS_VERSION, vga_entry_color(VGA_LIGHT_BLUE, VGA_DARK_GREY));
     ft(2, 22, "F1-F7 windows | ESC shell", vga_entry_color(VGA_LIGHT_GREY, VGA_DARK_GREY));
 }
 
@@ -262,7 +262,8 @@ static void draw_content(Win* w) {
         ft(wx + 2, wy + 5, "tasks time ps logo", vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
         ft(wx + 2, wy + 6, "touch ls cat rm write", vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
         ft(wx + 2, wy + 7, "run exec fault edit", vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
-        ft(wx + 2, wy + 8, "calc version gui", vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+        ft(wx + 2, wy + 8, "calc version desktop", vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+        ft(wx + 2, wy + 9, "part fatls pixel", vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
         break;
 
     case 2: /* Computer / System info */
@@ -271,7 +272,7 @@ static void draw_content(Win* w) {
           uint32_t us_mb  = tot_mb - fr_mb;
           char b[16];
           ft(wx + 2, wy + 1, "=== System Information ===", vga_entry_color(VGA_GREEN, VGA_BLACK));
-          ft(wx + 2, wy + 2, "OS:     MuOS 7 Ultimate", vga_entry_color(VGA_GREEN, VGA_BLACK));
+          ft(wx + 2, wy + 2, "OS:     MuOS " MUOS_VERSION, vga_entry_color(VGA_GREEN, VGA_BLACK));
           ft(wx + 2, wy + 3, "Arch:   x86 32-bit", vga_entry_color(VGA_GREEN, VGA_BLACK));
           ft(wx + 2, wy + 4, "RAM:    ", vga_entry_color(VGA_GREEN, VGA_BLACK));
           u32_to_dec(b, tot_mb);
@@ -320,7 +321,7 @@ static void draw_content(Win* w) {
         } break;
 
     case 4: /* Help */
-        ft(wx + 2, wy + 1, "    MuOS 7 Help", vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
+        ft(wx + 2, wy + 1, "    MuOS " MUOS_VERSION " Help", vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
         ft(wx + 2, wy + 2, "Mouse   Click / drag / X", vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
         ft(wx + 2, wy + 3, "TAB     Switch window", vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
         ft(wx + 2, wy + 4, "W/S     Minimize/Restore", vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
@@ -331,13 +332,21 @@ static void draw_content(Win* w) {
         ft(wx + 2, wy + 9, "F1-F7   Open window", vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
         break;
 
-    case 5: /* About / Logo */
-        for (int i = 0; i < 5; i++)
-            ft(wx + 2, wy + 1 + i, muos_logo[i], vga_entry_color(VGA_WHITE, VGA_BLUE));
-        ft(wx + 2, wy + 7, "MuOS 7 Ultimate Edition", vga_entry_color(VGA_LIGHT_CYAN, VGA_BLUE));
-        ft(wx + 2, wy + 8, "x86 32-bit Microkernel", vga_entry_color(VGA_LIGHT_GREY, VGA_BLUE));
-        ft(wx + 2, wy + 9, "Built: " __DATE__, vga_entry_color(VGA_LIGHT_GREY, VGA_BLUE));
+    case 5: { /* About / Logo: extruded wordmark */
+        static const enum vga_color grad[LOGO_ROWS] = {
+            VGA_WHITE, VGA_LIGHT_CYAN, VGA_LIGHT_CYAN, VGA_CYAN, VGA_LIGHT_BLUE
+        };
+        for (int i = 0; i < LOGO_ROWS; i++)
+            ft(wx + 5, wy + 2 + i, muos_logo[i],
+               vga_entry_color(VGA_BLACK, VGA_BLUE));
+        for (int i = 0; i < LOGO_ROWS; i++)
+            ft(wx + 3, wy + 1 + i, muos_logo[i],
+               vga_entry_color(grad[i], VGA_BLUE));
+        ft(wx + 2, wy + 7, "MuOS " MUOS_VERSION "  x86 32-bit",
+           vga_entry_color(VGA_LIGHT_CYAN, VGA_BLUE));
+        ft(wx + 2, wy + 8, "Built: " __DATE__, vga_entry_color(VGA_LIGHT_GREY, VGA_BLUE));
         break;
+    }
 
     case 6: { /* Calculator (interactive while focused) */
         ft(wx + 2, wy + 1, "=== Calculator ===", vga_entry_color(VGA_YELLOW, VGA_BLACK));
@@ -394,7 +403,7 @@ static void draw_start_menu(void) {
     }
 
     fd(sy, sx + 1, sx + sw - 2, vga_entry_color(VGA_WHITE, VGA_BLUE), ' ');
-    ft(sx + 1, sy, "  MuOS 7  -  User", vga_entry_color(VGA_WHITE, VGA_BLUE));
+    ft(sx + 1, sy, "  MuOS " MUOS_VERSION "  -  User", vga_entry_color(VGA_WHITE, VGA_BLUE));
 
     const char* items[] = {
         "  > Terminal",
@@ -741,7 +750,7 @@ void win7_run(void) {
     add_win(40, 2, 36, 10, 2, "Computer",     vga_entry_color(VGA_GREEN, VGA_BLACK));
     add_win(40, 13, 36, 8,  3, "Tasks",       vga_entry_color(VGA_CYAN, VGA_BLACK));
     add_win(40, 13, 36, 10, 4, "Help",        vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY));
-    add_win(20, 2, 40, 10, 5, "About MuOS 7", vga_entry_color(VGA_WHITE, VGA_BLUE));
+    add_win(20, 2, 40, 10, 5, "About MuOS", vga_entry_color(VGA_WHITE, VGA_BLUE));
     add_win(20, 13, 36, 8, 6, "Calculator",   vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
     add_win(40, 2, 36, 8,  7, "Files",        vga_entry_color(VGA_YELLOW, VGA_BLACK));
 
