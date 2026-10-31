@@ -73,6 +73,74 @@ int main(int argc, char** argv) {
         return 42;
     }
 
+    if (argc > 1 && arg_is(argv[1], "vfs")) {
+        /* Mounted FAT32/ext2 volumes through open/read/stat. The test image
+         * has one volume, so try /fat first and fall back to /ext2. */
+        union {
+            char raw[MUOS_STAT64_SIZE];
+            unsigned word[MUOS_STAT64_SIZE / 4];
+        } st;
+        char buf[64];
+        const char* path = "/fat/HELLO.TXT";
+        int ok = 1;
+
+        int fd = muos_open(path, 0);
+        if (fd < 0) {
+            path = "/ext2/hello.txt";
+            fd = muos_open(path, 0);
+        }
+        muos_puts("vfs: open="); muos_putdec(fd);
+        muos_puts(" path="); muos_puts(path); muos_puts("\n");
+        if (fd < 0) {
+            muos_puts("VFS-BAD\n");
+            return 0;
+        }
+
+        int n = muos_read(fd, buf, sizeof(buf) - 1);
+        buf[n > 0 ? n : 0] = '\0';
+        muos_puts("vfs: read="); muos_putdec(n); muos_puts("\n");
+        if (arg_is(buf, "FAT-HELLO-OK\n"))       muos_puts("VFS-FAT-OK\n");
+        else if (arg_is(buf, "EXT2-READ-OK\n"))  muos_puts("VFS-EXT2-OK\n");
+        else ok = 0;
+        muos_close(fd);
+
+        int rc = muos_fstatat64(MUOS_AT_FDCWD, path, st.raw, 0);
+        muos_puts("vfs: stat="); muos_putdec(rc);
+        muos_puts(" size="); muos_putdec((int)st.word[11]); muos_puts("\n");
+        if (rc != 0 || st.word[11] == 0) ok = 0;
+
+        int ro = muos_open(path, MUOS_O_WRONLY);
+        muos_puts("vfs: write-open="); muos_putdec(ro); muos_puts("\n");
+        if (ro < 0) muos_puts("VFS-RO-OK\n");
+        else { muos_close(ro); ok = 0; }
+
+        /* The mount root must enumerate through getdents64 too. */
+        int dfd = muos_open("/fat", MUOS_O_DIRECTORY);
+        if (dfd < 0) dfd = muos_open("/ext2", MUOS_O_DIRECTORY);
+        if (dfd >= 0) {
+            char db[256];
+            int dn = muos_getdents64(dfd, db, sizeof(db));
+            muos_close(dfd);
+            muos_puts("vfs: getdents="); muos_putdec(dn); muos_puts("\n");
+            int found = 0;
+            for (int off = 0; off < dn; ) {
+                unsigned short rl = *(unsigned short*)(db + off + 16);
+                if (!rl || off + (int)rl > dn) break;
+                const char* nm = db + off + 19;
+                if (arg_is(nm, "HELLO.TXT") || arg_is(nm, "hello.txt") ||
+                    arg_is(nm, "SUBDIR")    || arg_is(nm, "subdir")) found = 1;
+                off += (int)rl;
+            }
+            if (found) muos_puts("VFS-LIST-OK\n");
+            else ok = 0;
+        } else {
+            ok = 0;
+        }
+
+        muos_puts(ok ? "VFS-OK\n" : "VFS-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "pipe")) {
         int fds[2] = { -1, -1 };
         int rc = muos_pipe(fds);

@@ -38,6 +38,7 @@ int  muos_renameat(int olddirfd, const char* oldpath,
 int  muos_faccessat(int dirfd, const char* path, int mode);
 int  muos_fchmodat(int dirfd, const char* path, int mode);
 int  muos_readlinkat(int dirfd, const char* path, char* buf, int size);
+int  muos_getdents64(int fd, void* buf, unsigned count);
 int  muos_fork(void);
 int  muos_waitpid(int pid, int* status, int options);
 int  muos_execve(const char* path, char* const argv[], char* const envp[]);

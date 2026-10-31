@@ -17,6 +17,8 @@
 #include "pipe.h"
 #include "ata.h"
 #include "net.h"
+#include "fat.h"
+#include "ext2.h"
 
 /* Linux i386 syscall numbers (the ABI MuOS targets). This is the starter
  * set needed by freestanding user programs; anything else is rejected
@@ -216,6 +218,7 @@
 
 #define ERR_EPERM      1
 #define ERR_EINTR      4
+#define ERR_EIO        5
 #define ERR_ENOENT     2
 #define ERR_ESRCH      3
 #define ERR_ENOEXEC    8
@@ -233,6 +236,11 @@
 #define ERR_EINVAL    22
 #define ERR_EMFILE    24
 #define ERR_ENOSPC    28
+#define ERR_EROFS     30
+
+/* Mounted block-volume ids (VFS_T_EXT id / user_fd ext_vol). */
+#define VFS_VOL_FAT  1
+#define VFS_VOL_EXT2 2
 #define ERR_EFBIG     27
 #define ERR_ENOTTY    25
 #define ERR_ERANGE    34
@@ -334,6 +342,8 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
             return count;
         case USER_FD_VFILE:
             return err(ERR_EACCES);
+        case USER_FD_EXT:
+            return err(ERR_EROFS);     /* mounted volumes are read-only */
         case USER_FD_PIPE_WRITE: {
             int id = user_fd_pipe_id((int)fd);
             if (id < 0) return err(ERR_EBADF);
@@ -419,6 +429,18 @@ static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
             user_fd_set_offset((int)fd, off + (uint32_t)n);
             return (uint32_t)n;
         }
+        case USER_FD_EXT: {
+            int vol = 0;
+            const char* ep = NULL;
+            if (!user_fd_ext((int)fd, &vol, &ep)) return err(ERR_EBADF);
+            uint32_t off = user_fd_offset((int)fd);
+            int n = vol == VFS_VOL_FAT
+                    ? fat_read_at(ep, off, (void*)buf, count)
+                    : ext2_read_at(ep, off, (void*)buf, count);
+            if (n < 0) return err(ERR_EIO);
+            user_fd_set_offset((int)fd, off + (uint32_t)n);
+            return (uint32_t)n;
+        }
         case USER_FD_DIR:
             return err(ERR_EISDIR);
         default:
@@ -447,6 +469,7 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
 #define VFS_T_DEV    3
 #define VFS_T_VFILE  4
 #define VFS_T_MODULE 5
+#define VFS_T_EXT    6
 
 #define VFS_DIR_ROOT 1
 #define VFS_DIR_DEV  2
@@ -457,6 +480,8 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
 #define VFS_DIR_USRBIN 7
 #define VFS_DIR_SBIN 8
 #define VFS_DIR_REAL 9
+#define VFS_DIR_FAT  10
+#define VFS_DIR_EXT2 11
 
 #define VFS_DEV_NULL    1
 #define VFS_DEV_ZERO    2
@@ -584,6 +609,33 @@ static bool_t vfs_parse_pid_token(const char* s, uint32_t* out) {
     return true;
 }
 
+/* "/fat" and "/ext2" are the read-only mounts for the ATA volumes. The
+ * prefix check is independent of presence so an absent mount never falls
+ * through to the RAM FS namespace. */
+static bool_t vfs_mount_prefix(const char* path, int* vol, const char** sub) {
+    if (strncmp(path, "/fat", 4) == 0 && (path[4] == '/' || path[4] == '\0')) {
+        *vol = VFS_VOL_FAT;
+        *sub = path[4] == '/' ? path + 5 : path + 4;
+        return true;
+    }
+    if (strncmp(path, "/ext2", 5) == 0 && (path[5] == '/' || path[5] == '\0')) {
+        *vol = VFS_VOL_EXT2;
+        *sub = path[5] == '/' ? path + 6 : path + 5;
+        return true;
+    }
+    return false;
+}
+
+static bool_t vfs_mount_present(int vol) {
+    return vol == VFS_VOL_FAT ? fat_present() : ext2_present();
+}
+
+static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
+                             uint32_t* size) {
+    return vol == VFS_VOL_FAT ? fat_stat(sub, is_dir, size)
+                              : ext2_stat(sub, is_dir, size);
+}
+
 static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
     memset(e, 0, sizeof(*e));
     uint32_t rc = vfs_normalize(in, e->path, USER_FD_PATH_MAX);
@@ -596,6 +648,23 @@ static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
     if (strcmp(e->path, "/bin") == 0) { e->type = VFS_T_DIR; e->id = VFS_DIR_BIN; return 0; }
     if (strcmp(e->path, "/usr/bin") == 0) { e->type = VFS_T_DIR; e->id = VFS_DIR_USRBIN; return 0; }
     if (strcmp(e->path, "/sbin") == 0) { e->type = VFS_T_DIR; e->id = VFS_DIR_SBIN; return 0; }
+
+    int mvol = 0;
+    const char* msub = NULL;
+    if (vfs_mount_prefix(e->path, &mvol, &msub)) {
+        if (!vfs_mount_present(mvol)) return err(ERR_ENOENT);
+        bool_t is_dir = false;
+        uint32_t msize = 0;
+        if (!vfs_mount_stat(mvol, msub, &is_dir, &msize)) return err(ERR_ENOENT);
+        if (is_dir) {
+            e->type = VFS_T_DIR;
+            e->id = mvol == VFS_VOL_FAT ? VFS_DIR_FAT : VFS_DIR_EXT2;
+        } else {
+            e->type = VFS_T_EXT;
+            e->id = (uint32_t)mvol;
+        }
+        return 0;
+    }
 
     if (strncmp(e->path, "/dev/", 5) == 0) {
         const char* n = e->path + 5;
@@ -880,6 +949,8 @@ static int vfs_dir_id(const char* path) {
     if (strcmp(path, "/bin") == 0) return VFS_DIR_BIN;
     if (strcmp(path, "/usr/bin") == 0) return VFS_DIR_USRBIN;
     if (strcmp(path, "/sbin") == 0) return VFS_DIR_SBIN;
+    if (strcmp(path, "/fat") == 0 && fat_present()) return VFS_DIR_FAT;
+    if (strcmp(path, "/ext2") == 0 && ext2_present()) return VFS_DIR_EXT2;
     return 0;
 }
 
@@ -902,12 +973,57 @@ static bool_t vfs_dir_meta(const char* path, int* id, uint32_t* pid) {
         *pid = v;
         return true;
     }
+    int mvol = 0;
+    const char* msub = NULL;
+    if (vfs_mount_prefix(path, &mvol, &msub) && vfs_mount_present(mvol)) {
+        bool_t is_dir = false;
+        uint32_t msize = 0;
+        if (vfs_mount_stat(mvol, msub, &is_dir, &msize) && is_dir) {
+            *id = mvol == VFS_VOL_FAT ? VFS_DIR_FAT : VFS_DIR_EXT2;
+            *pid = 0;
+            return true;
+        }
+        return false;       /* a mount path never falls back to MuFS */
+    }
     if (path[0] == '/' && fs_is_dir(path + 1)) {
         *id = VFS_DIR_REAL;
         *pid = 0;
         return true;
     }
     return false;
+}
+
+static char vfs_ext_list[2048];
+
+/* Parse one line of fat_list/ext2_list output ("D name" or "F size name"). */
+static bool_t vfs_mount_dir_entry(int vol, const char* sub, int idx,
+                                  fs_dirent_t* out) {
+    int n = vol == VFS_VOL_FAT
+            ? fat_list(sub, vfs_ext_list, sizeof(vfs_ext_list))
+            : ext2_list(sub, vfs_ext_list, sizeof(vfs_ext_list));
+    if (n < 0) return false;
+
+    const char* p = vfs_ext_list;
+    for (int i = 0; i < idx; i++) {
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+    if (!*p) return false;
+
+    out->is_dir = (*p == 'D');
+    p++;
+    if (*p == ' ') p++;
+    uint32_t size = 0;
+    if (!out->is_dir) {
+        while (*p >= '0' && *p <= '9') size = size * 10 + (uint32_t)(*p++ - '0');
+        while (*p == ' ') p++;
+    }
+    int i = 0;
+    while (*p && *p != '\n' && i < FS_MAX_NAME - 1) out->name[i++] = *p++;
+    out->name[i] = '\0';
+    out->size = size;
+    out->slot = -1;
+    return i > 0;
 }
 
 static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
@@ -932,8 +1048,11 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
             return true;
         }
         idx -= (uint32_t)entries;
-        const char* extra[4] = { "bin", "dev", "proc", "etc" };
-        if (idx < 4) {
+        const char* extra[6] = { "bin", "dev", "proc", "etc" };
+        int ex = 4;
+        if (fat_present()) extra[ex++] = "fat";
+        if (ext2_present()) extra[ex++] = "ext2";
+        if ((int)idx < ex) {
             strncpy(name, extra[idx], USER_FD_PATH_MAX);
             *ino = 100 + idx;
             *type = 4;                  /* DT_DIR */
@@ -983,6 +1102,19 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
             return true;
         }
         return false;
+    }
+    if (dir == VFS_DIR_FAT || dir == VFS_DIR_EXT2) {
+        int vol = dir == VFS_DIR_FAT ? VFS_VOL_FAT : VFS_VOL_EXT2;
+        int dummy = 0;
+        const char* sub = NULL;
+        if (!vfs_mount_prefix(path, &dummy, &sub)) return false;
+        fs_dirent_t de;
+        if (!vfs_mount_dir_entry(vol, sub, (int)idx, &de)) return false;
+        strncpy(name, de.name, USER_FD_PATH_MAX - 1);
+        name[USER_FD_PATH_MAX - 1] = '\0';
+        *ino = (uint32_t)(vol == VFS_VOL_FAT ? 1500 : 1600) + idx;
+        *type = de.is_dir ? 4 : 8;
+        return true;
     }
     if (dir == VFS_DIR_REAL) {
         fs_dirent_t de;
@@ -1064,6 +1196,10 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
         if ((uint32_t)(-(int32_t)rc) != ERR_ENOENT) return rc;
         if (!(flags & O_CREAT) || (flags & O_DIRECTORY)) return rc;
 
+        int mvol = 0;
+        const char* msub = NULL;
+        if (vfs_mount_prefix(e.path, &mvol, &msub)) return err(ERR_EROFS);
+
         const char* name = e.path + 1;
         if (!*name) return err(ERR_ENOTDIR);
         if (strlen(name) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
@@ -1098,6 +1234,17 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
             char tmp[USER_FD_VBUF_MAX];
             uint32_t len = vfs_vfile_text(e.id, e.pid, tmp, sizeof(tmp));
             int fd = user_fd_alloc_vfile(tmp, len);
+            if (fd < 0) return err(ERR_EMFILE);
+            return (uint32_t)fd;
+        }
+        case VFS_T_EXT: {
+            if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
+            if ((flags & O_ACCMODE) != 0 || (flags & O_TRUNC))
+                return err(ERR_EROFS);
+            int vol = 0;
+            const char* sub = NULL;
+            if (!vfs_mount_prefix(e.path, &vol, &sub)) return err(ERR_ENOENT);
+            int fd = user_fd_alloc_ext(vol, sub);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
@@ -1348,10 +1495,28 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
             else if (e->id == VFS_DIR_ETC) base = 102;
             else if (e->id == VFS_DIR_PID) base = 500 + e->pid * 8;
             else if (e->id == VFS_DIR_REAL) base = 1000;
+            else if (e->id == VFS_DIR_FAT) base = 1500;
+            else if (e->id == VFS_DIR_EXT2) base = 1600;
             *ino = base;
-            *mode = S_IFDIR | 0755;
+            *mode = (e->id == VFS_DIR_FAT || e->id == VFS_DIR_EXT2)
+                    ? (S_IFDIR | 0555) : (S_IFDIR | 0755);
             *nlink = 2;
             *size = 0;
+            *atime = *mtime = *ctime = now;
+            return true;
+        }
+        case VFS_T_EXT: {
+            int vol = (int)e->id;
+            int dummy = 0;
+            const char* sub = NULL;
+            bool_t is_dir = false;
+            uint32_t msize = 0;
+            if (!vfs_mount_prefix(e->path, &dummy, &sub)) return false;
+            if (!vfs_mount_stat(vol, sub, &is_dir, &msize)) return false;
+            *ino = 1300u + (uint32_t)vol * 100u;
+            *mode = S_IFREG | 0444;
+            *nlink = 1;
+            *size = msize;
             *atime = *mtime = *ctime = now;
             return true;
         }
@@ -1415,6 +1580,20 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
             *atime = fs_fd_atime(slot);
             *mtime = fs_fd_mtime(slot);
             *ctime = fs_fd_ctime(slot);
+            return true;
+        }
+        case USER_FD_EXT: {
+            int vol = 0;
+            const char* ep = NULL;
+            bool_t is_dir = false;
+            uint32_t msize = 0;
+            if (!user_fd_ext(fd, &vol, &ep)) return false;
+            if (!vfs_mount_stat(vol, ep, &is_dir, &msize)) return false;
+            *ino = 1300u + (uint32_t)vol * 100u;
+            *mode = S_IFREG | 0444;
+            *nlink = 1;
+            *size = msize;
+            *atime = *mtime = *ctime = now;
             return true;
         }
         case USER_FD_DIR: {
@@ -1772,6 +1951,16 @@ static bool_t fd_regular_size(int fd, uint32_t* size) {
     if (kind == USER_FD_DEV_ATA) {
         uint32_t sec = ata_sector_count();
         *size = sec > 8000000u ? 0xFFFFFFFFu : sec * 512u;
+        return true;
+    }
+    if (kind == USER_FD_EXT) {
+        int vol = 0;
+        const char* ep = NULL;
+        bool_t is_dir = false;
+        uint32_t msize = 0;
+        if (!user_fd_ext(fd, &vol, &ep)) return false;
+        if (!vfs_mount_stat(vol, ep, &is_dir, &msize)) return false;
+        *size = msize;
         return true;
     }
     return false;

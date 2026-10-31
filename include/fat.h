@@ -17,6 +17,11 @@ int fat_list(const char* path, char* out, uint32_t cap);
  * actually copied, or negative on error. */
 int fat_read_file(const char* path, void* buf, uint32_t cap);
 
+/* VFS helpers: existence/type/size, and a random-access read starting at
+ * `offset` (returns bytes copied, 0 past EOF, negative on error). */
+bool_t fat_stat(const char* path, bool_t* is_dir, uint32_t* size);
+int fat_read_at(const char* path, uint32_t offset, void* buf, uint32_t cap);
+
 /* Create or overwrite a file (8.3 short name, root or existing subdir),
  * allocating clusters and updating both FAT copies. Returns bytes written
  * or negative on error. Writes are write-through (no cache). */

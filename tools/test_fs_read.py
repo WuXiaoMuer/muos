@@ -41,7 +41,7 @@ def main():
 
     tf = boot(fat, ["part", "fatls /", "fatcat /HELLO.TXT",
                     "fatcat /LONGFILE.TXT", "fatls /SUBDIR",
-                    "fatcat /SUBDIR/INNER.TXT",
+                    "fatcat /SUBDIR/INNER.TXT", "run vfs",
                     "fatwrite /NEW.TXT FAT-WRITE-OK", "fatcat /NEW.TXT",
                     "fatwrite /HELLO.TXT FAT-OVERWRITE",
                     "fatcat /HELLO.TXT",
@@ -52,6 +52,7 @@ def main():
     tg = boot(gpt, ["part", "fatcat /HELLO.TXT"], 4478, "gpt")
     te = boot(ext, ["part", "ext2ls /", "ext2cat /hello.txt",
                     "ext2ls /subdir", "ext2cat /subdir/inside.txt",
+                    "run vfs",
                     "ext2write /new.txt EXT2-WRITE-OK", "ext2cat /new.txt",
                     "ext2write /hello.txt EXT2-OVERWRITE",
                     "ext2cat /hello.txt"], 4479, "ext2")
@@ -81,6 +82,11 @@ def main():
         "ext2 write": "[ext2] write ok" in te and "EXT2-WRITE-OK" in te,
         "ext2 overwrite": "EXT2-OVERWRITE" in te,
         "ext2 persist": "EXT2-WRITE-OK" in tew and "EXT2-OVERWRITE" in tew,
+        "vfs fat open/read": "VFS-FAT-OK" in tf and "VFS-OK" in tf,
+        "vfs fat read-only": "VFS-RO-OK" in tf,
+        "vfs fat getdents": "VFS-LIST-OK" in tf,
+        "vfs ext2 open/read": "VFS-EXT2-OK" in te and "VFS-OK" in te,
+        "vfs ext2 getdents": "VFS-LIST-OK" in te,
     }
     for k, v in checks.items():
         print(f"{k}: {v}")

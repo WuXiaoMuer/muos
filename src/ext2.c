@@ -246,6 +246,40 @@ int ext2_read_file(const char* path, void* buf, uint32_t cap) {
     return (int)done;
 }
 
+bool_t ext2_stat(const char* path, bool_t* is_dir, uint32_t* size) {
+    ext2_ent_t d;
+    if (!resolve(path, &d)) return false;
+    if (is_dir) *is_dir = (d.mode & 0xF000) == 0x4000;
+    if (size)   *size = d.size;
+    return true;
+}
+
+/* VFS random access: jump straight to the logical block holding offset. */
+int ext2_read_at(const char* path, uint32_t offset, void* buf, uint32_t cap) {
+    ext2_ent_t d;
+    if (!resolve(path, &d) || (d.mode & 0xF000) == 0x4000) return -1;
+    if (offset >= d.size) return 0;
+    uint32_t want = d.size - offset;
+    if (want > cap) want = cap;
+
+    uint8_t inode[256];
+    if (!read_inode(d.ino, inode)) return -1;
+    uint32_t bs = vol.block_size;
+    uint32_t logical = offset / bs;
+    uint32_t within = offset % bs;
+    uint32_t done = 0;
+    while (done < want) {
+        uint32_t block;
+        if (!inode_block(inode, logical, &block)) break;
+        if (!read_block(block, blkbuf)) return -1;
+        for (uint32_t i = within; i < bs && done < want; i++)
+            ((uint8_t*)buf)[done++] = blkbuf[i];
+        within = 0;
+        logical++;
+    }
+    return (int)done;
+}
+
 /* ── Write path ───────────────────────────
  * ext2 rev 0 layout, group 0 only (the test images are a single group).
  * Allocation walks the block/inode bitmaps and updates the free counters

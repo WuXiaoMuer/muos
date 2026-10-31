@@ -51,7 +51,8 @@ typedef struct {
     int      fs_slot;   /* RAM FS slot for FILE */
     uint32_t offset;
     int      pipe_id;
-    char     path[USER_FD_PATH_MAX];   /* DIR: absolute directory */
+    int      ext_vol;   /* USER_FD_EXT: 1 = FAT32, 2 = ext2 */
+    char     path[USER_FD_PATH_MAX];   /* DIR: absolute directory; EXT: file path */
     char     vbuf[USER_FD_VBUF_MAX];   /* VFILE: generated /proc text */
     uint32_t vlen;
 } user_fd_t;
@@ -145,6 +146,25 @@ int user_fd_alloc_vfile(const char* data, uint32_t len) {
     if (data && len) memcpy(user_fds[fd].vbuf, data, len);
     user_fds[fd].vlen = len;
     return fd;
+}
+
+int user_fd_alloc_ext(int vol, const char* path) {
+    if (vol != 1 && vol != 2) return -1;
+    if (!path || strlen(path) >= USER_FD_PATH_MAX) return -1;
+    int fd = fd_alloc_kind(USER_FD_EXT);
+    if (fd < 0) return -1;
+    user_fds[fd].ext_vol = vol;
+    strncpy(user_fds[fd].path, path, USER_FD_PATH_MAX - 1);
+    user_fds[fd].path[USER_FD_PATH_MAX - 1] = '\0';
+    return fd;
+}
+
+bool_t user_fd_ext(int fd, int* vol, const char** path) {
+    int i = fd_index(fd);
+    if (i < 0 || user_fds[i].kind != USER_FD_EXT) return false;
+    if (vol) *vol = user_fds[i].ext_vol;
+    if (path) *path = user_fds[i].path;
+    return true;
 }
 
 int user_fd_alloc_pipe(int pipe_id, bool_t write_end) {

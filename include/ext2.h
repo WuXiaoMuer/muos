@@ -10,6 +10,9 @@ bool_t ext2_present(void);
 const char* ext2_volume(void);
 int ext2_list(const char* path, char* out, uint32_t cap);
 int ext2_read_file(const char* path, void* buf, uint32_t cap);
+/* VFS helpers: existence/type/size, and a random-access read. */
+bool_t ext2_stat(const char* path, bool_t* is_dir, uint32_t* size);
+int ext2_read_at(const char* path, uint32_t offset, void* buf, uint32_t cap);
 /* Create/truncate `path` and write `len` bytes. Returns len or -1. */
 int ext2_write_file(const char* path, const void* data, uint32_t len);
 

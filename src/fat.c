@@ -257,6 +257,39 @@ int fat_read_file(const char* path, void* buf, uint32_t cap) {
     return (int)done;
 }
 
+bool_t fat_stat(const char* path, bool_t* is_dir, uint32_t* size) {
+    dirent_t d;
+    if (!resolve(path, &d)) return false;
+    if (is_dir) *is_dir = (d.attr & 0x10) != 0;
+    if (size)   *size = d.size;
+    return true;
+}
+
+/* VFS random access: walk the cluster chain, skipping whole clusters until
+ * the requested offset, then copy across cluster boundaries. */
+int fat_read_at(const char* path, uint32_t offset, void* buf, uint32_t cap) {
+    dirent_t d;
+    if (!resolve(path, &d) || (d.attr & 0x10)) return -1;
+    if (offset >= d.size) return 0;
+    uint32_t want = d.size - offset;
+    if (want > cap) want = cap;
+
+    uint32_t bytes = vol.spc * SECTOR;
+    if (bytes == 0 || bytes > DIRBUF_MAX) return -1;
+    uint32_t skip = offset;
+    uint32_t done = 0;
+    uint8_t* dst = (uint8_t*)buf;
+    for (uint32_t c = d.cluster, guard = 0; c >= 2 && c < 0x0FFFFFF8u && done < want;
+         c = fat_next(c)) {
+        if (++guard > 4096) break;
+        if (skip >= bytes) { skip -= bytes; continue; }
+        if (!read_cluster(c, dirbuf)) return -1;
+        for (uint32_t i = skip; i < bytes && done < want; i++) dst[done++] = dirbuf[i];
+        skip = 0;
+    }
+    return (int)done;
+}
+
 /* ---------------- write path (8.3 names, write-through) ---------------- */
 
 static bool_t wr(uint64_t byte_off, const void* buf, uint32_t n) {

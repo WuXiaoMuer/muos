@@ -193,6 +193,11 @@ int muos_select(int nfds, unsigned* r, unsigned* w, unsigned* e, unsigned* tv) {
     return syscall5(82, nfds, (int)r, (int)w, (int)e, (int)tv);
 }
 
+/* getdents64(220): walk an open directory fd (Linux dirent64 records). */
+int muos_getdents64(int fd, void* buf, unsigned count) {
+    return syscall3(220, fd, (int)buf, (int)count);
+}
+
 /* muos_pselect6 lives in syscall6.s: its 6th argument must travel in ebp,
  * which C inline asm cannot reserve while also pinning the other five. */
 

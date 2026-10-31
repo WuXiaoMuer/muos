@@ -67,6 +67,7 @@ typedef enum {
     USER_FD_DEV_CONSOLE,
     USER_FD_DEV_ATA,        /* /dev/hda: raw ATA sectors */
     USER_FD_VFILE,
+    USER_FD_EXT,            /* file on a mounted FAT32/ext2 volume */
     USER_FD_PIPE_READ,
     USER_FD_PIPE_WRITE
 } user_fd_kind_t;
@@ -76,6 +77,8 @@ int      user_fd_alloc(int fs_slot);
 int      user_fd_alloc_dir(const char* path);
 int      user_fd_alloc_dev(int kind);
 int      user_fd_alloc_vfile(const char* data, uint32_t len);
+int      user_fd_alloc_ext(int vol, const char* path);
+bool_t   user_fd_ext(int fd, int* vol, const char** path);
 int      user_fd_alloc_pipe(int pipe_id, bool_t write_end);
 int      user_fd_pipe_id(int fd);
 int      user_fd_kind(int fd);

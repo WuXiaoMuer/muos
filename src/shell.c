@@ -84,8 +84,8 @@ static const cmd_doc_t cmd_docs[] = {
     {"halt","","","","halt the CPU",G_SYS},
     {"crash","","","","deliberate page fault (panic demo)",G_SYS},
     /* files (MuFS) */
-    {"ls","","","","list MuFS files",G_FILE},
-    {"cat","","","<file>","print a file",G_FILE},
+    {"ls","","","[path]","list MuFS files or /fat, /ext2",G_FILE},
+    {"cat","","","<file>","print a file (MuFS, /fat or /ext2)",G_FILE},
     {"touch","","","<file>","create an empty file",G_FILE},
     {"write","","","<file> <text>","create or overwrite with text",G_FILE},
     {"edit","","","[file]","open the text editor",G_FILE},
@@ -113,7 +113,7 @@ static const cmd_doc_t cmd_docs[] = {
 static const char* run_modes[] = {
     "fault","pie","dyn","tls","tcp","perm","sig","thread","blkpoll",
     "sched","p1","extra","poll","mmapfile","at","fork","pipefork","execbin",
-    "pipe","net","ata","ataread","fsata","fsread",NULL
+    "pipe","net","ata","ataread","fsata","fsread","vfs",NULL
 };
 
 static int starts_with(const char* s,const char* pre){
@@ -242,6 +242,7 @@ static void help_run_modes(void){
     vga_print("  pipe       pipe/pipe2\n");
     vga_print("  ata / ataread     ATA write / next-boot read\n");
     vga_print("  fsata / fsread    MuFS write / next-boot read\n");
+    vga_print("  vfs        open/read/stat/getdents on /fat or /ext2\n");
 }
 static void help_detail(const char* q){
     if(streq(q,"run")||streq(q,"hello")){
@@ -285,6 +286,8 @@ static void cmd_help(char**a,int n){
             vga_print(d->desc);vga_putchar('\n');
         }
     }
+    vga_print("\nMounted volumes: /fat and /ext2 (read-only)\n");
+    vga_print("  ls /fat    ls /ext2    cat /fat/<file>    cat /ext2/<file>\n");
     vga_print("\nRun modes (run <mode>):\n");
     for(int i=0;run_modes[i];i++){
         if(i%9==0)vga_print("  ");
@@ -545,9 +548,58 @@ static void cmd_crash(void){
 
 /* ── FS Commands ──────────────────────── */
 static void cmd_touch(char**a,int n){if(n<2){vga_print("touch <name>\n");return;}int f=fs_create(a[1]);if(f>=0){vga_print("OK: ");vga_print(a[1]);vga_putchar('\n');}else{vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));vga_print("Fail\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}}
-static void cmd_ls(void){int n=fs_count();vga_print_dec(n);vga_print(" file(s)\n");for(int i=0;i<n;i++){vga_print("  ");vga_print(fs_name(i));vga_print("  ");vga_print_dec(fs_size(i));vga_print("B\n");}}
+/* Mounted ATA volumes: "/fat" and "/ext2" (read-only). Returns 1/2 for the
+ * volume and points *sub at the path below the mount, or 0. */
+static int mount_volume(const char* path,const char** sub){
+    while(*path=='/')path++;
+    if(strncmp(path,"fat",3)==0&&(path[3]=='/'||path[3]=='\0')){
+        *sub=path[3]=='/'?path+4:path+3;return 1;
+    }
+    if(strncmp(path,"ext2",4)==0&&(path[4]=='/'||path[4]=='\0')){
+        *sub=path[4]=='/'?path+5:path+4;return 2;
+    }
+    return 0;
+}
+
+static void cmd_ls(char**a,int n){
+    if(n>1){
+        const char* sub=NULL;
+        int vol=mount_volume(a[1],&sub);
+        if(!vol){vga_print("ls <path>: only /fat or /ext2\n");return;}
+        if((vol==1&&!fat_present())||(vol==2&&!ext2_present())){
+            vga_print("Volume not present\n");return;
+        }
+        int r=vol==1?fat_list(sub,fs_out,sizeof(fs_out))
+                    :ext2_list(sub,fs_out,sizeof(fs_out));
+        if(r<0){vga_print("cannot list path\n");return;}
+        vga_print(fs_out);
+        serial_write(fs_out);
+        serial_write(vol==1?"[fat] ls ok\n":"[ext2] ls ok\n");
+        return;
+    }
+    int nf=fs_count();vga_print_dec(nf);vga_print(" file(s)\n");
+    for(int i=0;i<nf;i++){vga_print("  ");vga_print(fs_name(i));vga_print("  ");vga_print_dec(fs_size(i));vga_print("B\n");}
+    if(fat_present())vga_print("  /fat  (FAT32 mount)\n");
+    if(ext2_present())vga_print("  /ext2 (ext2 mount)\n");
+}
 static void cmd_cat(char**a,int n){
     if(n<2){vga_print("cat <file>\n");return;}
+    const char* sub=NULL;
+    int vol=mount_volume(a[1],&sub);
+    if(vol){
+        if((vol==1&&!fat_present())||(vol==2&&!ext2_present())){
+            vga_print("Volume not present\n");return;
+        }
+        int r=vol==1?fat_read_file(sub,fs_file,sizeof(fs_file)-1)
+                    :ext2_read_file(sub,fs_file,sizeof(fs_file)-1);
+        if(r<0){vga_print("Not found\n");return;}
+        fs_file[r]=0;
+        for(int i=0;i<r;i++)vga_putchar((char)fs_file[i]);
+        if(r==0||fs_file[r-1]!='\n')vga_putchar('\n');
+        serial_write((const char*)fs_file);
+        serial_write(vol==1?"[fat] cat ok\n":"[ext2] cat ok\n");
+        return;
+    }
     int f=fs_open(a[1]);if(f<0){vga_print("Not found\n");return;}
     const char* d=fs_fd_data(f);
     uint32_t sz=fs_fd_size(f);
@@ -601,7 +653,7 @@ static void execute(void){
     else if(streq(cmd,"halt"))cmd_halt();
     else if(streq(cmd,"crash"))cmd_crash();
     else if(streq(cmd,"touch"))cmd_touch(av,ac);
-    else if(streq(cmd,"ls"))cmd_ls();
+    else if(streq(cmd,"ls"))cmd_ls(av,ac);
     else if(streq(cmd,"cat"))cmd_cat(av,ac);
     else if(streq(cmd,"rm"))cmd_rm(av,ac);
     else if(streq(cmd,"write"))cmd_write(av,ac);
