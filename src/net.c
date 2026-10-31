@@ -63,6 +63,18 @@ typedef struct {
     uint32_t snd_una;       /* first unacknowledged sequence number */
     uint32_t cwnd;          /* congestion window, in bytes */
     uint32_t ssthresh;
+    uint32_t snd_wnd;       /* peer-advertised receive window (0 = unknown) */
+
+    /* TCP receive queue: out-of-order segments wait here until the gap
+     * fills; rx_delivered is the sequence number next handed to recvfrom. */
+    #define TCP_RXQ_MAX 4
+    struct {
+        bool_t   used;
+        uint32_t seq;
+        uint16_t len;
+        uint8_t  data[480];
+    } rxq[TCP_RXQ_MAX];
+    uint32_t rx_delivered;
 
     /* Small send queue: segments that carry sequence space stay here until
      * acknowledged; the head is retransmitted on RTO with backoff. */
@@ -725,6 +737,117 @@ static net_sock_t* tcp_new_sock(void) {
     return NULL;
 }
 
+/* Reset the receive queue and delivery cursor to the current ACK sequence. */
+static void tcp_rx_reset(net_sock_t* s) {
+    for (int i = 0; i < TCP_RXQ_MAX; i++) {
+        s->rxq[i].used = false;
+        s->rxq[i].len = 0;
+    }
+    s->rx_delivered = s->rcv_nxt;
+}
+
+/* Accept one segment into the receive queue. Bytes below rcv_nxt are
+ * trimmed, duplicates/overlaps are dropped, and rcv_nxt advances over any
+ * now-contiguous run of queued segments. Returns false if the queue is full. */
+static bool_t tcp_rx_store(net_sock_t* s, uint32_t seq,
+                           const uint8_t* data, uint32_t dlen) {
+    if (dlen == 0) return true;
+    if (dlen > TCP_MSS) dlen = TCP_MSS;
+
+    if ((int32_t)(seq - s->rcv_nxt) < 0) {
+        uint32_t skip = s->rcv_nxt - seq;
+        if (skip >= dlen) return true;          /* wholly duplicate */
+        data += skip;
+        dlen -= skip;
+        seq = s->rcv_nxt;
+    }
+    if ((uint32_t)(seq - s->rcv_nxt) > 2048u) return false;
+
+    for (int i = 0; i < TCP_RXQ_MAX; i++) {
+        if (!s->rxq[i].used) continue;
+        uint32_t es = s->rxq[i].seq;
+        uint32_t ee = es + s->rxq[i].len;
+        if (seq < ee && es < seq + dlen) return true;  /* overlap */
+    }
+
+    int slot = -1;
+    for (int i = 0; i < TCP_RXQ_MAX; i++)
+        if (!s->rxq[i].used) { slot = i; break; }
+    if (slot < 0) return false;
+
+    s->rxq[slot].used = true;
+    s->rxq[slot].seq = seq;
+    s->rxq[slot].len = (uint16_t)dlen;
+    memcpy(s->rxq[slot].data, data, dlen);
+
+    bool_t progressed = true;
+    uint32_t nxt = s->rcv_nxt;
+    while (progressed) {
+        progressed = false;
+        for (int i = 0; i < TCP_RXQ_MAX; i++) {
+            if (!s->rxq[i].used || !s->rxq[i].len) continue;
+            if (s->rxq[i].seq == nxt) {
+                nxt = s->rxq[i].seq + s->rxq[i].len;
+                progressed = true;
+            }
+        }
+    }
+    s->rcv_nxt = nxt;
+    return true;
+}
+
+/* Hand the next in-order bytes to the caller. A partial read shrinks the
+ * queued segment so the rest is returned on the next call. */
+static int tcp_rx_take(net_sock_t* s, void* buf, uint32_t maxlen) {
+    if (maxlen == 0) return 0;
+    for (int i = 0; i < TCP_RXQ_MAX; i++) {
+        if (!s->rxq[i].used || s->rxq[i].seq != s->rx_delivered) continue;
+        uint32_t n = s->rxq[i].len;
+        if (n > maxlen) n = maxlen;
+        memcpy(buf, s->rxq[i].data, n);
+        s->rx_delivered += n;
+        if (n == s->rxq[i].len) {
+            s->rxq[i].used = false;
+            s->rxq[i].len = 0;
+        } else {
+            s->rxq[i].seq += n;
+            s->rxq[i].len = (uint16_t)(s->rxq[i].len - n);
+            memmove(s->rxq[i].data, s->rxq[i].data + n, s->rxq[i].len);
+        }
+        return (int)n;
+    }
+    return 0;
+}
+
+/* Synthetic out-of-order check (no network I/O): queue segments 3-2-1 and
+ * verify that they are delivered as 1-2-3 with partial reads. */
+static bool_t tcp_reorder_selftest(void) {
+    net_sock_t* s = tcp_new_sock();
+    if (!s) return false;
+    s->tcp_state = TCP_ESTAB;
+    s->rcv_nxt = 1000;
+    tcp_rx_reset(s);
+
+    static const uint8_t a[] = "0123456789";
+    static const uint8_t b[] = "ABCDEFGHIJ";
+    static const uint8_t c[] = "KLMNOPQRST";
+    tcp_rx_store(s, 1020, c, 10);
+    tcp_rx_store(s, 1010, b, 10);
+    tcp_rx_store(s, 1000, a, 10);
+
+    bool_t ok = (s->rcv_nxt == 1030);
+    char out[64];
+    int total = 0;
+    int n;
+    while ((n = tcp_rx_take(s, out + total, 6)) > 0) total += n;
+    s->used = false;
+
+    if (!ok || total != 30) return false;
+    static const char want[] = "0123456789ABCDEFGHIJKLMNOPQRST";
+    for (int i = 0; i < 30; i++) if (out[i] != want[i]) return false;
+    return true;
+}
+
 static void tcp_input(uint32_t src, uint32_t dst,
                       const uint8_t* seg, uint32_t len) {
     (void)dst;
@@ -754,6 +877,7 @@ static void tcp_input(uint32_t src, uint32_t dst,
             child->rport = sport;
             child->parent = listener_id;
             child->rcv_nxt = seq + 1;
+            tcp_rx_reset(child);
             child->snd_nxt = 0x20000000u + (uint32_t)(child - socks) * 0x1000u;
             child->snd_una = child->snd_nxt;
             child->cwnd = TCP_MSS;
@@ -777,6 +901,7 @@ static void tcp_input(uint32_t src, uint32_t dst,
             child->parent = -1;
             child->echo_mode = true;
             child->rcv_nxt = seq + 1;
+            tcp_rx_reset(child);
             child->snd_nxt = 0x30000000u + (uint32_t)(child - socks) * 0x1000u;
             child->snd_una = child->snd_nxt;
             child->cwnd = TCP_MSS;
@@ -795,11 +920,16 @@ static void tcp_input(uint32_t src, uint32_t dst,
         return;
     }
 
-    if (flags & TCP_F_ACK) tcp_ack(s, ack);
+    if (flags & TCP_F_ACK) {
+        tcp_ack(s, ack);
+        uint16_t wnd = be16(seg + 14);
+        if (wnd) s->snd_wnd = wnd;      /* peer window (no scaling negotiated) */
+    }
 
     if (s->tcp_state == TCP_SYN_SENT && (flags & TCP_F_SYN) && (flags & TCP_F_ACK)) {
         if (ack == s->snd_nxt) {
             s->rcv_nxt = seq + 1;
+            tcp_rx_reset(s);
             s->tcp_state = TCP_ESTAB;
             tcp_send_seg(s, s->snd_nxt, s->rcv_nxt, TCP_F_ACK, NULL, 0);
         }
@@ -812,21 +942,16 @@ static void tcp_input(uint32_t src, uint32_t dst,
 
     if ((s->tcp_state == TCP_ESTAB || s->tcp_state == TCP_CLOSE_WAIT) &&
         dlen > 0) {
-        if (seq == s->rcv_nxt) {
-            if (s->echo_mode) {
+        if (s->echo_mode) {
+            if (seq == s->rcv_nxt) {
                 /* Kernel demo echo service: send the bytes straight back. */
                 tcp_send_seg(s, s->snd_nxt, s->rcv_nxt,
                              TCP_F_PSH | TCP_F_ACK, data, dlen);
                 s->snd_nxt += dlen;
-            } else if (!s->has) {
-                uint32_t n = dlen > sizeof(s->data) ? sizeof(s->data) : dlen;
-                memcpy(s->data, data, n);
-                s->plen = n;
-                s->sip = src;
-                s->sport = sport;
-                s->has = true;
+                s->rcv_nxt += dlen;
             }
-            s->rcv_nxt += dlen;
+        } else {
+            tcp_rx_store(s, seq, data, dlen);
         }
         tcp_send_seg(s, s->snd_nxt, s->rcv_nxt, TCP_F_ACK, NULL, 0);
     }
@@ -845,6 +970,7 @@ static int tcp_send_data(net_sock_t* s, const void* data, uint32_t len) {
     while (sent < len) {
         uint32_t inflight = s->snd_nxt - s->snd_una;
         uint32_t window = s->cwnd ? s->cwnd : TCP_MSS;
+        if (s->snd_wnd && s->snd_wnd < window) window = s->snd_wnd;
 
         if (inflight >= window) {
             /* Congestion window is full: wait for ACKs (poll also runs
@@ -923,6 +1049,8 @@ int net_connect(int id, uint32_t ip, uint16_t port) {
     s->snd_una = s->snd_nxt;
     s->cwnd = TCP_MSS;
     s->ssthresh = TCP_CWND_MAX;
+    s->snd_wnd = 0;
+    tcp_rx_reset(s);
     uint32_t seq = s->snd_nxt;
     s->snd_nxt = seq + 1;            /* SYN consumes one sequence number */
     s->q_head = 0;
@@ -968,17 +1096,14 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
     if (s->type == NET_SOCK_STREAM) {
         for (uint32_t loops = 0; loops < 300; loops++) {   /* ~3 seconds */
             net_poll();
-            if (s->has) {
-                uint32_t n = s->plen;
-                if (n > maxlen) n = maxlen;
-                memcpy(buf, s->data, n);
-                if (ip) *ip = s->sip;
-                if (port) *port = s->sport;
-                s->has = false;
-                s->plen = 0;
-                return (int)n;
+            int n = tcp_rx_take(s, buf, maxlen);
+            if (n > 0) {
+                if (ip) *ip = s->rip;
+                if (port) *port = s->rport;
+                return n;
             }
-            if (s->tcp_state == TCP_CLOSE_WAIT) return 0;   /* EOF */
+            if (s->tcp_state == TCP_CLOSE_WAIT && s->rcv_nxt == s->rx_delivered)
+                return 0;                                  /* EOF */
             __asm__ volatile ("sti; hlt; cli");
         }
         return NET_EAGAIN;
@@ -1100,6 +1225,11 @@ bool_t net_init(void) {
     outw(io_base + R_CAPR, 0xFFF0);            /* internal read pointer = 0 */
     outb(io_base + R_CMD, 0x0C);               /* RE|TE */
     present = true;
+
+    if (tcp_reorder_selftest())
+        serial_write("[net] TCP-REORDER-OK\n");
+    else
+        serial_write("[net] TCP-REORDER-BAD\n");
 
     if (dhcp_run()) {
         serial_write("[net] DHCP configured\n");

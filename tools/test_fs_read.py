@@ -92,6 +92,7 @@ def main():
         "vfs ext2 write": "VFS-WRITE-OK" in te,
         "vfs ext2 persist": "VFS-WRITE-OK" in tew,
         "vfs ext2 getdents": "VFS-LIST-OK" in te,
+        "tcp reorder selftest": "TCP-REORDER-OK" in tf,
     }
     for k, v in checks.items():
         print(f"{k}: {v}")
