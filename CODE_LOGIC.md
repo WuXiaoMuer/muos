@@ -6,7 +6,7 @@
 
 ```
 启动(汇编)          内核入口              硬件抽象                系统服务              用户可见
-boot.s          →   kernel.c         →   gdt/idt/isr/pic/irq  →  mm.c  kheap.c  →  shell.c(37 个命令名)
+boot.s          →   kernel.c         →   gdt/idt/isr/pic/irq  →  mm.c  kheap.c  →  shell.c(38 个命令名)
 boot_cd.s           初始化序列            pit keyboard mouse         string.c fs.c      editor.c
 isr_stubs.s                              vga serial rtc ata         task.c test.c      win7.c(桌面)
                                                                       tss/elf/proc/syscall/user → user/hello.c
@@ -261,12 +261,12 @@ USER_SIGTRAMP = 0x08847000
 - 事件循环:每 10ms(PIT)读 `mouse_get_pixels`(640×400 缩放到屏幕)与按键;按下时按 z-order 命中窗口:关闭按钮关闭、标题栏开始拖动(下一次移动按偏移挪动并夹在屏内)、内容区聚焦并置顶;键盘字符/回车/退格写入焦点窗口并重绘其缓冲;ESC 退出。
 - 退出时保存的 80×25 文本单元经 `vga_put_cell` 恢复后 `vga_repaint()`。`-kernel`(无 VBE)下提示需要 ISO。
 
-### 7.11 分区表与只读 FAT32 / ext2(part.c / fat.c / ext2.c)
+### 7.11 分区表与 FAT32 / ext2 读写(part.c / fat.c / ext2.c)
 
 - `part.c`:读 LBA0;无 `0xAA55` 签名即“整盘卷”(MuFS 或裸 FAT),有签名则视为分区表。若某项类型为 `0xEE`(保护性 MBR),读 LBA1 的 GPT 头(`EFI PART`),用 header 的 entries LBA/数量/项大小遍历条目,只保留 Basic Data GUID(`A2A0D0EB-E5B9-3344-87C0-68B6B72699C7`,按磁盘小端字节比较),名字按 UTF-16LE 低字节转 ASCII;否则解析 MBR 4 个 16 字节条目。`part_is_partitioned()` 供 `fs.c` 判断“不要格式化这块盘”。
 - `fat.c`:取第一个能通过 BPB 校验的分区(或整盘)。校验 512B/扇区、`fat_size16==0`、固定根目录项为 0、合法 spc(1..32 且 2 的幂)、FAT 数 1–2;计算 `fat_start = 分区起点 + reserved`、`data_start = fat_start + nfats*fsz32`。簇链读取:按 `cluster*4` 定位 FAT 扇区,取低 28 位。目录遍历把整个目录簇读入 16KB 缓冲;`0x00` 结束、`0xE5` 删除;`attr&0x3F==0x0F` 为 LFN 项,按序号把 UTF-16 字符写回 `(seq-1)*13` 位置,遇到短项时优先用 LFN 比较(否则 8.3 名),比较不区分大小写。`fat_read_file` 按 size 逐簇拷贝。`fat_list` 输出 `D/F size name` 行。写入路径(`fat_write_file`)只处理 8.3 名:路径拆成父目录 + 文件名,`make_short` 把名字规范成 11 字节(非法字符换 `_`),`dir_slot` 在父目录簇链里找同名项或第一个 `0xE5/0x00` 空槽(目录满时分配新簇并链接);覆盖时先 `free_chain` 释放旧簇链,再逐个 `alloc_cluster`(扫描 FAT 空项、置 EOC)、链接、按簇写数据;最后原地更新目录项的起始簇/大小。FAT 的每次修改都同时写所有 FAT 副本。
-- `ext2.c`:`ext2_init` 只接受 0x83/GPT 分区(或整盘),读分区 +1024 的超级块校验 `0xEF53`,取 `1K<<log_block_size`、组大小/inode 大小(rev0 固定 128);组描述符表位于 `first_data_block+1`,按 `group*32` 字节偏移取 inode table 块号。`read_inode` 按 `(ino-1)/ipg` 与 `%ipg` 定位 128 字节 inode;目录项是 `{inode, rec_len, name_len, name}` 线性表。文件块支持 12 个直接块 + 一级间接(间接块内索引)。`ext2_list/read_file` 与 FAT 版本接口对称。
-- 集成:内核在 `ata_init` 后依次调用 `part_init/fat_init/ext2_init`;`fs_persist_mount` 看到分区表就保持内存模式,避免把 FAT/ext2 盘格式化成 MuFS。Shell 增加 `part/fatls/fatcat/fatwrite/ext2ls/ext2cat`;`tools/make_fs_images.py` 生成带 MBR 或保护性 MBR+GPT 的 FAT32 镜像与一个 4MB ext2 镜像,`tools/test_fs_read.py` 三次启动验证 MBR FAT32、GPT FAT32 与 ext2 的目录/长名/子目录读取。
+- `ext2.c`:`ext2_init` 只接受 0x83/GPT 分区(或整盘),读分区 +1024 的超级块校验 `0xEF53`,取 `1K<<log_block_size`、组大小/inode 大小(rev0 固定 128);组描述符表位于 `first_data_block+1`,按 `group*32` 字节偏移取 inode table 块号。`read_inode` 按 `(ino-1)/ipg` 与 `%ipg` 定位 128 字节 inode;目录项是 `{inode, rec_len, name_len, name}` 线性表。文件块支持 12 个直接块 + 一级间接(间接块内索引)。`ext2_list/read_file` 与 FAT 版本接口对称。写入路径:`ext2_write_file` 拆父目录/文件名,已存在则先 `free_inode_blocks` 释放直接块与一级间接(清空指针),新文件用 `alloc_inode`(扫描 inode 位图)分配 inode 后 `dir_add` 插入目录项(复用空槽或分裂最后一项的 `rec_len` 余量,无余量则追加目录块);数据块由 `alloc_block` 扫描块位图分配,写零填充尾部,一级间接块按需分配,最后更新 `i_size/i_blocks`,并同步超级块与组描述符的空闲计数。写路径使用静态 `mapbuf/indbuf_w` 而不是 4KB 栈局部,避免嵌套调用压垮 8KB 内核栈。
+- 集成:内核在 `ata_init` 后依次调用 `part_init/fat_init/ext2_init`;`fs_persist_mount` 看到分区表就保持内存模式,避免把 FAT/ext2 盘格式化成 MuFS。Shell 增加 `part/fatls/fatcat/fatwrite/ext2ls/ext2cat/ext2write`;`tools/make_fs_images.py` 生成带 MBR 或保护性 MBR+GPT 的 FAT32 镜像与一个 4MB ext2 镜像,`tools/test_fs_read.py` 四次启动验证 MBR FAT32、GPT FAT32 与 ext2 的目录/长名/子目录读取、ext2 创建与覆盖写入及二次启动持久化。
 
 ### 7.12 安全与 ACPI(acpi.c / mm.c / user.c)
 
@@ -348,12 +348,12 @@ USER_SIGTRAMP = 0x08847000
 
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;无按需分页/换出
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
-3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc/musl `.so` 端到端验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回;ext2 只读、未接入 VFS
-4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32 支持 8.3/长名创建与写入但未接入 `open/read` 的 VFS;ext2 只读、无二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免;无乱序重排、无窗口缩放,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
+3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc/musl `.so` 端到端验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回;FAT32/ext2 已有读写驱动但未接入 VFS,ext2 尚不支持删除与多级间接
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32 支持 8.3/长名创建与写入但未接入 `open/read` 的 VFS;ext2 支持创建/覆盖写入(位图分配、目录项插入、单级间接),但无删除/二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免;无乱序重排、无窗口缩放,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
-8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 只是静态桌面原型,无窗口管理/控件/事件分发;窗口内容除 Calculator 外主要是状态展示
+8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 是合成器窗口管理器(每窗口后备缓冲 + 拖动/关闭/聚焦),但尚无滚动条/按钮/输入框等控件
 9. 单处理器(PIC,非 APIC);用户进程由 IRQ0 抢占,内核 shell 本身仍在启动栈上协作运行
 10. 无内核栈溢出保护(16KB 栈,GUI 深调用链靠它撑着;用户态入口另有 8KB TSS 栈)
 11. 无 guard page / 无 KASLR / panic 信息只有寄存器 dump(有 -g,可 addr2line)

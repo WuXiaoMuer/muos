@@ -103,6 +103,7 @@ static const cmd_doc_t cmd_docs[] = {
     {"fatwrite","","","<file> <text>","create/overwrite a FAT32 file",G_DISK},
     {"ext2ls","","","[p]","list ext2 root (read-only)",G_DISK},
     {"ext2cat","","","<file>","print an ext2 file",G_DISK},
+    {"ext2write","","","<file> <text>","create/overwrite an ext2 file",G_DISK},
     /* graphics */
     {"desktop","gui","","","text-mode desktop (windows, menu, calc)",G_GFX},
     {"pixel","","","","compositing WM (VBE, ISO boot only)",G_GFX},
@@ -396,6 +397,20 @@ static void cmd_ext2cat(char**a,int n){
     serial_write("[ext2] cat ok\n");
 }
 
+static void cmd_ext2write(char**a,int n){
+    if(!ext2_present()){ vga_print("No ext2 volume\n"); serial_write("[ext2] absent\n"); return; }
+    if(n<3){ vga_print("usage: ext2write <file> <text>\n"); return; }
+    char buf[128];
+    int len = 0;
+    for(const char* p=a[2]; *p && len<126; p++) buf[len++]=*p;
+    buf[len++]='\n';
+    int r = ext2_write_file(a[1], buf, (uint32_t)len);
+    if(r < 0){ vga_print("ext2: write failed\n"); serial_write("[ext2] write fail\n"); return; }
+    vga_print("[ext2] wrote "); vga_print_dec((uint32_t)r);
+    vga_print(" bytes to "); vga_print(a[1]); vga_putchar('\n');
+    serial_write("[ext2] write ok\n");
+}
+
 static void cmd_run(char**a,int n){
     /* Runs the embedded ELF at Ring3; returns when the process exits or
      * faults. `run fault` asks hello.c to touch an unmapped address, which
@@ -603,6 +618,7 @@ static void execute(void){
     else if(streq(cmd,"fatwrite"))cmd_fatwrite(av,ac);
     else if(streq(cmd,"ext2ls"))cmd_ext2ls(av,ac);
     else if(streq(cmd,"ext2cat"))cmd_ext2cat(av,ac);
+    else if(streq(cmd,"ext2write"))cmd_ext2write(av,ac);
     else if(streq(cmd,"execmod"))cmd_execmod(av,ac);
     else {
         vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));

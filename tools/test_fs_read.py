@@ -51,8 +51,11 @@ def main():
                      "fatcat /LongFileName.txt"], 4480, "fat2")
     tg = boot(gpt, ["part", "fatcat /HELLO.TXT"], 4478, "gpt")
     te = boot(ext, ["part", "ext2ls /", "ext2cat /hello.txt",
-                    "ext2ls /subdir", "ext2cat /subdir/inside.txt"],
-              4479, "ext2")
+                    "ext2ls /subdir", "ext2cat /subdir/inside.txt",
+                    "ext2write /new.txt EXT2-WRITE-OK", "ext2cat /new.txt",
+                    "ext2write /hello.txt EXT2-OVERWRITE",
+                    "ext2cat /hello.txt"], 4479, "ext2")
+    tew = boot(ext, ["ext2cat /new.txt", "ext2cat /hello.txt"], 4481, "ext2w")
 
     checks = {
         "fat part table": "[part] table ok" in tf,
@@ -74,7 +77,10 @@ def main():
         "ext2 read": "EXT2-READ-OK" in te,
         "ext2 subdir": "EXT2-SUB-OK" in te,
         "ext2 markers": te.count("[ext2] ls ok") >= 2 and
-                        te.count("[ext2] cat ok") >= 2,
+                        te.count("[ext2] cat ok") >= 4,
+        "ext2 write": "[ext2] write ok" in te and "EXT2-WRITE-OK" in te,
+        "ext2 overwrite": "EXT2-OVERWRITE" in te,
+        "ext2 persist": "EXT2-WRITE-OK" in tew and "EXT2-OVERWRITE" in tew,
     }
     for k, v in checks.items():
         print(f"{k}: {v}")
