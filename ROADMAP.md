@@ -10,7 +10,9 @@
 多任务地基 + mmap          Ring3 用户态             基础 POSIX 语义           fork/execve              (busybox/hello)
 ```
 
-## 当前进度快照(2026-10-30)
+## 当前进度快照(2026-10-31)
+
+- 版本 **v1.3**:Shell 帮助改为分组命令表(34 条命令 + 4 个别名,`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示);新增 `run.bat` 模式化启动与 `release.bat`/`release.ps1`(构建 → 冒烟 → `release/muos-<ver>` 与 zip)。
 
 - 内核自检 **88/0**;`tools/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
 - `src/syscall.c` 已定义 **120+ 个 Linux i386 系统调用号**,覆盖进程/stdio、信号、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。

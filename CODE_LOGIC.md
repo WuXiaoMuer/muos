@@ -6,7 +6,7 @@
 
 ```
 启动(汇编)          内核入口              硬件抽象                系统服务              用户可见
-boot.s          →   kernel.c         →   gdt/idt/isr/pic/irq  →  mm.c  kheap.c  →  shell.c(31 命令)
+boot.s          →   kernel.c         →   gdt/idt/isr/pic/irq  →  mm.c  kheap.c  →  shell.c(38 个命令名)
 boot_cd.s           初始化序列            pit keyboard mouse         string.c fs.c      editor.c
 isr_stubs.s                              vga serial rtc ata         task.c test.c      win7.c(桌面)
                                                                       tss/elf/proc/syscall/user → user/hello.c

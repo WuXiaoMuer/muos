@@ -101,7 +101,31 @@ muos/
 .\build.ps1 -Clean
 ```
 
-工具查找顺序:PATH → 仓库内 `toolchain\` / `tools\` → 常见安装位置(含 `X:\qemu`)。`run.bat` 走 `-Run`(文本模式),`run_iso.bat` 走 `-Iso -Run`(VBE,`pixel` 必须用后者或 `.\run.ps1`)。
+工具查找顺序:PATH → 仓库内 `toolchain\` / `tools\` → 常见安装位置(含 `X:\qemu`)。
+
+双击 / cmd 用的批处理入口(参数直接透传给 `run.ps1`,额外 QEMU 参数放在 `--` 之后):
+
+```bat
+run.bat              :: ISO 启动:VBE + RTL8139(`pixel` 可用,默认)
+run.bat iso          :: 同上
+run.bat kernel       :: QEMU -kernel 快路径(VGA 文本模式)
+run.bat disk         :: ISO + build\ata_disk.img(ATA/MuFS 测试)
+run.bat nobuild      :: 不重新构建,直接启动
+run.bat help         :: 打印机模式列表
+run.bat iso -- -monitor stdio   :: 追加 QEMU 参数
+run_iso.bat          :: 等价于 run.bat iso
+clean.bat            :: 删除 build\ 与 muos.iso(不动工具链)
+```
+
+打包发布(版本号取自 `src\shell.c` 的 `MUOS_VERSION`):
+
+```bat
+release.bat              :: 构建 ISO → verify_release.py → release\muos-v1.3\ + zip
+release.bat nobuild      :: 用现有产物打包
+release.bat noverify     :: 跳过 QEMU 冒烟测试
+```
+
+输出 `release\muos-v1.3-win32-x86.zip`(含 `muos.iso`、源码、脚本与测试工具)与同名解包目录。
 
 ### 自动测试
 
@@ -320,11 +344,9 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 ## 版本
 
-当前 **v1.2**:在 v1.1(mmap 解析、全 RAM 恒等映射、内核堆、寄存器布局修复)基础上加入 Ring3 用户态、TSS、Linux i386 `int 0x80` 调用、ELF32 加载器与 RAM FS 16×64KB,支持 `run`(内嵌 ELF)/`exec hello.elf`(FS ELF)、文件 fd(open/close/lseek/read/write)、`uname` 与匿名 `mmap`。首个用户 C 程序 `user/hello.c` 可由 `run` 或 `exec hello.elf` 启动。
+当前 **v1.3**(2026-10-31):在 v1.2 的 Ring3/TSS/`int 0x80`/ELF32 加载器与 RAM FS 基础上,已加入 **higher-half 内核(0xC0100000)**、每进程页目录 + 抢占调度、**页级 COW fork** 与可配置沙箱(`-SandboxMB`)、信号与 `clone` 线程、**ATA PIO + MuFS 持久化(元数据日志)**、MBR/GPT + **FAT32 读写(含长名创建)** 与 ext2 只读、**PT_INTERP 动态链接 + 静态 TLS + 符号版本化**、RTL8139 + ARP/ICMP/UDP/DHCP + **TCP 8 段发送队列/退避/拥塞窗口**、**uid/gid 与文件权限检查**、SMEP + 弱 ASLR、**ACPI 关机/重启**、**VBE 帧缓冲 + 8×16 字体 + 合成器窗口管理器(`pixel`)**。v1.3 同时把 Shell 帮助重写为分组命令表(`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示),并提供批处理启动模式与 `release.bat` 打包。
 
-桌面侧同步完善:PS/2 鼠标真实驱动 + 文本光标、窗口点击/拖拽/最小化/最大化/关闭、z-order、开始菜单鼠标操作、CMOS RTC 实况时钟、聚焦后键盘交互的 Calculator;编辑器修复 1KB 存盘截断与 Ctrl+S 失效,并支持 PgUp/PgDn;v1.2 时自检 57 项(现为 88 项)。
-
-**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)** → **MuFS 持久化文件系统(ATA 写穿 + 开机挂载)** → **动态链接:`PT_INTERP` + 用户态 `ld-mu.so`(`DT_NEEDED`/SysV hash 符号解析/共享库映射)** → **RTL8139 + ARP/IPv4/ICMP/UDP 与 socket ABI** → **VBE 线性帧缓冲文本控制台(ISO 引导 800×600×32)** → **DHCP 自动配置 + 最小 TCP(SOCK_STREAM)与回环** → **`.gnu.hash`/`R_386_COPY` 支持 + 像素桌面原型(`pixel`)**。下一步:TCP 重传/并发服务端、TLS 重定位、真正的图形窗口系统(见 ROADMAP)。
+**v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)** → **MuFS 持久化文件系统(ATA 写穿 + 开机挂载)** → **动态链接:`PT_INTERP` + 用户态 `ld-mu.so`(`DT_NEEDED`/SysV hash 符号解析/共享库映射)** → **RTL8139 + ARP/IPv4/ICMP/UDP 与 socket ABI** → **VBE 线性帧缓冲文本控制台(ISO 引导 800×600×32)** → **DHCP 自动配置 + 最小 TCP(SOCK_STREAM)与回环** → **`.gnu.hash`/`R_386_COPY` 支持 + 像素桌面原型(`pixel`)**。
 
 ## 参考资源
 

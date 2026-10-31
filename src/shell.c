@@ -29,6 +29,8 @@
 #define HIST_LEN  128
 #define MAX_ARGS  16
 
+#define MUOS_VERSION "v1.3"
+
 /* ── Line Editor State ───────────────── */
 static char cmd_buf[CMD_MAX];
 static int  cmd_pos, cmd_len;
@@ -54,16 +56,106 @@ static void isrt(char c){
     cmd_buf[cmd_pos++]=c;cmd_len++;redraw_line();
 }
 
-/* ── Tab Completion ──────────────────── */
-static const char*cmds[]={"help","clear","cls","echo","mem","tasks","time","ps","reboot","halt","crash","logo","version","gui","win7","desktop","touch","ls","cat","rm","write","edit","calc","test","run","hello","exec","mods","execmod","pixel","disk","part","fatls","fatcat","fatwrite","ext2ls","ext2cat","poweroff",NULL};
+/* ── Command table (help + tab completion) ── */
+enum { G_SYS, G_FILE, G_PROC, G_DISK, G_GFX };
+
+typedef struct {
+    const char* name;
+    const char* alias1;  /* "" when there is none */
+    const char* alias2;
+    const char* args;    /* "" when the command takes no arguments */
+    const char* desc;
+    uint8_t     group;
+} cmd_doc_t;
+
+static const cmd_doc_t cmd_docs[] = {
+    /* system */
+    {"help","","","[cmd]","list commands or details for one",G_SYS},
+    {"version","","","","version and build date",G_SYS},
+    {"clear","cls","","","clear the screen",G_SYS},
+    {"echo","","","<text>","print the text",G_SYS},
+    {"calc","","","<expr>","single-op calculator (N+M N-M N*M N/M)",G_SYS},
+    {"logo","","","","print the boot logo",G_SYS},
+    {"mem","","","","kernel heap / physical page usage",G_SYS},
+    {"tasks","","","","list scheduler tasks",G_SYS},
+    {"ps","","","","current task + task list",G_SYS},
+    {"time","","","","uptime from the PIT",G_SYS},
+    {"test","","","","run the kernel self-tests",G_SYS},
+    {"reboot","","","","ACPI reboot",G_SYS},
+    {"poweroff","","","","ACPI S5 power off",G_SYS},
+    {"halt","","","","halt the CPU",G_SYS},
+    {"crash","","","","deliberate page fault (panic demo)",G_SYS},
+    /* files (MuFS) */
+    {"ls","","","","list MuFS files",G_FILE},
+    {"cat","","","<file>","print a file",G_FILE},
+    {"touch","","","<file>","create an empty file",G_FILE},
+    {"write","","","<file> <text>","create or overwrite with text",G_FILE},
+    {"edit","","","[file]","open the text editor",G_FILE},
+    {"rm","","","<file>","delete a file",G_FILE},
+    /* Ring3 / Linux ABI */
+    {"run","hello","","[mode]","run the embedded ELF (modes below)",G_PROC},
+    {"exec","","","<file> [arg]","run an ELF from the MuFS",G_PROC},
+    {"mods","","","","list Multiboot -initrd modules",G_PROC},
+    {"execmod","","","<n> [args]","run module n",G_PROC},
+    /* disks */
+    {"disk","","","","ATA info + MuFS state",G_DISK},
+    {"part","","","","MBR/GPT partition table",G_DISK},
+    {"fatls","","","[p]","list a FAT32 directory",G_DISK},
+    {"fatcat","","","<file>","print a FAT32 file",G_DISK},
+    {"fatwrite","","","<file> <text>","create/overwrite a FAT32 file",G_DISK},
+    {"ext2ls","","","[p]","list ext2 root (read-only)",G_DISK},
+    {"ext2cat","","","<file>","print an ext2 file",G_DISK},
+    /* graphics */
+    {"gui","win7","desktop","","Win7-style text-mode desktop",G_GFX},
+    {"pixel","","","","compositing WM (VBE, ISO boot only)",G_GFX},
+    {NULL,NULL,NULL,NULL,NULL,0}
+};
+
+static const char* run_modes[] = {
+    "fault","pie","dyn","tls","tcp","perm","sig","thread","blkpoll",
+    "sched","p1","extra","poll","mmapfile","at","fork","pipefork","execbin",
+    "pipe","net","ata","ataread","fsata","fsread",NULL
+};
+
+static int starts_with(const char* s,const char* pre){
+    while(*pre){ if(*s!=*pre)return 0; s++; pre++; }
+    return 1;
+}
+
 static void tab(void){
     if(!cmd_pos)return;
     int ws=0;
     for(int i=cmd_pos-1;i>=0;i--){if(cmd_buf[i]==' '){ws=i+1;break;}}
     int wl=cmd_pos-ws; if(!wl)return;
-    int m=0; const char*mt=NULL;
-    for(int i=0;cmds[i];i++) if(strncmp(cmd_buf+ws,cmds[i],strlen(cmds[i]))==0){m++;mt=cmds[i];}
-    if(m==1&&mt){cmd_len=ws;cmd_pos=ws;for(const char*p=mt;*p;p++)isrt(*p);isrt(' ');}
+    const char* w=cmd_buf+ws;
+
+    /* Second word after `run`/`hello`: complete the test modes. */
+    int first_run = (ws==4 && strncmp(cmd_buf,"run",3)==0) ||
+                    (ws==6 && strncmp(cmd_buf,"hello",5)==0);
+    if(first_run){
+        int c=0; const char* mt=NULL;
+        for(int i=0;run_modes[i];i++)
+            if(starts_with(run_modes[i],w)){c++;mt=run_modes[i];}
+        if(c==1&&mt){
+            cmd_len=ws;cmd_pos=ws;
+            for(const char*p=mt;*p;p++)isrt(*p);
+            isrt(' ');
+        }
+        return;
+    }
+
+    int m=0; const char* mt=NULL;
+    for(int i=0;cmd_docs[i].name;i++){
+        const cmd_doc_t* d=&cmd_docs[i];
+        if(starts_with(d->name,w)){m++;mt=d->name;}
+        if(d->alias1[0]&&starts_with(d->alias1,w)){m++;mt=d->alias1;}
+        if(d->alias2[0]&&starts_with(d->alias2,w)){m++;mt=d->alias2;}
+    }
+    if(m==1&&mt){
+        cmd_len=ws;cmd_pos=ws;
+        for(const char*p=mt;*p;p++)isrt(*p);
+        isrt(' ');
+    }
 }
 static void bksp(void){
     if(!cmd_pos)return;
@@ -128,15 +220,79 @@ static int tokenize(char*b,char**a,int max_args){
 }
 
 /* ═══════════════════ Commands ═══════════════════ */
-static void cmd_help(void){
-    vga_print("  touch ls cat rm write edit  - filesystem\n");
-    vga_print("  run [fault|pie|dyn|tls]     - Ring3 C program (Linux ABI)\n");
-    vga_print("  exec <file>                 - run an ELF from the RAM FS\n");
-    vga_print("  mods / execmod <n>          - run a Multiboot -initrd module\n");
-    vga_print("  help clear echo mem tasks time ps disk logo\n");
-    vga_print("  version gui win7 desktop pixel test reboot poweroff halt crash\n");
-    vga_print("  part fatls [p] fatcat <f> fatwrite <f> <text>\n");
-    vga_print("  ext2ls [p] ext2cat <f>\n");
+static void help_run_modes(void){
+    vga_print("  no mode    basic Ring3 demo (also `run <arg>` passed to hello)\n");
+    vga_print("  fault      Ring3 page-fault isolation\n");
+    vga_print("  pie        ET_DYN/PIE relocations\n");
+    vga_print("  dyn        PT_INTERP + shared libraries\n");
+    vga_print("  tls        static TLS (initial-exec + global-dynamic)\n");
+    vga_print("  net        RTL8139 ICMP/UDP\n");
+    vga_print("  tcp        TCP echo + accept + socket names\n");
+    vga_print("  perm       uid/gid inheritance + file permissions\n");
+    vga_print("  fork       fork + waitpid over COW pages\n");
+    vga_print("  pipefork   pipe + fork\n");
+    vga_print("  execbin    fork + execve hello.elf\n");
+    vga_print("  sched      preemptive scheduling\n");
+    vga_print("  thread     clone(CLONE_VM) threads\n");
+    vga_print("  blkpoll    blocking poll\n");
+    vga_print("  sig        signal delivery\n");
+    vga_print("  poll       poll readiness\n");
+    vga_print("  p1 / extra extra POSIX surface\n");
+    vga_print("  mmapfile   file-backed mmap\n");
+    vga_print("  at         *at family\n");
+    vga_print("  pipe       pipe/pipe2\n");
+    vga_print("  ata / ataread     ATA write / next-boot read\n");
+    vga_print("  fsata / fsread    MuFS write / next-boot read\n");
+}
+static void help_detail(const char* q){
+    if(streq(q,"run")||streq(q,"hello")){
+        vga_print("usage: run [mode]\n");
+        vga_print("  Run the embedded Ring3 ELF (Linux i386 ABI).\n");
+        help_run_modes();
+        return;
+    }
+    for(int i=0;cmd_docs[i].name;i++){
+        const cmd_doc_t* d=&cmd_docs[i];
+        if(!streq(q,d->name)&&!streq(q,d->alias1)&&!streq(q,d->alias2))continue;
+        vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));
+        vga_print(d->name);
+        if(d->args[0]){vga_putchar(' ');vga_print(d->args);}
+        vga_putchar('\n');
+        vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
+        vga_print("  ");vga_print(d->desc);vga_putchar('\n');
+        return;
+    }
+    vga_print("No help for '");vga_print(q);vga_print("'. Try 'help'.\n");
+}
+static void cmd_help(char**a,int n){
+    if(n>1){help_detail(a[1]);return;}
+    vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));
+    vga_print("MuOS " MUOS_VERSION " commands   (Tab completes, help <cmd> for details)\n");
+    vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
+    static const char* titles[5]={"System","Files (MuFS)","Ring3 / Linux ABI","Disks (/dev/hda)","Graphics"};
+    for(int g=0;g<5;g++){
+        vga_setcolor(vga_entry_color(VGA_YELLOW,VGA_BLACK));
+        vga_print("\n");vga_print(titles[g]);vga_print(":\n");
+        vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
+        for(int i=0;cmd_docs[i].name;i++){
+            const cmd_doc_t* d=&cmd_docs[i];
+            if(d->group!=g)continue;
+            uint16_t col=2;
+            vga_print("  ");vga_print(d->name);col+=strlen(d->name);
+            if(d->alias1[0]){vga_print(" | ");vga_print(d->alias1);col+=3+strlen(d->alias1);}
+            if(d->alias2[0]){vga_print(" | ");vga_print(d->alias2);col+=3+strlen(d->alias2);}
+            if(d->args[0]){vga_putchar(' ');vga_print(d->args);col+=1+strlen(d->args);}
+            for(;col<30;col++)vga_putchar(' ');
+            vga_print(d->desc);vga_putchar('\n');
+        }
+    }
+    vga_print("\nRun modes (run <mode>):\n");
+    for(int i=0;run_modes[i];i++){
+        if(i%9==0)vga_print("  ");
+        vga_print(run_modes[i]);
+        if(run_modes[i+1])vga_putchar((i%9==8)?'\n':' ');
+    }
+    vga_print("\n  e.g. run tls   run perm   run tcp   run fork\n");
 }
 static void cmd_test(void){ if(tests_run()) vga_print("SELF-TEST FAILED\n"); }
 static void slog_u32(uint32_t v);
@@ -348,7 +504,7 @@ static void cmd_logo(void){
     vga_print("\n");
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
 }
-static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS v1.2 (Ring3 + Linux ABI)\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
+static void cmd_version(void){vga_setcolor(vga_entry_color(VGA_LIGHT_CYAN,VGA_BLACK));vga_print("MuOS " MUOS_VERSION " (Ring3 + Linux ABI)\n"__DATE__" "__TIME__"\n");vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));}
 static void cmd_reboot(void){
     vga_print("Reboot...\n");
     serial_write("[shell] reboot requested (8042 reset line)\n");
@@ -425,7 +581,7 @@ static void execute(void){
     serial_write("[cmd] "); serial_write(cmd_buf); serial_write("\n");
     char*av[MAX_ARGS]; int ac=tokenize(cmd_buf,av,MAX_ARGS); if(!ac)return;
     char*cmd=av[0];
-    if(streq(cmd,"help"))cmd_help();
+    if(streq(cmd,"help"))cmd_help(av,ac);
     else if(streq(cmd,"clear")||streq(cmd,"cls"))cmd_clear();
     else if(streq(cmd,"echo"))cmd_echo(av,ac);
     else if(streq(cmd,"mem"))cmd_mem();
@@ -460,6 +616,12 @@ static void execute(void){
     else if(streq(cmd,"ext2ls"))cmd_ext2ls(av,ac);
     else if(streq(cmd,"ext2cat"))cmd_ext2cat(av,ac);
     else if(streq(cmd,"execmod"))cmd_execmod(av,ac);
+    else {
+        vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));
+        vga_print("Unknown command: ");vga_print(cmd);vga_putchar('\n');
+        vga_setcolor(vga_entry_color(VGA_LIGHT_GREY,VGA_BLACK));
+        vga_print("Type 'help' for the command list, or 'help <cmd>' for details.\n");
+    }
 }
 
 void shell_run(void){
@@ -495,9 +657,9 @@ void shell_run(void){
     }
     vga_print("\n");
     vga_setcolor(vga_entry_color(VGA_YELLOW, VGA_BLACK));
-    vga_print("  MuOS 7 Ultimate  |  256MB  |  ");
+    vga_print("  MuOS " MUOS_VERSION " (Ring3 + Linux ABI)  |  ");
     vga_print(__DATE__);
-    vga_print("\n  Type 'help' or 'win7'\n\n");
+    vga_print("\n  Type 'help' (Tab completes, 'help <cmd>' for details)\n\n");
     vga_setcolor(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
     for(;;){readline();execute();}
 }
