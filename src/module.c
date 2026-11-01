@@ -61,3 +61,20 @@ const char* modules_name(uint32_t index) {
     if (index >= module_count) return NULL;
     return modules[index].name[0] ? modules[index].name : NULL;
 }
+
+static const char* base_name(const char* p) {
+    const char* b = p;
+    for (; *p; p++) if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+
+int module_find_name(const char* name) {
+    if (!name || !*name) return -1;
+    const char* want = base_name(name);
+    for (uint32_t i = 0; i < module_count; i++) {
+        const char* have = modules_name(i);
+        if (!have) continue;
+        if (strcmp(base_name(have), want) == 0) return (int)i;
+    }
+    return -1;
+}

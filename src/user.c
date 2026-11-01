@@ -11,6 +11,7 @@
 #include "pipe.h"
 #include "keyboard.h"
 #include "pit.h"
+#include "module.h"
 
 /* Embedded user image: built by build.ps1 into build/hello.elf and linked
  * into the kernel as a raw binary blob (see the objcopy step). */
@@ -164,6 +165,21 @@ bool_t user_fd_ext(int fd, int* vol, const char** path) {
     if (i < 0 || user_fds[i].kind != USER_FD_EXT) return false;
     if (vol) *vol = user_fds[i].ext_vol;
     if (path) *path = user_fds[i].path;
+    return true;
+}
+
+int user_fd_alloc_module(int index) {
+    if (index < 0) return -1;
+    int fd = fd_alloc_kind(USER_FD_MODULE);
+    if (fd < 0) return -1;
+    user_fds[fd].ext_vol = index;   /* module index (reuses the int field) */
+    return fd;
+}
+
+bool_t user_fd_module(int fd, int* index) {
+    int i = fd_index(fd);
+    if (i < 0 || user_fds[i].kind != USER_FD_MODULE) return false;
+    if (index) *index = user_fds[i].ext_vol;
     return true;
 }
 
@@ -581,6 +597,18 @@ static int interp_find(const char* path, const void** img, uint32_t* size) {
         *img = _binary_ld_mu_so_start;
         *size = (uint32_t)(_binary_ld_mu_so_end - _binary_ld_mu_so_start);
         return 0;
+    }
+
+    /* Real loaders/libs can be supplied as -initrd modules: /lib/<name>
+     * matches a module base name (this is how ld-musl-i386.so.1 is found). */
+    int mi = module_find_name(norm);
+    if (mi >= 0) {
+        uint32_t start = 0, end = 0;
+        if (modules_get((uint32_t)mi, &start, &end) && end > start) {
+            *img = (const void*)start;
+            *size = end - start;
+            return 0;
+        }
     }
     return -1;
 }

@@ -378,6 +378,8 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
             return count;
         case USER_FD_VFILE:
             return err(ERR_EACCES);
+        case USER_FD_MODULE:
+            return err(ERR_EACCES);
         case USER_FD_EXT: {
             int vol = 0;
             const char* ep = NULL;
@@ -491,6 +493,20 @@ static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
             user_fd_set_offset((int)fd, off + (uint32_t)n);
             return (uint32_t)n;
         }
+        case USER_FD_MODULE: {
+            int mi = -1;
+            if (!user_fd_module((int)fd, &mi)) return err(ERR_EBADF);
+            uint32_t start = 0, end = 0;
+            if (!modules_get((uint32_t)mi, &start, &end)) return err(ERR_EBADF);
+            uint32_t len = end - start;
+            uint32_t off = user_fd_offset((int)fd);
+            if (off >= len) return 0;
+            uint32_t n = len - off;
+            if (n > count) n = count;
+            memcpy((void*)buf, (const void*)(start + off), n);
+            user_fd_set_offset((int)fd, off + n);
+            return n;
+        }
         case USER_FD_EXT: {
             int vol = 0;
             const char* ep = NULL;
@@ -532,6 +548,7 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
 #define VFS_T_VFILE  4
 #define VFS_T_MODULE 5
 #define VFS_T_EXT    6
+#define VFS_T_BLOB   7     /* raw Multiboot module exposed as a read-only file */
 
 #define VFS_DIR_ROOT 1
 #define VFS_DIR_DEV  2
@@ -725,6 +742,28 @@ static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
             e->type = VFS_T_EXT;
             e->id = (uint32_t)mvol;
         }
+        return 0;
+    }
+
+    /* Module-backed files: /lib/<name> matches a -initrd module by base
+     * name, /mod/<n> exposes module n directly. This lets a real loader
+     * read larger shared libraries than the 64KB RAM FS slots allow. */
+    if (strncmp(e->path, "/lib/", 5) == 0) {
+        int mi = module_find_name(e->path + 5);
+        if (mi >= 0) { e->type = VFS_T_BLOB; e->id = (uint32_t)mi; return 0; }
+    }
+    if (strncmp(e->path, "/mod/", 5) == 0) {
+        const char* n = e->path + 5;
+        uint32_t idx = 0;
+        if (!*n) return err(ERR_ENOENT);
+        for (const char* p = n; *p; p++) {
+            if (*p < '0' || *p > '9') return err(ERR_ENOENT);
+            idx = idx * 10u + (uint32_t)(*p - '0');
+        }
+        uint32_t s = 0, en = 0;
+        if (!modules_get(idx, &s, &en)) return err(ERR_ENOENT);
+        e->type = VFS_T_BLOB;
+        e->id = idx;
         return 0;
     }
 
@@ -1307,6 +1346,15 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
+        case VFS_T_BLOB: {
+            if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
+            if ((flags & O_ACCMODE) != 0) return err(ERR_EACCES);
+            uint32_t s = 0, en = 0;
+            if (!modules_get(e.id, &s, &en)) return err(ERR_ENOENT);
+            int fd = user_fd_alloc_module((int)e.id);
+            if (fd < 0) return err(ERR_EMFILE);
+            return (uint32_t)fd;
+        }
         case VFS_T_EXT: {
             if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
             int vol = 0;
@@ -1577,6 +1625,16 @@ static bool_t vfs_ent_fields(const vfs_ent_t* e, uint32_t* ino,
             *atime = *mtime = *ctime = now;
             return true;
         }
+        case VFS_T_BLOB: {
+            uint32_t s = 0, en = 0;
+            if (!modules_get(e->id, &s, &en)) return false;
+            *ino = 1700u + e->id;
+            *mode = S_IFREG | 0555;
+            *nlink = 1;
+            *size = en - s;
+            *atime = *mtime = *ctime = now;
+            return true;
+        }
         case VFS_T_EXT: {
             int vol = (int)e->id;
             int dummy = 0;
@@ -1652,6 +1710,18 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
             *atime = fs_fd_atime(slot);
             *mtime = fs_fd_mtime(slot);
             *ctime = fs_fd_ctime(slot);
+            return true;
+        }
+        case USER_FD_MODULE: {
+            int mi = -1;
+            if (!user_fd_module(fd, &mi)) return false;
+            uint32_t s = 0, en = 0;
+            if (!modules_get((uint32_t)mi, &s, &en)) return false;
+            *ino = 1700u + (uint32_t)mi;
+            *mode = S_IFREG | 0555;
+            *nlink = 1;
+            *size = en - s;
+            *atime = *mtime = *ctime = now;
             return true;
         }
         case USER_FD_EXT: {

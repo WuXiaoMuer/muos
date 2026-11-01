@@ -13,5 +13,8 @@ void     modules_init(const multiboot_info_t* mb);
 uint32_t modules_count(void);
 bool_t   modules_get(uint32_t index, uint32_t* start, uint32_t* end);
 const char* modules_name(uint32_t index);
+/* Look up a module by base name (last path component), e.g. the file names
+ * QEMU records for -initrd modules. Returns -1 when absent. */
+int        module_find_name(const char* name);
 
 #endif

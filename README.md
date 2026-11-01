@@ -59,7 +59,7 @@ muos/
 ├── build.ps1        一键构建 / 运行 / ISO / 清理(含用户程序构建与 ELF 嵌入)
 ├── tools/           构建/测试工具(make_iso.py、qmp_shell.py、test_busybox.py、
 │                    test_ata.py、verify_release.py、screendump.py、
-│                    make_fs_images.py、test_fs_read.py)
+│                    make_fs_images.py、test_fs_read.py、test_realso.py)
 ├── make_iso.py      Python + pycdlib 自制可启动 ISO(位于 tools\make_iso.py)
 ├── setup-tools.ps1  自动下载 NASM / QEMU 到 tools\
 ├── linker.ld        链接脚本(内核加载到 1MB)
@@ -136,6 +136,8 @@ python tools\test_busybox.py "run net" "run tcp" "run dyn" "run tls"
 python tools\test_ata.py
 # MBR/GPT + FAT32(含长名/子目录)与 ext2 读写挂载
 python tools\test_fs_read.py
+# 真实 musl 动态链接(需 build\alpine\files 下的三个文件,见下文)
+python tools\test_realso.py
 # kernel + ISO 两条路径的发布冒烟
 python tools\verify_release.py
 # 启动 ISO、打开 pixel 桌面并抓屏(输出 build\pixel.ppm)
@@ -269,6 +271,20 @@ Built with GCC 15 + NASM
 `busybox-static-1.36.1-r31.apk` 解包后的 `bin/busybox.static`。为跑通它补齐了 i386 TLS(`set_thread_area` + GDT slot 6)、`exit_group`、`set_tid_address`、uid32、`ioctl`、`dup2`、`envp`/`auxv` 初始栈,以及扁平 VFS 的 `getdents64`/`stat64`/`statx`/`writev`/`sendfile64` 等调用。
 
 已实测 applet:`ls`(含 `-l`)、`cat`、`pwd`、`id`、`uname`、`wc`、`grep`、`head`、`tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp`、`rm`、`mv`、`touch`、`chown`、`sleep`、`free`、`df`、`dd`、`uptime`、`ps`;不存在的路径会正确返回 `ENOENT`。
+
+### 真实 musl 动态链接(.so 端到端)
+
+除静态 BusyBox 外,也验证了**真实 musl 动态链接器 + libc.so + 动态 BusyBox**:
+
+```powershell
+# 从 Alpine v3.20 i386 包中取出三个文件(APK 是 gzip 的 tar 数据段)
+build\alpine\files\bin\busybox                     # 820500B,PT_INTERP 为 /lib/ld-musl-i386.so.1
+build\alpine\files\lib\ld-musl-i386.so.1           # 657160B,真实 musl 动态加载器
+build\alpine\files\lib\libc.musl-x86.so.1          # 同一文件的 libc 别名
+python tools\test_realso.py
+```
+
+源码包:`https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86/musl-1.2.5-r4.apk` 与 `busybox-1.36.1-r31.apk`。内核把 `-initrd` 模块按文件名暴露成 `/lib/<name>` 只读文件(超过 64KB RAM FS 槽位),`interp_find` 也按基名查找解释器;随后由 musl 自己解析 `DT_NEEDED`、映射 libc 并运行 applet。实测 `execmod 0 echo REAL-SO-OK`、`uname -a`、`ls /` 全部通过。
 
 ```text
 muos> execmod 0 free

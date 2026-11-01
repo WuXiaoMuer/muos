@@ -21,7 +21,7 @@
 - 进程模型:每进程页目录 + **按需分页用户窗口**(首次访问分配零页,无预分配物理块)、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持,仍未用真实 glibc/musl `.so` 端到端验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列与对端窗口,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB,目录删除/目录重命名尚未提供;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除与多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(无 swapon 控制、无换出优先级、无内存压力压测);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持),并已用真实 musl loader + libc.so 端到端验证动态 BusyBox;真实 glibc 尚未验证;网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列与对端窗口,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB,目录删除/目录重命名尚未提供;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除与多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(无 swapon 控制、无换出优先级、无内存压力压测);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
 
 ## 后续计划(建议顺序)
 
@@ -49,7 +49,7 @@
 - [x] `PT_INTERP` 解释器路径解析(MuFS `/lib/...` 优先,回退内嵌 blob),解释器映射到 `0x08200000`,`AT_BASE` 指向其 load bias
 - [x] 共享库(`ET_DYN .so`)映射 + 动态链接器 `ld-mu.so`(`DT_NEEDED` 递归装载、SysV hash **与 .gnu.hash** 符号解析、`R_386_RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY/IRELATIVE`);`run dyn` 实测 `DYN-OK`(libmu.so 用 GNU hash 构建)
 - [x] 静态 TLS:`PT_TLS` 解析 + 变体 II 布局(TP `0x08780000`,主程序块贴 TP、库向下)、`.tdata/.tbss` 复制清零、`gs:0` 自指针、`set_thread_area(243)` + 选择子 `0x33`;支持 `R_386_TLS_TPOFF/IE/GOTIE/LE/IE_32/LE_32/TPOFF32/DTPMOD32/DTPOFF32` 与 `%eax` 传参的 `__tls_get_addr`;`run tls` 实测 `TLS-OK`
-- [ ] 符号版本化(`.gnu.version/.gnu.version_r`)未实现;尚未用真实 glibc/musl `.so` 验证,遇到未知重定位类型会明确报错而不是继续执行
+- [x] 真实 musl 动态链接:Alpine i386 动态 BusyBox + `ld-musl-i386.so.1` + `libc.musl-x86.so.1` 以 `-initrd` 模块进入,内核以 `/lib/<module>` 只读文件暴露大于 64KB 的库,`interp_find` 按基名找到解释器,musl 自行解析 `DT_NEEDED` 并运行 `echo/uname/ls`(`tools/test_realso.py`);真实 glibc 与交互式 shell 尚未验证
 
 ### P4 平台外设
 - [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`tools/test_ata.py` 两次启动验证持久化
