@@ -4,7 +4,7 @@
 
 - **完整启动链**:Multiboot1(QEMU `-kernel`)+ 自研 El Torito 光盘引导
 - **硬件抽象**:GDT / IDT(256 项全覆盖)/ PIC / PIT / PS/2 键盘 + PS/2 鼠标 / 串口 / VGA 文本模式
-- **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、**higher-half 内核**(链接 0xC0100000 / 物理 0x100000,引导期自举页表,全 RAM 恒等映射 + 0xC0000000 别名)、内核堆(kmalloc/kfree/kcalloc)、**用户页按需分页 + 页级 COW**,以及 **ATA 磁盘尾部交换区**(MuFS 盘启用,低内存时换出未共享用户页,`swaptest` 自检)
+- **内存管理**:multiboot mmap(E820)解析、物理页位图分配器、**higher-half 内核**(链接 0xC0100000 / 物理 0x100000,引导期自举页表,全 RAM 恒等映射 + 0xC0000000 别名)、内核堆(kmalloc/kfree/kcalloc)、**用户页按需分页 + 页级 COW**,以及 **ATA 磁盘尾部交换区**(MuFS 盘启用,低内存时换出未共享用户页,`swaptest` 单页自检 + `swapstress` 600 页换出/读回压力测试)
 - **Ring3 用户态**:TSS + `int 0x80` 系统调用(Linux i386 编号)+ ELF32 加载器,在 0x08048000 起的用户窗口内运行 C 程序(默认 8MB,`build.ps1 -SandboxMB` 可改为 8/12/16/32MB 等 4MB 倍数);每个进程有独立页目录(CR3 切换),**fork 为写时复制**(共享页只读,首次写才复制一页),100Hz 抢占轮转;ELF 可来自内核内嵌(`run`)、RAM FS(`exec hello.elf`)或 Multiboot 模块;支持 ET_EXEC 与 ET_DYN(PIE,`run pie`);用户态故障只杀进程,不 panic 内核
 - **进程与信号**:`fork/execve/wait4/waitid`、`clone` 线程(`CLONE_VM/FILES/THREAD/SETTLS`,共享地址空间)、信号 pending/blocked 掩码与 `signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline、默认终止动作、`alarm`;阻塞 `wait4/waitid/poll/read` 在管道/键盘/定时器事件上唤醒
 - **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;多级 RAM FS(`mkdir/rmdir`、子目录路径解析)与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块;`/dev/hda` 提供 ATA PIO 块设备(跨启动持久化)
@@ -244,7 +244,7 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - `nanosleep` 在单进程/没有其他可运行进程时用 `sti; hlt` 等 PIT tick(100Hz),整机暂停到时间到期;`times` 返回 tick 数,`getrusage` 返回全零结构,`chown/lchown/fchown/fchownat` 只校验目标(不跟踪所有权),`readlink` 对非符号链接返回 `EINVAL`。
 - `*at` 路径解析:绝对路径忽略 dirfd;相对路径在 `AT_FDCWD(-100)` 时按 cwd,在目录 fd 时拼接该 fd 的绝对路径;`fstatat64` 空路径 + `AT_EMPTY_PATH` 直接 stat dirfd,`unlinkat` 的 `AT_REMOVEDIR` 走 rmdir 语义。VFS 暂无符号链接,`readlinkat` 对已存在目标返回 `EINVAL`。
 - 路径统一规范化:支持绝对/相对路径、`.` 与 `..`(父目录越界时停在 `/`)。命名空间 = 扁平 RAM FS 根目录 + `/dev`、`/proc`、`/etc` 虚拟目录;`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`。
-- 沙箱要求物理 RAM > 128MB;ISO 路径现在通过自建 E820 info 获得真实内存图,内存足够时 `exec` 可正常运行,内存不足时才提示并优雅拒绝。沙箱大小在构建期可配(`-SandboxMB`,默认 8);fork 使用页级 COW(帧引用计数 + 写故障内存复制),用户页按需分配(缺页时零页装入);MuFS 盘(无分区表/FAT/ext2)还会在磁盘尾部启用交换区,空闲页低于 128 时按 100Hz 调度节拍换出未共享用户页,`swaptest` 验证写盘→换出→缺页读回。
+- 沙箱要求物理 RAM > 128MB;ISO 路径现在通过自建 E820 info 获得真实内存图,内存足够时 `exec` 可正常运行,内存不足时才提示并优雅拒绝。沙箱大小在构建期可配(`-SandboxMB`,默认 8);fork 使用页级 COW(帧引用计数 + 写故障内存复制),用户页按需分配(缺页时零页装入);MuFS 盘(无分区表/FAT/ext2)还会在磁盘尾部启用交换区,空闲页低于 128 时按 100Hz 调度节拍换出未共享用户页,`swaptest` 验证写盘→换出→缺页读回,`swapstress` 在 3 个临时地址空间各换出/读回 200 页(共 600 页)并逐字节校验。
 
 ## 真实 Linux 二进制(BusyBox)
 

@@ -107,6 +107,7 @@ static const cmd_doc_t cmd_docs[] = {
     {"ext2write","","","<file> <text>","create/overwrite an ext2 file",G_DISK},
     {"swap","","","","page swap status (ATA disk tail)",G_DISK},
     {"swaptest","","","","evict and fault a page back in",G_DISK},
+    {"swapstress","","","","evict/fault 600 pages (stress)",G_DISK},
     /* graphics */
     {"desktop","gui","","","text-mode desktop (windows, menu, calc)",G_GFX},
     {"pixel","","","","compositing WM (VBE, ISO boot only)",G_GFX},
@@ -434,6 +435,12 @@ static void cmd_swaptest(void){
     serial_write(ok ? "[swap] SWAP-OK\n" : "[swap] SWAP-SKIP\n");
 }
 
+static void cmd_swapstress(void){
+    bool_t ok = swap_stress_test();
+    vga_print(ok ? "SWAP-STRESS-OK\n" : "SWAP-STRESS-SKIP\n");
+    serial_write(ok ? "[swap] SWAP-STRESS-OK\n" : "[swap] SWAP-STRESS-SKIP\n");
+}
+
 static void cmd_run(char**a,int n){
     /* Runs the embedded ELF at Ring3; returns when the process exits or
      * faults. `run fault` asks hello.c to touch an unmapped address, which
@@ -693,6 +700,7 @@ static void execute(void){
     else if(streq(cmd,"ext2write"))cmd_ext2write(av,ac);
     else if(streq(cmd,"swap"))cmd_swap();
     else if(streq(cmd,"swaptest"))cmd_swaptest();
+    else if(streq(cmd,"swapstress"))cmd_swapstress();
     else if(streq(cmd,"execmod"))cmd_execmod(av,ac);
     else {
         vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));

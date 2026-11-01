@@ -18,5 +18,8 @@ void   swap_free_slot(uint32_t slot);
 
 /* Exercise write -> evict -> fault-in on a scratch user page directory. */
 bool_t swap_selftest(void);
+/* Multi-page stress: evict 600 pages across three scratch address spaces,
+ * verify the slots are occupied, fail them back in and compare content. */
+bool_t swap_stress_test(void);
 
 #endif

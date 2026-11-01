@@ -161,3 +161,94 @@ out:
     if (!ok) serial_write("[swap] selftest FAILED\n");
     return ok;
 }
+
+/* Multi-page stress: three scratch page directories, 200 pages each. */
+#define STRESS_PDS   3
+#define STRESS_PAGES 200
+#define STRESS_TOTAL (STRESS_PDS * STRESS_PAGES)
+
+static uint8_t stress_pat(int pd, int page, int k) {
+    return (uint8_t)((pd * 131 + page * 17 + k) & 0xFF);
+}
+
+bool_t swap_stress_test(void) {
+    if (!enabled || swap_slot_count() < STRESS_TOTAL) return false;
+
+    uint32_t pds[STRESS_PDS] = {0}, tramps[STRESS_PDS] = {0};
+    for (int i = 0; i < STRESS_PDS; i++) {
+        tramps[i] = (uint32_t)mm_alloc_page();
+        if (!tramps[i]) goto fail_tramp;
+        memset((void*)tramps[i], 0, PAGE_SIZE);
+        pds[i] = mm_create_user_pd(tramps[i]);
+        if (!pds[i]) {
+            mm_free_page((void*)tramps[i]);
+            tramps[i] = 0;
+            goto fail_tramp;
+        }
+    }
+
+    /* Touch every page and write a unique pattern. */
+    for (int i = 0; i < STRESS_PDS; i++) {
+        for (int p = 0; p < STRESS_PAGES; p++) {
+            uint32_t va = USER_BASE + (uint32_t)p * PAGE_SIZE;
+            if (!mm_user_fault(pds[i], va, true)) goto cleanup;
+            uint32_t phys = mm_user_translate(pds[i], va);
+            if (!phys) goto cleanup;
+            for (int k = 0; k < (int)PAGE_SIZE; k++)
+                ((uint8_t*)phys)[k] = stress_pat(i, p, k);
+        }
+    }
+
+    /* Evict all of them. */
+    int evicted = 0;
+    for (int i = 0; i < STRESS_PDS; i++) {
+        for (int p = 0; p < STRESS_PAGES; p++) {
+            uint32_t va = USER_BASE + (uint32_t)p * PAGE_SIZE;
+            if (!mm_user_swap_out(pds[i], va)) goto cleanup;
+            evicted++;
+        }
+    }
+    if (evicted != STRESS_TOTAL || swap_used_slots() != STRESS_TOTAL)
+        goto cleanup;
+
+    /* Fault every page back and compare its content. */
+    for (int i = 0; i < STRESS_PDS; i++) {
+        for (int p = 0; p < STRESS_PAGES; p++) {
+            uint32_t va = USER_BASE + (uint32_t)p * PAGE_SIZE;
+            if (!mm_user_fault(pds[i], va, false)) goto cleanup;
+            uint32_t phys = mm_user_translate(pds[i], va);
+            if (!phys) goto cleanup;
+            for (int k = 0; k < (int)PAGE_SIZE; k++) {
+                if (((uint8_t*)phys)[k] != stress_pat(i, p, k)) goto cleanup;
+            }
+        }
+    }
+    if (swap_used_slots() != 0) goto cleanup;
+
+    for (int i = 0; i < STRESS_PDS; i++) {
+        mm_user_reset_pages(pds[i]);
+        mm_free_user_pd(pds[i]);
+        mm_free_page((void*)tramps[i]);
+    }
+    return true;
+
+cleanup:
+    for (int i = 0; i < STRESS_PDS; i++) {
+        if (pds[i]) {
+            mm_user_reset_pages(pds[i]);
+            mm_free_user_pd(pds[i]);
+        }
+        if (tramps[i]) mm_free_page((void*)tramps[i]);
+    }
+    return false;
+
+fail_tramp:
+    for (int i = 0; i < STRESS_PDS; i++) {
+        if (pds[i]) {
+            mm_user_reset_pages(pds[i]);
+            mm_free_user_pd(pds[i]);
+        }
+        if (tramps[i]) mm_free_page((void*)tramps[i]);
+    }
+    return false;
+}
