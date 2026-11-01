@@ -41,6 +41,16 @@
 #define W_IN_W    220
 #define W_IN_H    24
 
+/* List control (body-local). */
+#define LIST_X    242
+#define LIST_Y    62
+#define LIST_W    126
+#define LIST_H    (LIST_ROWS * LIST_ROW_H)
+#define LIST_ROWS 6
+#define LIST_ROW_H 18
+#define LIST_SB   8
+#define LIST_COUNT 10
+
 typedef struct {
     int      x, y;
     bool_t   open;
@@ -50,7 +60,47 @@ typedef struct {
     int      scroll;        /* first visible text line */
     char     input[64];     /* Widgets input box */
     int      ilen;
+    int      list_sel;      /* list control selection */
+    int      list_scroll;   /* first visible list row */
 } wm_window_t;
+
+/* Clipping stack: every buf_rect/buf_text call is limited to the current
+ * rectangle. Nested controls push their viewport and pop afterwards. */
+#define CLIP_MAX 8
+typedef struct { int x0, y0, x1, y1; } clip_rect_t;
+static clip_rect_t clip_stack[CLIP_MAX];
+static int clip_depth;
+static int clip_x0, clip_y0, clip_x1, clip_y1;
+
+static void clip_reset(int w, int h) {
+    clip_depth = 0;
+    clip_x0 = 0; clip_y0 = 0; clip_x1 = w; clip_y1 = h;
+}
+
+static void clip_push(int x, int y, int w, int h) {
+    if (clip_depth >= CLIP_MAX) return;
+    int x0 = x > clip_x0 ? x : clip_x0;
+    int y0 = y > clip_y0 ? y : clip_y0;
+    int x1 = (x + w) < clip_x1 ? (x + w) : clip_x1;
+    int y1 = (y + h) < clip_y1 ? (y + h) : clip_y1;
+    if (x1 < x0) x1 = x0;
+    if (y1 < y0) y1 = y0;
+    clip_stack[clip_depth].x0 = clip_x0;
+    clip_stack[clip_depth].y0 = clip_y0;
+    clip_stack[clip_depth].x1 = clip_x1;
+    clip_stack[clip_depth].y1 = clip_y1;
+    clip_depth++;
+    clip_x0 = x0; clip_y0 = y0; clip_x1 = x1; clip_y1 = y1;
+}
+
+static void clip_pop(void) {
+    if (clip_depth <= 0) return;
+    clip_depth--;
+    clip_x0 = clip_stack[clip_depth].x0;
+    clip_y0 = clip_stack[clip_depth].y0;
+    clip_x1 = clip_stack[clip_depth].x1;
+    clip_y1 = clip_stack[clip_depth].y1;
+}
 
 static uint32_t* scr;                 /* full-screen back buffer */
 static uint32_t* wbuf[WIN_COUNT];     /* per-window body buffers */
@@ -71,10 +121,10 @@ static void buf_rect(uint32_t* b, int w, int h, int x, int y,
                      int rw, int rh, uint32_t c) {
     for (int yy = 0; yy < rh; yy++) {
         int py = y + yy;
-        if (py < 0 || py >= h) continue;
+        if (py < 0 || py >= h || py < clip_y0 || py >= clip_y1) continue;
         for (int xx = 0; xx < rw; xx++) {
             int px = x + xx;
-            if (px < 0 || px >= w) continue;
+            if (px < 0 || px >= w || px < clip_x0 || px >= clip_x1) continue;
             b[py * w + px] = c;
         }
     }
@@ -92,10 +142,10 @@ static void buf_text(uint32_t* b, int w, int h, int x, int y,
             uint32_t bits = glyph[gy];
             for (int dy = 0; dy < 2; dy++) {
                 int py = y + gy * 2 + dy;
-                if (py < 0 || py >= h) continue;
+                if (py < 0 || py >= h || py < clip_y0 || py >= clip_y1) continue;
                 for (int gx = 0; gx < 8; gx++) {
                     int px = x + gx;
-                    if (px < 0 || px >= w) continue;
+                    if (px < 0 || px >= w || px < clip_x0 || px >= clip_x1) continue;
                     b[py * w + px] = (bits & (1u << gx)) ? fg : bg;
                 }
             }
@@ -181,7 +231,90 @@ static void draw_button(uint32_t* b, int x, int y, const char* label) {
              rgb(245, 248, 255), rgb(42, 111, 219));
 }
 
-/* Widgets window: two buttons and a one-line input box. */
+static const char* list_items[LIST_COUNT] = {
+    "Alpha", "Bravo", "Charlie", "Delta", "Echo",
+    "Foxtrot", "Golf", "Hotel", "India", "Juliet"
+};
+
+static int list_max_scroll(wm_window_t* win) {
+    (void)win;
+    return LIST_COUNT > LIST_ROWS ? LIST_COUNT - LIST_ROWS : 0;
+}
+
+static void list_clamp(wm_window_t* win) {
+    int maxs = list_max_scroll(win);
+    if (win->list_scroll > maxs) win->list_scroll = maxs;
+    if (win->list_scroll < 0) win->list_scroll = 0;
+    if (win->list_sel < 0) win->list_sel = 0;
+    if (win->list_sel >= LIST_COUNT) win->list_sel = LIST_COUNT - 1;
+    if (win->list_sel < win->list_scroll)
+        win->list_scroll = win->list_sel;
+    if (win->list_sel >= win->list_scroll + LIST_ROWS)
+        win->list_scroll = win->list_sel - LIST_ROWS + 1;
+}
+
+static void draw_list(wm_window_t* win, uint32_t* b) {
+    list_clamp(win);
+    clip_push(LIST_X, LIST_Y, LIST_W, LIST_H);
+    buf_rect(b, BODY_W, BODY_H, LIST_X, LIST_Y, LIST_W, LIST_H,
+             rgb(72, 82, 98));
+    buf_rect(b, BODY_W, BODY_H, LIST_X + 1, LIST_Y + 1, LIST_W - 2,
+             LIST_H - 2, rgb(18, 22, 30));
+
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = win->list_scroll + r;
+        if (idx >= LIST_COUNT) break;
+        int y = LIST_Y + 1 + r * LIST_ROW_H;
+        uint32_t bg = (idx == win->list_sel) ? rgb(42, 111, 219)
+                                             : rgb(26, 32, 42);
+        buf_rect(b, BODY_W, BODY_H, LIST_X + 1, y, LIST_W - 2 - LIST_SB,
+                 LIST_ROW_H - 1, bg);
+        buf_text(b, BODY_W, BODY_H, LIST_X + 6, y + 2, list_items[idx],
+                 idx == win->list_sel ? rgb(245, 248, 255) : rgb(200, 210, 225),
+                 bg);
+    }
+
+    if (LIST_COUNT > LIST_ROWS) {
+        int track_x = LIST_X + LIST_W - LIST_SB + 1;
+        buf_rect(b, BODY_W, BODY_H, track_x, LIST_Y + 1, LIST_SB - 2,
+                 LIST_H - 2, rgb(34, 38, 46));
+        int span = LIST_H - 2;
+        int thumb_h = span * LIST_ROWS / LIST_COUNT;
+        if (thumb_h < 14) thumb_h = 14;
+        int maxs = list_max_scroll(win);
+        int thumb_y = LIST_Y + 1 +
+                      (maxs ? (span - thumb_h) * win->list_scroll / maxs : 0);
+        buf_rect(b, BODY_W, BODY_H, track_x, thumb_y, LIST_SB - 2, thumb_h,
+                 rgb(112, 128, 152));
+    }
+    clip_pop();
+
+    char st[40];
+    int p = 0;
+    const char* pre = "sel: ";
+    while (*pre && p < 39) st[p++] = *pre++;
+    const char* s = list_items[win->list_sel];
+    while (*s && p < 39) st[p++] = *s++;
+    st[p] = '\0';
+    buf_text(b, BODY_W, BODY_H, LIST_X, LIST_Y + LIST_H + 8, st,
+             rgb(160, 190, 220), rgb(16, 20, 24));
+}
+
+/* Update the list scrollbar from a screen-space mouse y. */
+static void list_scroll_drag(wm_window_t* win, int my) {
+    int maxs = list_max_scroll(win);
+    if (!maxs) { win->list_scroll = 0; return; }
+    int top = win->y + TITLE_H + 1 + LIST_Y + 1;
+    int span = LIST_H - 2;
+    int thumb_h = span * LIST_ROWS / LIST_COUNT;
+    if (thumb_h < 14) thumb_h = 14;
+    int y = my - top - thumb_h / 2;
+    if (y < 0) y = 0;
+    if (y > span - thumb_h) y = span - thumb_h;
+    win->list_scroll = (span - thumb_h) ? y * maxs / (span - thumb_h) : 0;
+}
+
+/* Widgets window: two buttons, an input box and a list control. */
 static void body_render_widgets(int i) {
     wm_window_t* win = &wins[i];
     uint32_t* b = wbuf[i];
@@ -205,9 +338,12 @@ static void body_render_widgets(int i) {
         buf_rect(b, BODY_W, BODY_H, W_IN_X + 6 + win->ilen * GLYPH_W,
                  W_IN_Y + 4, 6, GLYPH_H, rgb(120, 200, 120));
     }
+
+    draw_list(win, b);
 }
 
 static void body_render(int i) {
+    clip_reset(BODY_W, BODY_H);
     if (i == WIDGET_WIN) body_render_widgets(i);
     else body_render_text(i);
 }
@@ -255,6 +391,7 @@ static void draw_cursor(int mx, int my) {
 }
 
 static void compose(int mx, int my) {
+    clip_reset(SW, SH);
     /* Desktop gradient. */
     for (int y = 0; y < SH; y++) {
         uint8_t r = (uint8_t)(24 + y * 24 / (SH ? SH : 1));
@@ -289,7 +426,9 @@ static void compose(int mx, int my) {
         buf_text(scr, SW, SH, win->x + WIN_W - 19, win->y + 2, "x",
                  rgb(255, 240, 240), rgb(190, 60, 60));
 
-        /* Body: copy the window's backing buffer into the screen image. */
+        /* Body: copy the window's backing buffer into the screen image,
+         * clipped to the window body rectangle. */
+        clip_push(win->x + 1, win->y + TITLE_H + 1, BODY_W, BODY_H);
         for (int y = 0; y < BODY_H; y++) {
             int py = win->y + TITLE_H + y;
             if (py < 0 || py >= SH) continue;
@@ -299,15 +438,18 @@ static void compose(int mx, int my) {
                 scr[py * SW + px] = wbuf[i][y * BODY_W + x];
             }
         }
+        clip_pop();
     }
 
     /* Taskbar */
     int ty = SH - TASKBAR_H;
     if (ty > 0) {
         buf_rect(scr, SW, SH, 0, ty, SW, TASKBAR_H, rgb(18, 22, 30));
+        clip_push(4, ty + 4, SW - 8, TASKBAR_H - 8);
         buf_text(scr, SW, SH, 10, ty + 6,
-                 "MuOS WM  drag / scrollbar / buttons / type / ESC exits",
+                 "MuOS WM  drag / scrollbar / list / buttons / type / ESC exits",
                  rgb(200, 210, 225), rgb(18, 22, 30));
+        clip_pop();
     }
 
     draw_cursor(mx, my);
@@ -389,6 +531,8 @@ void wm_run(void) {
     wins[2].tlen = 0;
     wins[3].tlen = 0;
     wins[3].input[0] = '\0';
+    wins[3].list_sel = 0;
+    wins[3].list_scroll = 0;
     strncpy(wins[0].title, "Terminal", 23);
     strncpy(wins[1].title, "System", 23);
     strncpy(wins[2].title, "Editor", 23);
@@ -400,6 +544,7 @@ void wm_run(void) {
     int mx = SW / 2, my = SH / 2;
     int drag_i = -1, drag_dx = 0, drag_dy = 0;
     int scroll_i = -1;
+    int list_scroll_i = -1;
     int prev_left = 0;
     uint32_t last = pit_get_ticks();
     bool_t running = true;
@@ -448,6 +593,20 @@ void wm_run(void) {
                         wins[0].tlen = 0;
                         wins[0].scroll = 0;
                         body_render(0);
+                    } else if (bx >= LIST_X && bx < LIST_X + LIST_W &&
+                               by >= LIST_Y && by < LIST_Y + LIST_H) {
+                        if (bx >= LIST_X + LIST_W - LIST_SB) {
+                            list_scroll_i = i;
+                            list_scroll_drag(win, my);
+                        } else {
+                            int row = (by - LIST_Y - 1) / LIST_ROW_H;
+                            if (row >= 0 && row < LIST_ROWS) {
+                                int idx = win->list_scroll + row;
+                                if (idx >= 0 && idx < LIST_COUNT)
+                                    win->list_sel = idx;
+                            }
+                        }
+                        body_render(i);
                     }
                 } else if (mx >= win->x + WIN_W - 12 &&
                            my >= win->y + TITLE_H + 1 &&
@@ -460,10 +619,14 @@ void wm_run(void) {
                 focus_i = -1;
             }
         }
-        if (!left) { drag_i = -1; scroll_i = -1; }
+        if (!left) { drag_i = -1; scroll_i = -1; list_scroll_i = -1; }
         if (left && scroll_i >= 0) {
             scroll_drag(&wins[scroll_i], my);
             body_render(scroll_i);
+        }
+        if (left && list_scroll_i >= 0) {
+            list_scroll_drag(&wins[list_scroll_i], my);
+            body_render(list_scroll_i);
         }
         if (left && drag_i >= 0) {
             wm_window_t* win = &wins[drag_i];
