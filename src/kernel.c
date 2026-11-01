@@ -193,13 +193,15 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     /* 6b2. ACPI FADT (PM1a control; independent of the disk) */
     acpi_init();
 
-    /* 6c. RTL8139 network card + minimal IPv4 stack */
+    /* 6c. Network card (RTL8139, or Intel E1000) + minimal IPv4 stack */
     if (net_init()) {
-        vga_print("[OK] Network: RTL8139, 10.0.2.15/24\n");
-        serial_write("[OK] RTL8139 network initialized\n");
+        vga_print("[OK] Network: ");
+        vga_print(net_driver_name());
+        vga_print(", 10.0.2.15/24\n");
+        serial_write("[OK] network initialized\n");
     } else {
-        vga_print("[WARN] No supported network card (RTL8139)\n");
-        serial_write("[WARN] No RTL8139 network card\n");
+        vga_print("[WARN] No supported network card (RTL8139/E1000)\n");
+        serial_write("[WARN] no supported network card\n");
     }
 
     /* 7. Keyboard */

@@ -1,6 +1,6 @@
-/* net.c - RTL8139 driver + minimal IPv4 stack and socket ABI.
+/* net.c - RTL8139 / Intel E1000 drivers + minimal IPv4 stack and socket ABI.
  *
- * Deliberately polling based (no IRQ handler): the ISR ROK bit is checked
+ * Deliberately polling based (no IRQ handler): the receive status is checked
  * on every syscall that needs the network. That keeps the driver usable
  * from the kernel shell and from user syscalls without touching IRQ
  * routing, and QEMU's user-mode network responds within a few milliseconds.
@@ -31,6 +31,59 @@
 #define R_RCR       0x44
 #define R_CONFIG1   0x52
 
+/* Intel E1000 (82540EM) register offsets (BAR0, memory mapped) */
+#define E_MMIO_VIRT   0xE0000000u
+#define E_MMIO_SIZE   0x20000u                 /* BAR0 is 128KB */
+#define E_MMIO_PAGES  (E_MMIO_SIZE / PAGE_SIZE)
+
+#define E_REG_CTRL    0x0000
+#define E_REG_STATUS  0x0008
+#define E_REG_EERD    0x0014
+#define E_REG_ICR     0x00C0
+#define E_REG_ITR     0x00C4
+#define E_REG_IMC     0x00D8
+#define E_REG_RCTL    0x0100
+#define E_REG_TCTL    0x0400
+#define E_REG_MTA     0x5200
+#define E_REG_RDBAL   0x2800
+#define E_REG_RDBAH   0x2804
+#define E_REG_RDLEN   0x2808
+#define E_REG_RDH     0x2810
+#define E_REG_RDT     0x2818
+#define E_REG_TDBAL   0x3800
+#define E_REG_TDBAH   0x3804
+#define E_REG_TDLEN   0x3808
+#define E_REG_TDH     0x3810
+#define E_REG_TDT     0x3818
+#define E_REG_RAL0    0x5400
+#define E_REG_RAH0    0x5404
+
+#define E_CTRL_RST    0x04000000u
+#define E_CTRL_SLU    0x00000040u
+#define E_CTRL_ASDE   0x00000020u
+#define E_STATUS_LU   0x00000002u
+
+#define E_RCTL_EN     0x00000002u
+#define E_RCTL_UPE    0x00000008u
+#define E_RCTL_MPE    0x00000010u
+#define E_RCTL_BAM    0x00008000u
+#define E_RCTL_SECRC  0x04000000u
+
+#define E_TCTL_EN     0x00000002u
+#define E_TCTL_PSP    0x00000008u
+#define E_TCTL_CT     0x00000100u             /* 0x10 << 4 */
+#define E_TCTL_COLD   0x00040000u             /* 0x40 << 12 */
+
+#define E_RXD_STAT_DD  0x01
+#define E_TXD_CMD_EOP  0x01
+#define E_TXD_CMD_IFCS 0x02
+#define E_TXD_CMD_RS   0x08
+#define E_TXD_STAT_DD  0x01
+
+#define E_RX_DESC 16
+#define E_TX_DESC 8
+#define E_BUF_SIZE 2048u
+
 #define ETH_TYPE_IP  0x0800
 #define ETH_TYPE_ARP 0x0806
 
@@ -39,6 +92,26 @@ typedef struct {
     uint8_t  mac[6];
     bool_t   used;
 } arp_entry_t;
+
+/* E1000 DMA descriptor rings (hardware reads/writes these directly). */
+typedef struct {
+    volatile uint64_t addr;
+    volatile uint16_t length;
+    volatile uint16_t checksum;
+    volatile uint8_t  status;
+    volatile uint8_t  errors;
+    volatile uint16_t special;
+} __attribute__((packed)) e1000_rx_desc_t;
+
+typedef struct {
+    volatile uint64_t addr;
+    volatile uint16_t length;
+    volatile uint8_t  cso;
+    volatile uint8_t  cmd;
+    volatile uint8_t  status;
+    volatile uint8_t  css;
+    volatile uint16_t special;
+} __attribute__((packed)) e1000_tx_desc_t;
 
 typedef struct {
     bool_t   used;
@@ -116,12 +189,26 @@ typedef struct {
 #define TCP_F_PSH 0x08
 #define TCP_F_ACK 0x10
 
+typedef enum {
+    NET_DRV_NONE = 0,
+    NET_DRV_RTL8139,
+    NET_DRV_E1000
+} net_drv_t;
+
 static uint16_t io_base;
 static bool_t   present;
+static net_drv_t driver = NET_DRV_NONE;
 static uint8_t  mac_addr[6];
 static uint32_t my_ip, my_mask, gateway;
 static uint32_t rx_capr;
 static int      tx_next;
+
+static volatile uint32_t* e_mmio;
+static e1000_rx_desc_t e_rx_ring[E_RX_DESC] __attribute__((aligned(16)));
+static e1000_tx_desc_t e_tx_ring[E_TX_DESC] __attribute__((aligned(16)));
+static uint8_t e_rx_buf[E_RX_DESC][E_BUF_SIZE] __attribute__((aligned(16)));
+static uint8_t e_tx_buf[E_TX_DESC][E_BUF_SIZE] __attribute__((aligned(16)));
+static int e_rx_cur, e_tx_cur;
 static arp_entry_t arp_cache[4];
 static net_sock_t  socks[NET_FD_MAX - NET_FD_BASE];
 static uint16_t    next_port = 40000;
@@ -358,8 +445,7 @@ static void ring_read(uint32_t start, uint8_t* dst, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) dst[i] = rx_buffer[(start + i) % RX_SIZE];
 }
 
-static void net_poll(void) {
-    if (!present) return;
+static void rtl_poll(void) {
     for (uint32_t guard = 0; guard < 64; guard++) {
         uint16_t isr = inw(io_base + R_ISR);
         if (!(isr & 0x0001)) break;          /* ROK */
@@ -392,8 +478,8 @@ static void net_poll(void) {
 
 /* ---------------- transmit path ---------------- */
 
-static void net_send_frame(const uint8_t* frame, uint32_t len) {
-    if (!present || len < 14 || len > TX_MAX) return;
+static void rtl_send_frame(const uint8_t* frame, uint32_t len) {
+    if (len < 14 || len > TX_MAX) return;
     memcpy(tx_buffer, frame, len);
     uint32_t phys = mm_virt_to_phys((uint32_t)tx_buffer);
     int slot = tx_next;
@@ -405,6 +491,106 @@ static void net_send_frame(const uint8_t* frame, uint32_t len) {
     for (uint32_t n = 0; n < 200000; n++) {
         if (inl(io_base + R_TSD0 + (uint32_t)slot * 4) & 0x8000u) break;
     }
+}
+
+/* ---------------- Intel E1000 (82540EM) ---------------- */
+
+static uint32_t e_rd(uint32_t off) { return e_mmio[off >> 2]; }
+static void e_wr(uint32_t off, uint32_t v) { e_mmio[off >> 2] = v; }
+
+/* Init runs before the kernel enables interrupts, so the PIT tick does not
+ * advance here; use the POST port as a rough microsecond delay instead. */
+static void e_delay_ms(uint32_t ms) {
+    for (uint32_t i = 0; i < ms * 1000; i++) outb(0x80, 0);
+}
+
+static uint16_t e_eeprom_read(uint8_t addr) {
+    e_wr(E_REG_EERD, ((uint32_t)addr << 8) | 0x1);
+    for (uint32_t n = 0; n < 100000; n++) {
+        uint32_t v = e_rd(E_REG_EERD);
+        if (v & 0x2) return (uint16_t)(v >> 16);   /* done */
+        if (!(v & 0x1)) break;                     /* start cleared, failed */
+    }
+    return 0xFFFF;
+}
+
+static void e_read_mac(void) {
+    uint16_t w0 = e_eeprom_read(0);
+    uint16_t w1 = e_eeprom_read(1);
+    uint16_t w2 = e_eeprom_read(2);
+    if (w0 != 0xFFFF) {
+        mac_addr[0] = (uint8_t)(w0 & 0xFF);
+        mac_addr[1] = (uint8_t)(w0 >> 8);
+        mac_addr[2] = (uint8_t)(w1 & 0xFF);
+        mac_addr[3] = (uint8_t)(w1 >> 8);
+        mac_addr[4] = (uint8_t)(w2 & 0xFF);
+        mac_addr[5] = (uint8_t)(w2 >> 8);
+    } else {
+        /* No EEPROM (or read failed): use the receive address registers. */
+        uint32_t ral = e_rd(E_REG_RAL0), rah = e_rd(E_REG_RAH0);
+        mac_addr[0] = (uint8_t)(ral & 0xFF);
+        mac_addr[1] = (uint8_t)((ral >> 8) & 0xFF);
+        mac_addr[2] = (uint8_t)((ral >> 16) & 0xFF);
+        mac_addr[3] = (uint8_t)((ral >> 24) & 0xFF);
+        mac_addr[4] = (uint8_t)(rah & 0xFF);
+        mac_addr[5] = (uint8_t)((rah >> 8) & 0xFF);
+    }
+}
+
+static void e1000_poll(void) {
+    for (uint32_t guard = 0; guard < 64; guard++) {
+        e1000_rx_desc_t* d = &e_rx_ring[e_rx_cur];
+        if (!(d->status & E_RXD_STAT_DD)) break;
+        uint16_t plen = d->length;
+        uint8_t  errs = d->errors;
+        int idx = e_rx_cur;
+        d->status = 0;
+        /* Hand the descriptor back to the hardware (RDT = last available). */
+        e_wr(E_REG_RDT, (uint32_t)idx);
+        e_rx_cur = (e_rx_cur + 1) % E_RX_DESC;
+
+        if (errs || plen < 14) continue;
+        uint32_t flen = plen;
+        if (flen > sizeof(rx_frame)) flen = sizeof(rx_frame);
+        memcpy(rx_frame, e_rx_buf[idx], flen);
+        net_handle_frame(rx_frame, flen);
+    }
+    tcp_timers();
+}
+
+static void e1000_send(const uint8_t* frame, uint32_t len) {
+    if (len < 14 || len > E_BUF_SIZE) return;
+    int slot = e_tx_cur;
+    memcpy(e_tx_buf[slot], frame, len);
+    e_tx_ring[slot].addr = (uint64_t)mm_virt_to_phys((uint32_t)e_tx_buf[slot]);
+    e_tx_ring[slot].length = (uint16_t)len;
+    e_tx_ring[slot].cso = 0;
+    e_tx_ring[slot].status = 0;
+    e_tx_ring[slot].css = 0;
+    e_tx_ring[slot].special = 0;
+    e_tx_ring[slot].cmd = E_TXD_CMD_EOP | E_TXD_CMD_IFCS | E_TXD_CMD_RS;
+    e_wr(E_REG_TDT, (uint32_t)((slot + 1) % E_TX_DESC));
+
+    /* Wait for descriptor done so the buffer can be reused. */
+    for (uint32_t n = 0; n < 1000000; n++) {
+        if (e_tx_ring[slot].status & E_TXD_STAT_DD) break;
+    }
+    e_tx_ring[slot].status = 0;
+    e_tx_cur = (slot + 1) % E_TX_DESC;
+}
+
+/* ---------------- driver dispatch ---------------- */
+
+static void net_poll(void) {
+    if (!present) return;
+    if (driver == NET_DRV_E1000) e1000_poll();
+    else rtl_poll();
+}
+
+static void net_send_frame(const uint8_t* frame, uint32_t len) {
+    if (!present) return;
+    if (driver == NET_DRV_E1000) e1000_send(frame, len);
+    else rtl_send_frame(frame, len);
 }
 
 static bool_t arp_resolve(uint32_t ip, uint8_t* out) {
@@ -574,13 +760,25 @@ static void dhcp_build(uint8_t* p, uint8_t msgtype,
     p[i++] = 255;
 }
 
+/* Poll for a DHCP reply for up to `ms` milliseconds. Kernel init still runs
+ * with interrupts disabled, and a pure polling loop starves QEMU's main loop
+ * (slirp never answers, and the e1000 keeps the first packets in its net
+ * queue for ~1s). Sleeping one PIT tick per iteration lets it run. */
+static void dhcp_wait(uint32_t ms) {
+    uint32_t ticks = (ms + 9) / 10;
+    for (uint32_t t = 0; t < ticks && !dhcp_seen; t++) {
+        __asm__ volatile ("sti; hlt; cli");
+        for (uint32_t k = 0; k < 20; k++) net_poll();
+    }
+}
+
 static bool_t dhcp_run(void) {
     uint8_t bootp[300];
 
     dhcp_seen = false;
     dhcp_build(bootp, 1, 0, 0);              /* DISCOVER */
     net_send_ip(17, 0xFFFFFFFFu, bootp, 300, 68, 67);
-    for (int i = 0; i < 120000 && !dhcp_seen; i++) net_poll();
+    dhcp_wait(1500);
     if (!dhcp_seen || dhcp_type != 2 || dhcp_yiaddr == 0) return false;
 
     uint32_t offer = dhcp_yiaddr;
@@ -589,7 +787,7 @@ static bool_t dhcp_run(void) {
     dhcp_seen = false;
     dhcp_build(bootp, 3, offer, server);     /* REQUEST */
     net_send_ip(17, 0xFFFFFFFFu, bootp, 300, 68, 67);
-    for (int i = 0; i < 120000 && !dhcp_seen; i++) net_poll();
+    dhcp_wait(500);
     if (!dhcp_seen || dhcp_type != 5) return false;
 
     my_ip = dhcp_yiaddr;
@@ -1358,7 +1556,7 @@ void net_tick(void) {
 
 /* ---------------- init ---------------- */
 
-bool_t net_init(void) {
+static bool_t rtl_init(void) {
     uint8_t bus = 0, slot = 0, func = 0;
     if (!pci_find(PCI_VENDOR_REALTEK, PCI_DEVICE_RTL8139,
                   &bus, &slot, &func)) return false;
@@ -1375,12 +1573,6 @@ bool_t net_init(void) {
     }
 
     mac_read();
-    my_ip = NET_DEFAULT_IP;
-    my_mask = NET_DEFAULT_MASK;
-    gateway = NET_DEFAULT_GW;
-
-    memset(arp_cache, 0, sizeof(arp_cache));
-    memset(socks, 0, sizeof(socks));
     rx_capr = 0;
     tx_next = 0;
 
@@ -1393,7 +1585,102 @@ bool_t net_init(void) {
     outl(io_base + R_TCR, 0x0300);
     outw(io_base + R_CAPR, 0xFFF0);            /* internal read pointer = 0 */
     outb(io_base + R_CMD, 0x0C);               /* RE|TE */
+    return true;
+}
+
+static bool_t e1000_init(void) {
+    uint8_t bus = 0, slot = 0, func = 0;
+    if (!pci_find(PCI_VENDOR_INTEL, PCI_DEVICE_E1000,
+                  &bus, &slot, &func)) return false;
+
+    uint32_t bar = pci_read32(bus, slot, func, 0x10);
+    if (bar & 1) return false;                 /* need a memory BAR */
+    uint32_t phys = bar & ~0xFu;
+
+    /* Map BAR0 (128KB) uncached at a dedicated kernel virtual range. */
+    for (uint32_t i = 0; i < E_MMIO_PAGES; i++) {
+        if (!mm_map_page(phys + i * PAGE_SIZE, E_MMIO_VIRT + i * PAGE_SIZE,
+                         PAGE_KERNEL | PDE_PCD)) return false;
+    }
+    e_mmio = (volatile uint32_t*)E_MMIO_VIRT;
+
+    /* Reset the controller, then enable memory decoding + bus mastering
+     * (the reset clears the PCI command register). */
+    e_wr(E_REG_IMC, 0xFFFFFFFFu);
+    e_wr(E_REG_CTRL, e_rd(E_REG_CTRL) | E_CTRL_RST);
+    for (uint32_t n = 0; n < 1000; n++) {
+        if (!(e_rd(E_REG_CTRL) & E_CTRL_RST)) break;
+        e_delay_ms(1);
+    }
+    e_delay_ms(10);
+    pci_enable_mem_busmaster(bus, slot, func);
+    e_wr(E_REG_IMC, 0xFFFFFFFFu);               /* polling only */
+    e_wr(E_REG_ICR, 0xFFFFFFFFu);
+    e_wr(E_REG_ITR, 0);
+
+    e_read_mac();
+    e_wr(E_REG_RAL0, (uint32_t)mac_addr[0] | ((uint32_t)mac_addr[1] << 8) |
+                     ((uint32_t)mac_addr[2] << 16) |
+                     ((uint32_t)mac_addr[3] << 24));
+    e_wr(E_REG_RAH0, ((uint32_t)mac_addr[4] | ((uint32_t)mac_addr[5] << 8) |
+                     0x80000000u));             /* address valid */
+
+    for (uint32_t i = 0; i < 128; i++) e_wr(E_REG_MTA + i * 4, 0);
+
+    /* Receive ring: 16 descriptors, 2KB buffers, no CRC in the buffer. */
+    e_rx_cur = 0;
+    for (int i = 0; i < E_RX_DESC; i++) {
+        e_rx_ring[i].addr = (uint64_t)mm_virt_to_phys((uint32_t)e_rx_buf[i]);
+        e_rx_ring[i].status = 0;
+        e_rx_ring[i].special = 0;
+    }
+    e_wr(E_REG_RDBAL, mm_virt_to_phys((uint32_t)e_rx_ring));
+    e_wr(E_REG_RDBAH, 0);
+    e_wr(E_REG_RDLEN, sizeof(e_rx_ring));
+    e_wr(E_REG_RDH, 0);
+    e_wr(E_REG_RDT, E_RX_DESC - 1);
+
+    /* Transmit ring: 8 descriptors, 2KB buffers. */
+    e_tx_cur = 0;
+    for (int i = 0; i < E_TX_DESC; i++) {
+        e_tx_ring[i].addr = (uint64_t)mm_virt_to_phys((uint32_t)e_tx_buf[i]);
+        e_tx_ring[i].status = 0;
+        e_tx_ring[i].cmd = 0;
+    }
+    e_wr(E_REG_TDBAL, mm_virt_to_phys((uint32_t)e_tx_ring));
+    e_wr(E_REG_TDBAH, 0);
+    e_wr(E_REG_TDLEN, sizeof(e_tx_ring));
+    e_wr(E_REG_TDH, 0);
+    e_wr(E_REG_TDT, 0);
+
+    e_wr(E_REG_TCTL, E_TCTL_EN | E_TCTL_PSP | E_TCTL_CT | E_TCTL_COLD);
+    e_wr(E_REG_RCTL, E_RCTL_EN | E_RCTL_BAM | E_RCTL_UPE | E_RCTL_MPE |
+                     E_RCTL_SECRC);
+    e_wr(E_REG_CTRL, E_CTRL_SLU | E_CTRL_ASDE);
+
+    /* Bring the link up (QEMU reports it immediately). */
+    for (uint32_t n = 0; n < 200; n++) {
+        if (e_rd(E_REG_STATUS) & E_STATUS_LU) break;
+        e_delay_ms(1);
+    }
+    return true;
+}
+
+bool_t net_init(void) {
+    if (rtl_init()) {
+        driver = NET_DRV_RTL8139;
+    } else if (e1000_init()) {
+        driver = NET_DRV_E1000;
+    } else {
+        return false;
+    }
+
     present = true;
+    my_ip = NET_DEFAULT_IP;
+    my_mask = NET_DEFAULT_MASK;
+    gateway = NET_DEFAULT_GW;
+    memset(arp_cache, 0, sizeof(arp_cache));
+    memset(socks, 0, sizeof(socks));
 
     if (tcp_reorder_selftest())
         serial_write("[net] TCP-REORDER-OK\n");
@@ -1415,12 +1702,16 @@ bool_t net_init(void) {
     } else {
         serial_write("[net] DHCP unavailable, using static 10.0.2.15\n");
     }
-    serial_write("[net] RTL8139 initialized\n");
+    serial_write("[net] ");
+    serial_write(net_driver_name());
+    serial_write(" initialized\n");
     return true;
 }
 
 bool_t net_present(void) { return present; }
-const char* net_driver_name(void) { return "RTL8139"; }
+const char* net_driver_name(void) {
+    return driver == NET_DRV_E1000 ? "E1000" : "RTL8139";
+}
 void net_get_mac(uint8_t out[6]) { memcpy(out, mac_addr, 6); }
 uint32_t net_get_ip(void) { return my_ip; }
 uint32_t net_get_gateway(void) { return gateway; }

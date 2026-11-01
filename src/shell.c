@@ -229,7 +229,7 @@ static void help_run_modes(void){
     vga_print("  pie        ET_DYN/PIE relocations\n");
     vga_print("  dyn        PT_INTERP + shared libraries\n");
     vga_print("  tls        static TLS (initial-exec + global-dynamic)\n");
-    vga_print("  net        RTL8139 ICMP/UDP\n");
+    vga_print("  net        RTL8139/E1000 ICMP/UDP\n");
     vga_print("  tcp        TCP echo + accept + socket names\n");
     vga_print("  perm       uid/gid inheritance + file permissions\n");
     vga_print("  fork       fork + waitpid over COW pages\n");

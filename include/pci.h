@@ -10,6 +10,8 @@
 
 #define PCI_VENDOR_REALTEK 0x10EC
 #define PCI_DEVICE_RTL8139 0x8139
+#define PCI_VENDOR_INTEL   0x8086
+#define PCI_DEVICE_E1000   0x100E
 
 uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off);
 uint16_t pci_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off);
@@ -23,5 +25,8 @@ bool_t pci_find(uint16_t vendor, uint16_t device,
 
 /* Enable I/O decoding and bus mastering in the command register. */
 void pci_enable_io_busmaster(uint8_t bus, uint8_t slot, uint8_t func);
+
+/* Enable memory decoding and bus mastering (for MMIO devices). */
+void pci_enable_mem_busmaster(uint8_t bus, uint8_t slot, uint8_t func);
 
 #endif

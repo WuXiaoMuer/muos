@@ -241,8 +241,10 @@ USER_SIGTRAMP = 0x08847000
 
 ### 7.8 网络与 socket ABI(pci.c / net.c)
 
-- `pci.c`:机制 #1 配置空间读写(0xCF8 地址、0xCFC 数据),`pci_find(0x10EC,0x8139)` 扫 bus 0–7/slot 0–31,读 BAR0 得到 I/O 基址并置命令寄存器 bit0(I/O)+bit2(bus master)。
-- `net.c` 驱动:RTL8139 软复位(0x37 bit4)后读 MAC(0x00–0x05),设置 RBSTART(0x30,物理地址由 `mm_virt_to_phys` 给出)、RCR=0x100F(全接收 + 32K 环)、TCR、CAPR、CMD=0x0C(RE|TE)。**CAPR 在 RTL8139/QEMU 中比内部读指针超前 16 字节**,因此写入 `rx_capr - 0x10`(初始 0xFFF0),否则 QEMU 会判定 16 字节可用并触发 RxOverflow。接收走轮询:`ISR(0x3E) & ROK`,先写 0xFFFF 应答,再按 4 字节头部(状态/长度)读环,长度含 4 字节 CRC;发送用 4 个描述符轮转(TSAD/TSD,轮询 bit15 完成),发送缓冲与接收环都是内核静态 BSS 的物理地址。
+- `pci.c`:机制 #1 配置空间读写(0xCF8 地址、0xCFC 数据),`pci_find` 扫 bus 0–7/slot 0–31 定位 RTL8139(0x10EC:0x8139)或 Intel E1000(0x8086:0x100E);RTL 读 BAR0 得到 I/O 基址并置命令寄存器 bit0(I/O)+bit2(bus master),E1000 用 `pci_enable_mem_busmaster` 置 bit1(memory)+bit2(bus master)。
+- `net.c` 驱动(RTL8139 先试,E1000 回退):RTL8139 软复位(0x37 bit4)后读 MAC(0x00–0x05),设置 RBSTART(0x30,物理地址由 `mm_virt_to_phys` 给出)、RCR=0x100F(全接收 + 32K 环)、TCR、CAPR、CMD=0x0C(RE|TE)。**CAPR 在 RTL8139/QEMU 中比内部读指针超前 16 字节**,因此写入 `rx_capr - 0x10`(初始 0xFFF0),否则 QEMU 会判定 16 字节可用并触发 RxOverflow。接收走轮询:`ISR(0x3E) & ROK`,先写 0xFFFF 应答,再按 4 字节头部(状态/长度)读环,长度含 4 字节 CRC;发送用 4 个描述符轮转(TSAD/TSD,轮询 bit15 完成),发送缓冲与接收环都是内核静态 BSS 的物理地址。
+- E1000(82540EM):BAR0 是 memory BAR,按 32 页(128KB)以 `mm_map_page(..., PAGE_KERNEL|PDE_PCD)` 映射到 `0xE0000000`;CTRL.RST 软复位后**再**打开 PCI memory/master(复位会清命令寄存器);从 EERD 读 EEPROM 前 3 字取 MAC 并写入 RAL0/RAH0(AV 位);RX 16×16B 描述符环 + 16×2KB 缓冲,RCTL=EN|BAM|UPE|MPE|SECRC,TX 8 项描述符环,TCTL=EN|PSP|CT|COLD;轮询 RX `status.DD` 取包后把 RDT 写回刚消费的下标,发送填描述符→写 TDT→轮询 DD。`net_poll/net_send_frame` 按 `driver` 枚举(DRV_RTL8139/DRV_E1000)分发,协议栈与驱动无关。
+- 开机时中断仍关闭,而 E1000 的**纯轮询**会让 QEMU 主循环得不到调度(DHCP 报文卡在 net 队列、slirp 不应答);`dhcp_wait` 因此每 10ms 执行 `sti; hlt; cli` 让出 CPU,OFFER/ACK 最多各等 1.5s/0.5s。
 - 协议:ARP 缓存 4 项(请求/应答,收到请求且目标是自己时回 MAC);IPv4 20 字节头 + 校验和,按掩码判断是否经网关;ICMP echo 请求自动回 reply;UDP 无校验和。收到的报文按 socket 分发:RAW 存 IP 载荷(ICMP 消息),DGRAM 按本地端口存 UDP 载荷。
 - socket 表 8 槽:`net_socket(type,proto)` 支持 DGRAM/RAW/STREAM(其他类型 ENOSYS),`bind/connect/listen/accept/sendto/recvfrom/getsockname/getpeername`;`recvfrom/accept` 在 syscall 内以 `sti; hlt; cli` 轮询约 3 秒,超时返回 `NET_EAGAIN`(-11),由 syscall 层转成 `-EAGAIN`。注意内核态轮询不会被 Ring3 抢占(见 7.7),因此两个进程的 client/server 并发还需后续用网络事件唤醒阻塞进程;当前 accept 用同进程自连接验证。对端地址结构按 i386 `sockaddr_in`(family/网络序 port/4 字节 IP)解析与回填。
 - syscall:直接编号 `socket(359)/bind(361)/connect(362)/shutdown(373)/sendto(369)/recvfrom(371)`,以及旧式 `socketcall(102)`(1/2/3/4/5/9/10/11/12 等);socket fd 固定为 16–23,`close(6)` 会先识别该区间再释放 socket 槽。`listen(363)/accept4(364)` 也已接入;`send/recv` 复用 `sendto/recvfrom`(无地址参数)。固定兜底配置 10.0.2.15/24、网关 10.0.2.2、DNS 10.0.2.3(QEMU user-net 默认值)。
@@ -347,8 +349,10 @@ USER_SIGTRAMP = 0x08847000
 | `parts[] / nparts / partitioned` | part.c | MBR/GPT 分区表与“不要格式化”标志 |
 | `vol / dirbuf` | fat.c | FAT32 卷参数与 16KB 目录簇缓冲 |
 | `vol / blkbuf` | ext2.c | ext2 卷参数与块缓冲 |
-| `io_base / present / mac_addr` | net.c | RTL8139 I/O 基址、探测结果与 MAC |
-| `rx_buffer / tx_buffer` | net.c | 32K 接收环与发送 DMA 缓冲(物理地址交给网卡) |
+| `io_base / present / mac_addr / driver` | net.c | RTL8139 I/O 基址、探测结果、MAC 与当前驱动枚举 |
+| `rx_buffer / tx_buffer` | net.c | RTL 32K 接收环与发送 DMA 缓冲(物理地址交给网卡) |
+| `e_mmio / e_rx_ring / e_tx_ring` | net.c | E1000 MMIO 虚拟基址与 RX(16)/TX(8) 描述符环 |
+| `e_rx_buf / e_tx_buf` | net.c | E1000 每描述符 2KB 收发缓冲(DMA 物理地址) |
 | `socks[] / arp_cache[]` | net.c | 8 个 socket 槽与 4 项 ARP 缓存 |
 | `info / fb / active` | fb.c | VBE 模式信息、恒等映射后的显存指针与启用状态 |
 | `cells[] / pending` | vga.c | 80×25 影子文本网格与"等待帧缓冲"标志 |
@@ -365,7 +369,7 @@ USER_SIGTRAMP = 0x08847000
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;用户页按需分配并可换出到 MuFS 盘尾部(单页与 600 页压力自检已过,但无文件页缓存、无 swapon 控制与换出优先级)
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
 3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc `.so` 验证(真实 musl loader + libc.so + 动态 BusyBox 已由 `tools/test_realso.py` 端到端跑通),遇到未知重定位会明确报错;`MAP_SHARED` 不写回;FAT32/ext2 已以 `/fat`、`/ext2` 接入 VFS(读写、文件与目录的删除/重命名/建目录,整文件回写且单文件 64KB 上限),ext2 尚无多级间接
-4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents/unlink/rename/mkdir/rmdir`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),文件与目录均可改名;ext2 支持创建/覆盖/删除文件与目录(位图分配、目录项插入与合并、单级间接),但无多级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列/WS 缩放/3 次重复 ACK 快速重传/阻塞 accept;尚无 SACK 与时间戳选项);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents/unlink/rename/mkdir/rmdir`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),文件与目录均可改名;ext2 支持创建/覆盖/删除文件与目录(位图分配、目录项插入与合并、单级间接),但无多级间接;FAT32 只识别第一个卷;网络为 RTL8139 或 Intel E1000(先试 RTL 再回退)+ ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列/WS 缩放/3 次重复 ACK 快速重传/阻塞 accept;尚无 SACK 与时间戳选项);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标在文本桌面按 8×16 单元粗粒度移动,在 `pixel` 中映射到像素坐标;无滚轮/右键菜单/双击标题栏最大化

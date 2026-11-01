@@ -17,11 +17,11 @@
 - 内核自检 **88/0**;`tools/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
 - `src/syscall.c` 已定义 **120+ 个 Linux i386 系统调用号**,覆盖进程/stdio、信号、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。
 - 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
-- 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run tls`(静态 TLS:initial-exec + global-dynamic)、`run net`(RTL8139 + ICMP/UDP socket ABI)、`run tcp`(双连接回显 + 真实 getsockname/getpeername + listen/accept 自连接)、`part/fatls/fatcat/fatwrite/ext2ls/ext2cat/ext2write`(MBR/GPT FAT32 与 ext2 读写)、`run vfs`(/fat、/ext2 挂载的 open/read/write/stat/getdents64,`tools/test_fs_read.py`)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。ISO 路径额外用 QMP `screendump` 验证 VBE 文本渲染。
+- 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run tls`(静态 TLS:initial-exec + global-dynamic)、`run net`(RTL8139/E1000 + ICMP/UDP socket ABI;`tools/test_e1000.py` 用 `model=e1000` 复测)、`run tcp`(双连接回显 + 真实 getsockname/getpeername + listen/accept 自连接)、`part/fatls/fatcat/fatwrite/ext2ls/ext2cat/ext2write`(MBR/GPT FAT32 与 ext2 读写)、`run vfs`(/fat、/ext2 挂载的 open/read/write/stat/getdents64,`tools/test_fs_read.py`)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。ISO 路径额外用 QMP `screendump` 验证 VBE 文本渲染。
 - 进程模型:每进程页目录 + **按需分页用户窗口**(首次访问分配零页,无预分配物理块)、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持),并已用真实 musl loader + libc.so 端到端验证动态 BusyBox;真实 glibc 尚未验证;网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列、对端窗口与 WS 缩放、3 次重复 ACK 快速重传、阻塞 accept;尚无 SACK/时间戳选项);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir/rmdir,文件与目录可改名,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB;ext2 支持创建/覆盖/删除文件与目录(位图分配、目录项插入与合并、单级间接),但无多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(有单页与 600 页压力自检,但无 swapon 控制、无换出优先级,也未在真实低空闲内存下压测调度换出);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持),并已用真实 musl loader + libc.so 端到端验证动态 BusyBox;真实 glibc 尚未验证;网络支持 RTL8139 与 Intel E1000(先试 RTL,再试 8086:100E;E1000 为 MMIO BAR0 + 16/8 项描述符环)+ ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列、对端窗口与 WS 缩放、3 次重复 ACK 快速重传、阻塞 accept;尚无 SACK/时间戳选项);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir/rmdir,文件与目录可改名,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB;ext2 支持创建/覆盖/删除文件与目录(位图分配、目录项插入与合并、单级间接),但无多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(有单页与 600 页压力自检,但无 swapon 控制、无换出优先级,也未在真实低空闲内存下压测调度换出);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
 
 ## 后续计划(建议顺序)
 
@@ -54,7 +54,7 @@
 ### P4 平台外设
 - [x] ATA PIO(primary master,28-bit LBA)块设备 `/dev/hda`,读/写/部分扇区 RMW;`tools/test_ata.py` 两次启动验证持久化
 - [x] 持久化文件系统 MuFS:扇区 0 超级块、扇区 2–8 文件/目录元数据表、扇区 16 起 16×64KB 数据槽;每次变更写穿(元数据表 + 涉及扇区),`fsync/sync` 全量刷新,开机 `fs_persist_mount` 挂载或首次格式化;`run fsata` → 重启 `run fsread` 验证
-- [x] 网络:PCI 枚举 + RTL8139(轮询 ISR,32K RX 环)+ ARP/IPv4/ICMP echo/UDP + DHCP 客户端;`run net` 实测 ping 网关与 DNS 查询成功
+- [x] 网络:PCI 枚举 + RTL8139(轮询 ISR,32K RX 环)+ Intel E1000(82540EM,BAR0 128KB uncached MMIO、16 项 RX / 8 项 TX 描述符环、EEPROM MAC、轮询 DD)回退链 + ARP/IPv4/ICMP echo/UDP + DHCP 客户端;`run net` 实测 ping 网关与 DNS 查询成功,`tools/test_e1000.py` 在 `model=e1000` 下验证 `NET-OK`/`TCP-OK`/`BACC-OK`
 - [x] 分区与真实文件系统:MBR 4 项 + GPT(保护性 MBR → LBA1 头/LBA2 表项,Basic Data GUID);FAT32 读取(8.3/VFAT 长名/簇链/子目录)与**写入**(创建/覆盖 8.3 文件、簇分配与释放、双 FAT 写穿);ext2 读取(超级块/组描述符/直接块 + 一级间接)与**写入**(块/inode 位图分配、目录项插入/分裂/合并、覆盖前释放旧块、删除文件并回收块与 inode、空闲计数更新);有分区表时 MuFS 拒绝格式化;`part/fatls/fatcat/fatwrite/ext2ls/ext2cat/ext2write` + `tools/test_fs_read.py`(MBR/GPT FAT32 + ext2 镜像 + 二次启动写入持久化)实测通过
 - [x] MuFS 元数据写前日志:提交前把 meta/dir 副本写到扇区 10–15 并置扇区 9 头魔数,真实表写完后清除;挂载时发现有效头即重放。槽位引用计数归零后回收(空间回收已随 unlink 生效)
 - [x] FAT32/ext2 接入 VFS:`/fat`、`/ext2` 挂载,路径解析落到卷内文件;用户态 `open/read/write/stat/lseek/getdents64/unlink/rename/mkdir/rmdir` 直接读写分区文件(open 支持 `O_CREAT/O_TRUNC`,写为整文件回写,单文件 64KB 上限),`rename` 保留数据簇、`unlink` 回收簇链/inode 并清理 LFN 项,目录删除前校验仅剩 `.`/`..` 并回收目录簇/inode,目录改名会同步修正 `..` 与链接数;`ls /fat`、`cat /fat/<file>` 与 `run vfs` 实测通过
@@ -163,7 +163,7 @@
 - [ ] fs 截断告警(fs_write 返回实际写入量,调用方检查)
 - [ ] 内核堆 Grow(耗尽时向 vmm 要新页)
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
-- [x] 网卡(RTL8139)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] TCP 窗口缩放/阻塞 accept、其他网卡;MuFS 仍是整槽布局,无块分配位图/碎片整理
+- [x] 网卡(RTL8139 + Intel E1000)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] 更多网卡型号、IRQ 驱动方式;MuFS 仍是整槽布局,无块分配位图/碎片整理
 - [x] 符号版本化:解析 `DT_VERSYM/DT_VERDEF/DT_VERNEED`,按版本名筛选提供者并处理隐藏版本位;未版本化 `.so` 仍兼容
 - [ ] 动态链接器兼容真实 libc 产物(仍未用真实 glibc/musl `.so` 端到端验证;`.gnu.hash`/TLS/`R_386_COPY`/`IRELATIVE` 已支持)
 - [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作

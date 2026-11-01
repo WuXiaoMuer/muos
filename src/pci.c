@@ -53,3 +53,12 @@ void pci_enable_io_busmaster(uint8_t bus, uint8_t slot, uint8_t func) {
     v = (v & 0xFFFF0000u) | cmd;
     pci_write32(bus, slot, func, 0x04, v);
 }
+
+void pci_enable_mem_busmaster(uint8_t bus, uint8_t slot, uint8_t func) {
+    /* Command register at 0x04: bit1 = memory space, bit2 = bus master. */
+    uint16_t cmd = pci_read16(bus, slot, func, 0x04);
+    cmd |= 0x0002 | 0x0004;
+    uint32_t v = pci_read32(bus, slot, func, 0x04);
+    v = (v & 0xFFFF0000u) | cmd;
+    pci_write32(bus, slot, func, 0x04, v);
+}

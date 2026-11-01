@@ -2,10 +2,11 @@
 #define MUOS_NET_H
 #include "types.h"
 
-/* Minimal IPv4 stack over an RTL8139 (QEMU `-nic user,model=rtl8139`).
- * Supported: ARP, IPv4, ICMP echo, UDP, plus a small socket table exposed
- * through the Linux i386 socket syscalls. There is no TCP, no DHCP and no
- * dynamic configuration: the address is the QEMU user-net default
+/* Minimal IPv4 stack over an RTL8139 (`-nic user,model=rtl8139`) or an
+ * Intel E1000 (`-nic user,model=e1000`; the RTL is probed first).
+ * Supported: ARP, IPv4, ICMP echo, UDP, DHCP and a small TCP client /
+ * server, plus a socket table exposed through the Linux i386 socket
+ * syscalls. The static fallback address is the QEMU user-net default
  * 10.0.2.15/24 with gateway 10.0.2.2 and DNS 10.0.2.3. */
 
 #define NET_IP(a,b,c,d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
