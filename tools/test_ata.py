@@ -37,14 +37,16 @@ def main():
         with open(DISK, "wb") as f:
             f.truncate(8 * 1024 * 1024)
 
-    t1 = boot(["run fsata", "run ata"], 4466, "boot1")
-    t2 = boot(["run fsread", "run ataread"], 4467, "boot2")
+    t1 = boot(["run fsata", "run ata", "swap", "swaptest"], 4466, "boot1")
+    t2 = boot(["run fsread", "run ataread", "swaptest"], 4467, "boot2")
 
     checks = {
         "boot1 FS-PERSIST-OK": "FS-PERSIST-OK" in t1,
         "boot1 ATA-OK": "ATA-OK" in t1,
+        "boot1 SWAP-OK": "SWAP-OK" in t1,
         "boot2 FS-PERSIST-OK": "FS-PERSIST-OK" in t2,
         "boot2 ATA-PERSIST-OK": "ATA-PERSIST-OK" in t2,
+        "boot2 SWAP-OK": "SWAP-OK" in t2,
     }
     for k, v in checks.items():
         print(f"{k}: {v}")

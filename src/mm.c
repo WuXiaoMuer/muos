@@ -4,6 +4,7 @@
 #include "vga.h"
 #include "user.h"
 #include "string.h"
+#include "swap.h"
 
 /* External symbol defined in linker script */
 extern uint32_t _kernel_end;
@@ -425,6 +426,12 @@ uint32_t mm_create_user_pd(uint32_t tramp_phys) {
     return (uint32_t)pd;
 }
 
+/* A non-present user PTE carrying a swap slot: bit1 marks it, bits 12+
+ * hold the slot index. Bit1 is also PTE_WRITABLE, so the present bit must
+ * be clear first. */
+#define PTE_SWAP 0x2u
+#define PTE_IS_SWAP(x) (!((x) & PTE_PRESENT) && ((x) & PTE_SWAP))
+
 /* Demand paging: map a fresh zero page for an absent user address, or
  * privatize a COW page on write. The kernel can reach the frame through
  * the identity map, so no user VA/PA relationship is required. */
@@ -443,6 +450,19 @@ bool_t mm_user_fault(uint32_t pd_phys, uint32_t va, bool_t write) {
     uint32_t* pte = (uint32_t*)(pd[d] & PAGE_MASK);
     pte = &pte[(va >> 12) & 0x3FF];
 
+    if (PTE_IS_SWAP(*pte)) {
+        uint32_t slot = *pte >> PAGE_SHIFT;
+        uint32_t frame = (uint32_t)mm_alloc_page();
+        if (!frame) return false;
+        if (!swap_read_and_free(slot, frame)) {
+            mm_free_page((void*)frame);
+            return false;
+        }
+        *pte = frame | PAGE_KERNEL | PTE_USER | PTE_WRITABLE;
+        if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
+        return true;
+    }
+
     if (!(*pte & PTE_PRESENT)) {
         uint32_t frame = (uint32_t)mm_alloc_page();
         if (!frame) return false;
@@ -455,13 +475,39 @@ bool_t mm_user_fault(uint32_t pd_phys, uint32_t va, bool_t write) {
     return mm_user_make_writable(pd_phys, va);
 }
 
+/* Evict one unshared present page: write it to swap, replace the PTE with
+ * the slot marker, and return the frame to the allocator. */
+bool_t mm_user_swap_out(uint32_t pd_phys, uint32_t va) {
+    if (!swap_enabled() || !pd_phys ||
+        va < USER_BASE || va >= USER_SIGTRAMP) return false;
+    uint32_t* pte = user_pte(pd_phys, va);
+    if (!pte || !(*pte & PTE_PRESENT)) return false;
+
+    uint32_t phys = *pte & PAGE_MASK;
+    if (mm_page_ref(phys) > 1) return false;   /* COW-shared pages stay */
+
+    uint32_t slot = 0;
+    if (!swap_alloc_and_write(phys, &slot)) return false;
+
+    *pte = (slot << PAGE_SHIFT) | PTE_SWAP;
+    page_unref(phys >> PAGE_SHIFT);
+    if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
+    return true;
+}
+
 /* Drop every user page (execve image replacement). Page tables stay
  * allocated and are reused by later faults. */
 void mm_user_reset_pages(uint32_t pd_phys) {
     if (!pd_phys) return;
     for (uint32_t va = USER_BASE; va < USER_SIGTRAMP; va += PAGE_SIZE) {
         uint32_t* pte = user_pte(pd_phys, va);
-        if (!pte || !(*pte & PTE_PRESENT)) continue;
+        if (!pte) continue;
+        if (!(*pte & PTE_PRESENT) && (*pte & PTE_SWAP)) {
+            swap_free_slot(*pte >> PAGE_SHIFT);
+            *pte = 0;
+            continue;
+        }
+        if (!(*pte & PTE_PRESENT)) continue;
         page_unref((*pte & PAGE_MASK) >> PAGE_SHIFT);
         *pte = 0;
     }
@@ -492,6 +538,15 @@ uint32_t mm_get_current_pd(void) {
 
 uint32_t mm_clone_user_pd(uint32_t src_pd_phys, uint32_t tramp_phys) {
     if (!src_pd_phys || !tramp_phys) return 0;
+
+    /* A fork cannot share a swap slot: materialize every swapped page in
+     * the parent first so the copy below only deals with present frames. */
+    for (uint32_t va = USER_BASE; va < USER_SIGTRAMP; va += PAGE_SIZE) {
+        uint32_t* pte = user_pte(src_pd_phys, va);
+        if (pte && PTE_IS_SWAP(*pte) && !mm_user_fault(src_pd_phys, va, false))
+            return 0;
+    }
+
     uint32_t* src = (uint32_t*)src_pd_phys;
     uint32_t* pd = (uint32_t*)mm_alloc_page();
     if (!pd) return 0;
@@ -565,7 +620,12 @@ void mm_user_release_pages(uint32_t pd_phys) {
     if (!pd_phys) return;
     for (uint32_t va = USER_BASE; va < USER_SIGTRAMP; va += PAGE_SIZE) {
         uint32_t* pte = user_pte(pd_phys, va);
-        if (pte && (*pte & PTE_PRESENT)) page_unref((*pte & PAGE_MASK) >> PAGE_SHIFT);
+        if (!pte) continue;
+        if (!(*pte & PTE_PRESENT) && (*pte & PTE_SWAP)) {
+            swap_free_slot(*pte >> PAGE_SHIFT);
+            continue;
+        }
+        if (*pte & PTE_PRESENT) page_unref((*pte & PAGE_MASK) >> PAGE_SHIFT);
     }
 }
 

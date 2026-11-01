@@ -80,6 +80,9 @@ uint32_t mm_create_user_pd(uint32_t tramp_phys);
 bool_t   mm_user_fault(uint32_t pd_phys, uint32_t va, bool_t write);
 /* Unmap and release every user page (image replacement on execve). */
 void     mm_user_reset_pages(uint32_t pd_phys);
+/* Evict one present, unshared user page to the swap area. The PTE is
+ * replaced by a swap-slot marker and the frame is returned to the pool. */
+bool_t   mm_user_swap_out(uint32_t pd_phys, uint32_t va);
 /* Clone a user page directory (kernel PDEs shared, user PTEs copied into
  * fresh page tables) so COW'd remaps are preserved; gives the child its
  * own sigreturn trampoline page. */

@@ -21,7 +21,7 @@
 - 进程模型:每进程页目录 + **按需分页用户窗口**(首次访问分配零页,无预分配物理块)、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持,仍未用真实 glibc/musl `.so` 端到端验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列与对端窗口,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB,目录删除/目录重命名尚未提供;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除与多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;无页面换出;UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持,仍未用真实 glibc/musl `.so` 端到端验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列与对端窗口,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB,目录删除/目录重命名尚未提供;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除与多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(无 swapon 控制、无换出优先级、无内存压力压测);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
 
 ## 后续计划(建议顺序)
 
@@ -36,7 +36,7 @@
 - [x] 每进程页目录 + 按需分页用户窗口(CR3 切换);**fork 页级 COW**(物理帧引用计数,父/子页表只读,写故障复制单页并重载 CR3),exec 前释放全部用户页再重新缺页装入
 - [x] 可配置沙箱:`build.ps1 -SandboxMB`(默认 8,>=8 且 4MB 倍数),`USER_SIZE` 由宏派生,窗口边界按沙箱尺寸取整(仅虚拟地址,物理页按需分配)
 - [x] 按需分页(用户页首次访问由缺页处理分配零页;页目录初始只映射 trampoline)
-- [ ] 页面换出/swap(按需分页已具备缺页路径,但无磁盘交换区)
+- [x] 页面换出/swap:MuFS 盘(无分区表且无 FAT/ext2)尾部约一半空间作为交换区(上限 32MB),空闲页低于 128 时调度节拍换出未共享用户页(PTE 存槽号,COW 共享页不换出),缺页从槽读回并释放槽;`swaptest` 实测写盘→换出→读回数据一致
 - [x] higher-half 内核:链接 0xC0100000,`AT()` 指定物理装载 0x100000;boot.s 自举页目录(identity 0..8MB + 0xC0000000),mm_init 把全部 RAM 再别名到 0xC0000000(上限 1GB = 256 个 PDE)
 - [x] 抢占调度:Ring3 进程 100Hz 轮转,`waitpid` 阻塞让出 CPU(内核 shell 不参与调度)
 - [x] `clone` 线程(`CLONE_VM/CLONE_FS/CLONE_FILES/CLONE_THREAD/CLONE_SETTLS`)、每线程内核栈与 TLS

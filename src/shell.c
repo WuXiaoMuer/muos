@@ -21,6 +21,7 @@
 #include "fat.h"
 #include "ext2.h"
 #include "acpi.h"
+#include "swap.h"
 #include "wm.h"
 
 /* ── Types ────────────────────────────── */
@@ -104,6 +105,8 @@ static const cmd_doc_t cmd_docs[] = {
     {"ext2ls","","","[p]","list ext2 root (read-only)",G_DISK},
     {"ext2cat","","","<file>","print an ext2 file",G_DISK},
     {"ext2write","","","<file> <text>","create/overwrite an ext2 file",G_DISK},
+    {"swap","","","","page swap status (ATA disk tail)",G_DISK},
+    {"swaptest","","","","evict and fault a page back in",G_DISK},
     /* graphics */
     {"desktop","gui","","","text-mode desktop (windows, menu, calc)",G_GFX},
     {"pixel","","","","compositing WM (VBE, ISO boot only)",G_GFX},
@@ -414,6 +417,23 @@ static void cmd_ext2write(char**a,int n){
     serial_write("[ext2] write ok\n");
 }
 
+static void cmd_swap(void){
+    if(!swap_enabled()){
+        vga_print("swap: disabled (no ATA disk or filesystem occupies it)\n");
+        serial_write("[swap] disabled\n");
+        return;
+    }
+    vga_print("swap: "); vga_print_dec(swap_slot_count());
+    vga_print(" slots, "); vga_print_dec(swap_used_slots()); vga_print(" used\n");
+    serial_write("[swap] status\n");
+}
+
+static void cmd_swaptest(void){
+    bool_t ok = swap_selftest();
+    vga_print(ok ? "SWAP-OK\n" : "SWAP-SKIP\n");
+    serial_write(ok ? "[swap] SWAP-OK\n" : "[swap] SWAP-SKIP\n");
+}
+
 static void cmd_run(char**a,int n){
     /* Runs the embedded ELF at Ring3; returns when the process exits or
      * faults. `run fault` asks hello.c to touch an unmapped address, which
@@ -671,6 +691,8 @@ static void execute(void){
     else if(streq(cmd,"ext2ls"))cmd_ext2ls(av,ac);
     else if(streq(cmd,"ext2cat"))cmd_ext2cat(av,ac);
     else if(streq(cmd,"ext2write"))cmd_ext2write(av,ac);
+    else if(streq(cmd,"swap"))cmd_swap();
+    else if(streq(cmd,"swaptest"))cmd_swaptest();
     else if(streq(cmd,"execmod"))cmd_execmod(av,ac);
     else {
         vga_setcolor(vga_entry_color(VGA_LIGHT_RED,VGA_BLACK));

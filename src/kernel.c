@@ -24,6 +24,7 @@
 #include "part.h"
 #include "fat.h"
 #include "ext2.h"
+#include "swap.h"
 #include "acpi.h"
 #include "net.h"
 #include "fb.h"
@@ -176,6 +177,11 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
             vga_print("\n");
             serial_write("[OK] ext2 mounted\n");
         }
+
+        /* Page swap: only claim the disk tail when no partition table and
+         * no FAT32/ext2 volume occupies it (i.e. this is the MuFS disk). */
+        if (!part_is_partitioned() && !fat_present() && !ext2_present())
+            swap_init();
     } else {
         vga_print("[WARN] No ATA disk on the primary bus\n");
         serial_write("[WARN] No ATA disk\n");

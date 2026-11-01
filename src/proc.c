@@ -1,5 +1,6 @@
 #include "proc.h"
 #include "mm.h"
+#include "swap.h"
 #include "kheap.h"
 #include "pit.h"
 #include "tss.h"
@@ -688,7 +689,42 @@ void proc_tick_all(void) {
     }
 }
 
+/* ---- page replacement ---- */
+
+#define SWAP_SCAN_PAGES ((USER_SIGTRAMP - USER_BASE) / PAGE_SIZE)
+static uint32_t swap_scan = 0;
+
+/* Evict one unshared user page from any live process, scanning round-robin
+ * so a small working set is spread across address spaces. */
+static bool_t proc_swap_out_one(void) {
+    if (!swap_enabled()) return false;
+    uint32_t total = PROC_MAX * SWAP_SCAN_PAGES;
+    if (!total) return false;
+    for (uint32_t k = 0; k < total; k++) {
+        uint32_t idx = (swap_scan + k) % total;
+        uint32_t slot = idx / SWAP_SCAN_PAGES;
+        uint32_t va = USER_BASE + (idx % SWAP_SCAN_PAGES) * PAGE_SIZE;
+        proc_t* p = &procs[slot];
+        if (!p->used || !p->pd_phys) continue;
+        if (p->state == PROC_FREE || p->state == PROC_ZOMBIE) continue;
+        if (mm_user_swap_out(p->pd_phys, va)) {
+            swap_scan = (idx + 1) % total;
+            return true;
+        }
+    }
+    return false;
+}
+
 void proc_sched_tick(registers_t* regs) {
+    /* Reclaim frames under pressure, at most once every 10 ticks. */
+    static uint32_t swap_tick = 0;
+    if (swap_enabled() && ++swap_tick >= 10) {
+        swap_tick = 0;
+        if (mm_get_free_pages() < 128) {
+            for (int i = 0; i < 8; i++) if (!proc_swap_out_one()) break;
+        }
+    }
+
     proc_t* cur = proc_current();
     if (!cur || cur->pid == 1) return;
     if ((regs->cs & 3) != 3) return;

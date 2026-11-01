@@ -109,8 +109,16 @@ mm_init 末尾:for pfn in [0, total_pages):
 - 防护:magic 校验(野指针)、双重释放忽略、区间外指针忽略;耗尽返回 NULL(暂不 Grow,见 ROADMAP)。
 - 使用者:`task_register`(替代每任务 4KB 整页浪费)。**非可重入**:IRQ 上下文使用需外面包 cli/sti。
 
-## 五、字符串库(string.c)
+### 4.5 页面换出(swap.c)
 
+- 交换区:仅在 ATA 存在且无分区表、无 FAT32/ext2 卷(MuFS 盘)时启用;从 LBA 4096 之后取磁盘剩余空间的一半(上限 32MB)作为交换区,一页(4KB = 8 扇区)一个槽,槽位位图在 RAM 中,重启即清空。
+- 换出:`mm_user_swap_out(pd, va)` 只接受 present 且帧引用 ≤1 的页;`swap_alloc_and_write` 先把 4KB 写到 ATA 槽,再把 PTE 改成非 present 的 `(slot << 12) | 0x2`,随后 `page_unref` 归还帧。
+- 缺页:`mm_user_fault` 识别“非 present + bit1”的交换 PTE(bit1 同时是 PTE_WRITABLE,必须先看 present 位),分配新帧、从槽读回、释放槽并恢复 present|RW。
+- 自动化:IRQ0 每 10 tick 检查 `mm_get_free_pages() < 128`,由 `proc_swap_out_one` 轮转扫描 8 个进程的用户窗口,最多换出 8 页;COW 共享页、zombie/free 进程跳过。
+- fork 前 `mm_clone_user_pd` 会把父进程的交换页先读回,避免父子共享同一个槽;exec/进程回收会 `swap_free_slot` 释放槽。
+- `swaptest` 用临时页目录完成“写入 → 换出(校验帧归还与槽释放) → 缺页读回(逐字节比对)”闭环,`tools/test_ata.py` 两次启动都要求 `SWAP-OK`。
+
+## 五、字符串库(string.c)
 标准名 `memset/memcpy/memmove/memcmp/strlen/strcmp/strncmp/strcpy/strncpy + u32_to_dec`:
 
 - **名字是承重的**:`-ffreestanding` 下 GCC 仍会为结构拷贝/清零隐式生成 `memcpy/memset` 调用,缺标准名实现会链接失败。
@@ -143,7 +151,7 @@ USER_SIGTRAMP = 0x08847000
 - `execve` 前 `proc_reset_current` → `mm_user_reset_pages`:遍历用户窗口逐页 `page_unref` 并清 PTE,释放全部旧页;新镜像的段再按需缺页装入。`run` 路径不再 memset 整段沙箱——那会一次性触发 2047 次缺页,等于退回整块分配。
 - 调度器 `mm_switch_pd(pd_phys)` 切 CR3;同一虚拟地址在不同进程指向不同物理页。内核不使用恒等地址访问用户页,而是 `mm_user_translate(pd, va)` 拿到物理地址(必要时先缺页/私有化)。
 
-收益:空闲进程几乎不占物理页,8 个槽位不再需要 64MB 常驻,也不再要求 RAM > 128MB;代价:首次访问有缺页开销,且尚无页面换出(swap)与文件页缓存。
+收益:空闲进程几乎不占物理页,8 个槽位不再需要 64MB 常驻,也不再要求 RAM > 128MB;代价:首次访问有缺页开销,且尚无文件页缓存(页面换出见 §4.5)。
 
 ### 7.2 进入/退出 Ring3(isr_stubs.s)
 
@@ -353,7 +361,7 @@ USER_SIGTRAMP = 0x08847000
 
 ## 十一、已知局限(真实清单)
 
-1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;用户页按需分配,但无页面换出(swap)、无文件页缓存
+1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;用户页按需分配并可换出到 MuFS 盘尾部,但无文件页缓存、无 swapon 控制与换出优先级
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
 3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc/musl `.so` 端到端验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回;FAT32/ext2 已以 `/fat`、`/ext2` 接入 VFS(读写、文件删除/重命名/建目录,整文件回写且单文件 64KB 上限),ext2 不支持目录删除与目录重命名,也尚无多级间接
 4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents/unlink/rename/mkdir`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),挂载内目录删除/目录重命名仍返回 `EPERM`;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除/重命名与二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列;无窗口缩放选项,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
