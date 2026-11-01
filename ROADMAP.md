@@ -21,7 +21,7 @@
 - 进程模型:每进程页目录 + **按需分页用户窗口**(首次访问分配零页,无预分配物理块)、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持),并已用真实 musl loader + libc.so 端到端验证动态 BusyBox;真实 glibc 尚未验证;网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列与对端窗口,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB,目录删除/目录重命名尚未提供;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除与多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(无 swapon 控制、无换出优先级、无内存压力压测);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持),并已用真实 musl loader + libc.so 端到端验证动态 BusyBox;真实 glibc 尚未验证;网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列、对端窗口与 WS 缩放、阻塞 accept;无快速重传/重复 ACK 快速恢复);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB,目录删除/目录重命名尚未提供;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除与多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(无 swapon 控制、无换出优先级、无内存压力压测);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
 
 ## 后续计划(建议顺序)
 
@@ -59,10 +59,10 @@
 - [x] MuFS 元数据写前日志:提交前把 meta/dir 副本写到扇区 10–15 并置扇区 9 头魔数,真实表写完后清除;挂载时发现有效头即重放。槽位引用计数归零后回收(空间回收已随 unlink 生效)
 - [x] FAT32/ext2 接入 VFS:`/fat`、`/ext2` 挂载,路径解析落到卷内文件;用户态 `open/read/write/stat/lseek/getdents64/unlink/rename/mkdir` 直接读写分区文件(open 支持 `O_CREAT/O_TRUNC`,写为整文件回写,单文件 64KB 上限),`rename` 保留数据簇、`unlink` 回收簇链/inode 并清理 LFN 项,挂载目录出现在根目录枚举中;`ls /fat`、`cat /fat/<file>` 与 `run vfs` 实测通过
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/listen(363)/accept4(364)/sendto(369)/recvfrom(371)/shutdown(373)/getsockname(367)/getpeername(368)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽
-- [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;8 段发送队列 + 队列头 RTO 指数退避(最多 5 次)、ACK 逐段退休、慢开始/拥塞避免窗口;接收端 4 段乱序队列(按 `rcv_nxt` 连续推进)与对端窗口跟踪;启动自检 `TCP-REORDER-OK`;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)
+- [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;8 段发送队列 + 队列头 RTO 指数退避(最多 5 次)、ACK 逐段退休、慢开始/拥塞避免窗口;接收端 4 段乱序队列(按 `rcv_nxt` 连续推进)、对端窗口跟踪与 **WS 窗口缩放协商**(SYN/SYN-ACK 带 shift=4,按对端 shift 放大 `snd_wnd`);`accept` 在无待完成连接时阻塞(由握手完成事件唤醒,`run baccept` 实测);启动自检 `TCP-REORDER-OK`/`TCP-WSCALE-OK`;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)
 - [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
 - [x] 像素窗口管理器(`pixel`,ISO/VBE):4 个窗口(Terminal/System/Editor/Widgets),每窗口 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`);鼠标拖动标题栏/关闭/聚焦置顶,文本窗口可拖动滚动条,Widgets 提供按钮(Say Hello/Clear Log)与单行输入框(回车发送到 Terminal),键盘输入到焦点窗口,任务栏与 8×16 文字(8×8 字模纵向 2 倍);ESC 返回文本 shell
-- [ ] 裁剪栈、更多字体尺寸、列表/菜单控件;TCP 窗口缩放选项、网络事件唤醒的阻塞 accept、其他网卡
+- [ ] 裁剪栈、更多字体尺寸、列表/菜单控件;其他网卡;TCP 拥塞控制细节(快速重传/重复 ACK)
 
 ## 阶段 0:地基(已完成,2026-09)
 

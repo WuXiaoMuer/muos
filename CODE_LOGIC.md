@@ -129,7 +129,7 @@ mm_init 末尾:for pfn in [0, total_pages):
 
 - **内核 shell(pid 1)不参与调度**:它直接跑在内核栈上,PIT 中断只 tick + 驱动用户进程抢占;`task_t` 仅作 `tasks`/`ps`/自检的 introspection。
 - **用户进程调度器**:`proc_t`(proc.c)固定 8 槽,每个进程/线程有私有页目录(用户页按需缺页)+ 8KB TSS 内核栈;IRQ0 每 tick 调 `proc_sched_tick`,保存当前 Registers_t 现场并改写同一中断帧切换到下一个 READY 进程(`iret` 直接进入它)。无 READY 进程时,`proc_exit_current` 切回内核页目录并用 `user_kernel_esp_launch` 返回 shell。
-- 阻塞点(`wait4/waitid/poll/read/sigsuspend`)把进程标为 BLOCKED 后让出;唤醒方(子进程 exit、pipe 写/关、键盘 IRQ、PIT)直接把结果写进阻塞进程的保存现场(它的用户内存通过 `proc_user_ptr` 的 PD 翻译访问,必要时先缺页/私有化),或标记 READY 由调度器恢复。
+- 阻塞点(`wait4/waitid/poll/read/accept/sigsuspend`)把进程标为 BLOCKED 后让出;唤醒方(子进程 exit、pipe 写/关、键盘 IRQ、TCP 握手完成、PIT)直接把结果写进阻塞进程的保存现场(它的用户内存通过 `proc_user_ptr` 的 PD 翻译访问,必要时先缺页/私有化),或标记 READY 由调度器恢复。
 - GDT 槽 3/4 是 Ring3 代码/数据段(0x1B/0x23),槽 5 是 TSS(0x28),槽 6 是 TLS(0x33)。
 
 ## 七、Ring3 用户态与系统调用
@@ -356,7 +356,7 @@ USER_SIGTRAMP = 0x08847000
 
 - `fs_file_t/fs_dir_t` 增加 `uid/gid/mode`;MuFS 元数据 v2 保存这些字段(旧的 v1 盘在挂载时因版本不匹配被重新格式化)。新建文件 0644、目录 0755;`fs_perm_path/fs_perm_slot` 供 syscall 层读取,`fs_chmod_*`/`fs_chown_*` 校验后落盘。
 - `proc_t.uid/gid` 默认 0(root),fork/clone 继承;`getuid/getgid/geteuid/getegid` 返回真实值,`setuid/setgid` 允许 root 任意切换、非 root 只能设成自身。`perm_ok` 按 owner/group/other 取 rwx 位;root 对读写直接放行、执行仍需任一 x 位;目录的读写检查附带 x(遍历)。`open` 对已存在文件按 O_ACCMODE 检查 r/w,`O_CREAT` 检查父目录 w+x;`access` 用 X/W/R_OK 位;`chmod/fchmod/chmodat` 与 `chown/fchown/fchownat` 只允许 root 或文件 owner(改所有者仅 root)。
-- TCP 发送队列与接收重排:`net_sock_t` 内 8 项 `txq`(seq/end/flags/data),`tcp_send_seg` 入队并立即发送;`tcp_ack` 按 `ack >= end` 逐段退休并重置 RTO;`tcp_timers` 只重传队头,超时重置 cwnd/ssthresh。接收侧 4 项 `rxq` 缓存乱序段,`tcp_rx_store` 推进 `rcv_nxt`、`tcp_rx_take` 按 `rx_delivered` 投递;数据段不再因“序号不连续”直接丢弃。
+- TCP 发送队列与接收重排:`net_sock_t` 内 8 项 `txq`(seq/end/flags/data),`tcp_send_seg` 入队并立即发送;`tcp_ack` 按 `ack >= end` 逐段退休并重置 RTO;`tcp_timers` 只重传队头,超时重置 cwnd/ssthresh。接收侧 4 项 `rxq` 缓存乱序段,`tcp_rx_store` 推进 `rcv_nxt`、`tcp_rx_take` 按 `rx_delivered` 投递;数据段不再因“序号不连续”直接丢弃。SYN/SYN-ACK 带 WS 选项(kind 3,shift=4),`tcp_parse_ws` 解析对端 shift,`snd_wnd = 窗口字段 << snd_shift`,发送窗口再受 `TXQ_MAX*MSS` 限制;`NET-FD` 连接的 `accept` 在无 ESTAB 子连接时进入 `PROC_WAIT_ACCEPT`,子连接握手完成时 `proc_wake_accept` 调 `net_accept_now` 取走子 socket 并把 fd 写入阻塞进程 eax;PIT 每个 tick 调 `net_tick()` 轮询网卡,因此阻塞期间仍能收到 SYN/ACK。
 - FAT32 长名写入:名字不是纯 8.3 时生成 `NAME~1.EXT` 短别名,`dir_find` 同时按 LFN 与短名匹配,`dir_free_run` 找连续 `need` 个空槽(目录满则追加簇),`dir_write_long` 按序号降序写 LFN(含 11 字节短名校验和)再写短项。
 
 ## 十一、已知局限(真实清单)
@@ -364,7 +364,7 @@ USER_SIGTRAMP = 0x08847000
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;用户页按需分配并可换出到 MuFS 盘尾部,但无文件页缓存、无 swapon 控制与换出优先级
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
 3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc `.so` 验证(真实 musl loader + libc.so + 动态 BusyBox 已由 `tools/test_realso.py` 端到端跑通),遇到未知重定位会明确报错;`MAP_SHARED` 不写回;FAT32/ext2 已以 `/fat`、`/ext2` 接入 VFS(读写、文件删除/重命名/建目录,整文件回写且单文件 64KB 上限),ext2 不支持目录删除与目录重命名,也尚无多级间接
-4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents/unlink/rename/mkdir`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),挂载内目录删除/目录重命名仍返回 `EPERM`;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除/重命名与二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列;无窗口缩放选项,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents/unlink/rename/mkdir`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),挂载内目录删除/目录重命名仍返回 `EPERM`;ext2 支持创建/覆盖/删除文件(位图分配、目录项插入与合并、单级间接),但无目录删除/重命名与二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列/WS 缩放/阻塞 accept;无快速重传与重复 ACK 快速恢复);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标在文本桌面按 8×16 单元粗粒度移动,在 `pixel` 中映射到像素坐标;无滚轮/右键菜单/双击标题栏最大化

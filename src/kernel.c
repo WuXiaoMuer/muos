@@ -40,6 +40,9 @@ extern uint32_t _kernel_end;
 /* Timer IRQ handler */
 static void timer_handler(registers_t* regs) {
     pit_tick();
+    /* Net is polled (RTL8139 has no IRQ here), so drive it from the tick:
+     * this lets a process blocked in accept() receive its SYN/ACK. */
+    net_tick();
     /* Alarms and blocked-poll timeouts for every process. */
     proc_tick_all();
     /* Round-robin preemption between Ring3 processes (no-op in kernel). */

@@ -40,6 +40,10 @@ int net_bind(int id, uint32_t ip, uint16_t port);
 int net_connect(int id, uint32_t ip, uint16_t port);
 int net_listen(int id);
 int net_accept(int id);
+/* Non-blocking accept: pick an established child of listener `id` now. */
+int net_accept_now(int id);
+/* Drive the polled NIC from the timer tick so a blocked accept can wake. */
+void net_tick(void);
 int net_sendto(int id, const void* data, uint32_t len,
                uint32_t ip, uint16_t port);
 int net_recvfrom(int id, void* buf, uint32_t maxlen,

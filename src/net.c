@@ -13,6 +13,7 @@
 #include "string.h"
 #include "vga.h"
 #include "serial.h"
+#include "proc.h"
 
 #define RX_SIZE 32768u
 #define TX_MAX  1792u
@@ -63,7 +64,9 @@ typedef struct {
     uint32_t snd_una;       /* first unacknowledged sequence number */
     uint32_t cwnd;          /* congestion window, in bytes */
     uint32_t ssthresh;
-    uint32_t snd_wnd;       /* peer-advertised receive window (0 = unknown) */
+    uint32_t snd_wnd;       /* peer-advertised receive window (scaled) */
+    uint8_t  snd_shift;     /* WS shift requested by the peer */
+    uint8_t  rcv_shift;     /* our WS shift advertised in SYN/SYN-ACK */
 
     /* TCP receive queue: out-of-order segments wait here until the gap
      * fills; rx_delivered is the sequence number next handed to recvfrom. */
@@ -610,7 +613,9 @@ static uint16_t tcp_cksum(uint32_t src, uint32_t dst,
     return net_cksum(seg, len, sum);
 }
 
-/* Build and transmit one TCP segment without touching retransmission state. */
+/* Build and transmit one TCP segment without touching retransmission state.
+ * SYN segments carry a window-scale option (shift = rcv_shift); data and
+ * ACK segments use the 20-byte header. */
 static void tcp_emit(net_sock_t* s, uint32_t seq, uint32_t ack,
                      uint8_t flags, const uint8_t* data, uint32_t len) {
     if (len > 512) len = 512;
@@ -619,14 +624,24 @@ static void tcp_emit(net_sock_t* s, uint32_t seq, uint32_t ack,
     put16be(t + 2, s->rport);
     put32be(t + 4, seq);
     put32be(t + 8, ack);
-    t[12] = 0x50;                       /* data offset 5 words */
+    uint32_t hdr = 20;
+    if (flags & TCP_F_SYN) {
+        t[12] = 0x60;                   /* data offset 6 words (24 bytes) */
+        t[20] = 3;                      /* kind: window scale */
+        t[21] = 3;                      /* length */
+        t[22] = (uint8_t)(s->rcv_shift & 0x0F);
+        t[23] = 0;                      /* NOP padding */
+        hdr = 24;
+    } else {
+        t[12] = 0x50;                   /* data offset 5 words */
+    }
     t[13] = flags;
-    put16be(t + 14, 2048);              /* window */
+    put16be(t + 14, (uint16_t)(2048u >> s->rcv_shift));  /* advertised window */
     put16be(t + 16, 0);
     put16be(t + 18, 0);
-    if (len) memcpy(t + 20, data, len);
-    put16be(t + 16, tcp_cksum(local_ip_for(s->rip), s->rip, t, 20 + len));
-    net_send_ip_raw(6, s->rip, t, 20 + len);
+    if (len) memcpy(t + hdr, data, len);
+    put16be(t + 16, tcp_cksum(local_ip_for(s->rip), s->rip, t, hdr + len));
+    net_send_ip_raw(6, s->rip, t, hdr + len);
 }
 
 /* Enqueue a sequence-space segment for retransmission and send it now. */
@@ -732,6 +747,7 @@ static net_sock_t* tcp_new_sock(void) {
         socks[i].type = NET_SOCK_STREAM;
         socks[i].proto = 6;
         socks[i].parent = -1;
+        socks[i].rcv_shift = 4;
         return &socks[i];
     }
     return NULL;
@@ -848,6 +864,22 @@ static bool_t tcp_reorder_selftest(void) {
     return true;
 }
 
+/* Parse a TCP window-scale option (kind 3, length 3). Returns the shift or
+ * 0xFF when the option is absent/malformed. */
+static uint8_t tcp_parse_ws(const uint8_t* opt, uint32_t n) {
+    for (uint32_t i = 0; i < n; ) {
+        uint8_t kind = opt[i];
+        if (kind == 0) break;               /* end of options */
+        if (kind == 1) { i++; continue; }   /* NOP */
+        if (i + 1 >= n) break;
+        uint8_t olen = opt[i + 1];
+        if (olen < 2 || i + olen > n) break;
+        if (kind == 3 && olen == 3) return (uint8_t)(opt[i + 2] & 0x0F);
+        i += olen;
+    }
+    return 0xFF;
+}
+
 static void tcp_input(uint32_t src, uint32_t dst,
                       const uint8_t* seg, uint32_t len) {
     (void)dst;
@@ -861,6 +893,7 @@ static void tcp_input(uint32_t src, uint32_t dst,
     uint8_t flags = seg[13];
     const uint8_t* data = seg + off;
     uint32_t dlen = len - off;
+    uint8_t peer_shift = (off > 20) ? tcp_parse_ws(seg + 20, off - 20) : 0xFF;
 
     int listener_id = -1;
     net_sock_t* s = tcp_find(src, sport, dport, &listener_id);
@@ -882,6 +915,8 @@ static void tcp_input(uint32_t src, uint32_t dst,
             child->snd_una = child->snd_nxt;
             child->cwnd = TCP_MSS;
             child->ssthresh = TCP_CWND_MAX;
+            child->rcv_shift = 4;
+            child->snd_shift = (peer_shift != 0xFF) ? peer_shift : 0;
             child->tcp_state = TCP_SYN_RCVD;
             /* Consume the SYN sequence number before transmitting: loopback
              * delivers the reply synchronously, so the peer's ACK can arrive
@@ -906,6 +941,8 @@ static void tcp_input(uint32_t src, uint32_t dst,
             child->snd_una = child->snd_nxt;
             child->cwnd = TCP_MSS;
             child->ssthresh = TCP_CWND_MAX;
+            child->rcv_shift = 4;
+            child->snd_shift = (peer_shift != 0xFF) ? peer_shift : 0;
             child->tcp_state = TCP_SYN_RCVD;
             uint32_t cseq = child->snd_nxt;
             child->snd_nxt = cseq + 1;
@@ -920,10 +957,13 @@ static void tcp_input(uint32_t src, uint32_t dst,
         return;
     }
 
+    if ((flags & TCP_F_SYN) && peer_shift != 0xFF)
+        s->snd_shift = peer_shift;      /* client learns WS from SYN-ACK */
+
     if (flags & TCP_F_ACK) {
         tcp_ack(s, ack);
         uint16_t wnd = be16(seg + 14);
-        if (wnd) s->snd_wnd = wnd;      /* peer window (no scaling negotiated) */
+        if (wnd) s->snd_wnd = (uint32_t)wnd << s->snd_shift;
     }
 
     if (s->tcp_state == TCP_SYN_SENT && (flags & TCP_F_SYN) && (flags & TCP_F_ACK)) {
@@ -937,7 +977,10 @@ static void tcp_input(uint32_t src, uint32_t dst,
     }
 
     if (s->tcp_state == TCP_SYN_RCVD && (flags & TCP_F_ACK)) {
-        if (ack == s->snd_nxt) s->tcp_state = TCP_ESTAB;
+        if (ack == s->snd_nxt) {
+            s->tcp_state = TCP_ESTAB;
+            if (s->parent >= 0) proc_wake_accept(s->parent);
+        }
     }
 
     if ((s->tcp_state == TCP_ESTAB || s->tcp_state == TCP_CLOSE_WAIT) &&
@@ -963,6 +1006,50 @@ static void tcp_input(uint32_t src, uint32_t dst,
     }
 }
 
+/* Exercise WS negotiation: a SYN carrying shift 4 must make the child
+ * scale the peer's 128-byte window to 2048 after the handshake ACK. */
+static bool_t tcp_ws_selftest(void) {
+    net_sock_t* l = tcp_new_sock();
+    if (!l) return false;
+    int lid = (int)(l - socks);
+    l->lport = 9001;
+    l->bound = true;
+    l->tcp_state = TCP_LISTEN;
+
+    uint8_t syn[24];
+    memset(syn, 0, sizeof(syn));
+    put16be(syn + 0, 9101);
+    put16be(syn + 2, 9001);
+    put32be(syn + 4, 7000);
+    syn[12] = 0x60;
+    syn[13] = TCP_F_SYN;
+    put16be(syn + 14, 128);
+    syn[20] = 3; syn[21] = 3; syn[22] = 4; syn[23] = 0;
+    tcp_input(my_ip, my_ip, syn, sizeof(syn));
+
+    net_sock_t* child = NULL;
+    for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
+        if (socks[i].used && socks[i].parent == lid) { child = &socks[i]; break; }
+    }
+    bool_t ok = child && child->snd_shift == 4 && child->rcv_shift == 4;
+    if (ok) {
+        uint8_t ackseg[20];
+        memset(ackseg, 0, sizeof(ackseg));
+        put16be(ackseg + 0, 9101);
+        put16be(ackseg + 2, 9001);
+        put32be(ackseg + 4, 7001);
+        put32be(ackseg + 8, child->snd_nxt);
+        ackseg[12] = 0x50;
+        ackseg[13] = TCP_F_ACK;
+        put16be(ackseg + 14, 128);
+        tcp_input(my_ip, my_ip, ackseg, sizeof(ackseg));
+        ok = child->tcp_state == TCP_ESTAB && child->snd_wnd == (128u << 4);
+    }
+    if (child) child->used = false;
+    l->used = false;
+    return ok;
+}
+
 static int tcp_send_data(net_sock_t* s, const void* data, uint32_t len) {
     if (s->tcp_state != TCP_ESTAB && s->tcp_state != TCP_CLOSE_WAIT) return -1;
     uint32_t sent = 0;
@@ -971,6 +1058,9 @@ static int tcp_send_data(net_sock_t* s, const void* data, uint32_t len) {
         uint32_t inflight = s->snd_nxt - s->snd_una;
         uint32_t window = s->cwnd ? s->cwnd : TCP_MSS;
         if (s->snd_wnd && s->snd_wnd < window) window = s->snd_wnd;
+        /* More in-flight bytes than the retransmission queue can hold would
+         * be silently dropped, so cap the window by the queue capacity. */
+        if (window > TXQ_MAX * TCP_MSS) window = TXQ_MAX * TCP_MSS;
 
         if (inflight >= window) {
             /* Congestion window is full: wait for ACKs (poll also runs
@@ -1016,6 +1106,7 @@ int net_socket(int type, int proto) {
         else socks[i].proto = (type == NET_SOCK_DGRAM) ? 17 :
                               (type == NET_SOCK_STREAM) ? 6 : 1;
         socks[i].parent = -1;
+        socks[i].rcv_shift = 4;
         return i;
     }
     return -1;
@@ -1169,22 +1260,28 @@ int net_listen(int id) {
     return 0;
 }
 
-int net_accept(int id) {
+int net_accept_now(int id) {
     if (!net_socket_ok(id)) return -1;
     net_sock_t* l = &socks[id];
     if (l->type != NET_SOCK_STREAM || l->tcp_state != TCP_LISTEN) return -1;
-    for (uint32_t loops = 0; loops < 300; loops++) {   /* ~3 seconds */
-        net_poll();
-        for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
-            net_sock_t* c = &socks[i];
-            if (c->used && c->parent == id && c->tcp_state == TCP_ESTAB) {
-                c->parent = -1;
-                return i;
-            }
+    for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
+        net_sock_t* c = &socks[i];
+        if (c->used && c->parent == id && c->tcp_state == TCP_ESTAB) {
+            c->parent = -1;
+            return i;
         }
-        __asm__ volatile ("sti; hlt; cli");
     }
     return NET_EAGAIN;
+}
+
+int net_accept(int id) {
+    /* The syscall layer blocks on NET_EAGAIN and the TCP input path wakes
+     * it once a child reaches ESTAB; no polling loop here. */
+    return net_accept_now(id);
+}
+
+void net_tick(void) {
+    if (present) net_poll();
 }
 
 /* ---------------- init ---------------- */
@@ -1230,6 +1327,11 @@ bool_t net_init(void) {
         serial_write("[net] TCP-REORDER-OK\n");
     else
         serial_write("[net] TCP-REORDER-BAD\n");
+
+    if (tcp_ws_selftest())
+        serial_write("[net] TCP-WSCALE-OK\n");
+    else
+        serial_write("[net] TCP-WSCALE-BAD\n");
 
     if (dhcp_run()) {
         serial_write("[net] DHCP configured\n");

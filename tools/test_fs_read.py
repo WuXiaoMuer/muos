@@ -103,6 +103,7 @@ def main():
                                         "VFS-RENAME-OK" in te and
                                         "VFS-UNLINK-OK" in te,
         "tcp reorder selftest": "TCP-REORDER-OK" in tf,
+        "tcp wscale selftest": "TCP-WSCALE-OK" in tf,
     }
     for k, v in checks.items():
         print(f"{k}: {v}")

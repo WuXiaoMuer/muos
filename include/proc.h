@@ -27,7 +27,8 @@ typedef enum {
     PROC_WAIT_WAITID,
     PROC_WAIT_POLL,      /* blocked in poll() with a deadline */
     PROC_WAIT_SIGSUSP,   /* blocked until a signal is delivered */
-    PROC_WAIT_READ       /* blocked in read() on a pipe/console */
+    PROC_WAIT_READ,      /* blocked in read() on a pipe/console */
+    PROC_WAIT_ACCEPT     /* blocked in accept() on a listening TCP socket */
 } proc_wait_t;
 
 /* Refcounted address space: a thread group shares one block + page
@@ -144,6 +145,8 @@ void     proc_switch_space(proc_t* p);
 void     proc_sched_tick(registers_t* regs);
 bool_t   proc_block_current(registers_t* regs, proc_wait_t kind,
                             int32_t pid, uint32_t status_ptr);
+/* Wake a process blocked in accept() on listener socket `listener_id`. */
+void     proc_wake_accept(int listener_id);
 bool_t   proc_block_current_ext(registers_t* regs, proc_wait_t kind,
                                 uint32_t ptr, int32_t len,
                                 uint32_t deadline, bool_t has_deadline,

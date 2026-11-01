@@ -520,6 +520,55 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "baccept")) {
+        /* Blocking accept: fork a delayed client, accept() must yield the
+         * CPU until the child's SYN/ACK completes the handshake. */
+        int ok = 1;
+        muos_sockaddr_in_t sa;
+        int lfd = muos_socket(MUOS_AF_INET, MUOS_SOCK_STREAM, 0);
+        sa.sin_family = MUOS_AF_INET;
+        sa.sin_port = htons16(9002);
+        sa.sin_addr = 0;
+        sa.pad[0] = sa.pad[1] = 0;
+        int brc = muos_bind(lfd, &sa, 16);
+        int lrc = muos_listen(lfd, 2);
+        ok = ok && brc == 0 && lrc == 0;
+
+        int pid = muos_fork();
+        if (pid == 0) {
+            unsigned ts[2] = { 0, 80000000 };   /* 80ms */
+            muos_nanosleep(ts, 0);
+            int cli = muos_socket(MUOS_AF_INET, MUOS_SOCK_STREAM, 0);
+            sa.sin_family = MUOS_AF_INET;
+            sa.sin_port = htons16(9002);
+            sa.sin_addr = IP4(127,0,0,1);
+            sa.pad[0] = sa.pad[1] = 0;
+            int crc = cli >= 0 ? muos_connect(cli, &sa, 16) : -1;
+            const char msg[] = "BACC";
+            if (crc == 0) muos_send(cli, msg, sizeof(msg) - 1, 0);
+            muos_exit(crc == 0 ? 0 : 1);
+        }
+
+        int a = muos_accept(lfd);
+        muos_puts("baccept: accept="); muos_putdec(a); muos_puts("\n");
+        ok = ok && a >= 0;
+        if (a >= 0) {
+            char ab[8];
+            int n = muos_recv(a, ab, sizeof(ab) - 1, 0);
+            int got = (n == 4);
+            for (int i = 0; got && i < n; i++) if (ab[i] != "BACC"[i]) got = 0;
+            if (got) muos_puts("baccept: data-ok\n");
+            else ok = 0;
+            muos_close(a);
+        }
+        int status = 0;
+        muos_waitpid(pid, &status, 0);
+        ok = ok && ((status >> 8) & 0xFF) == 0;
+        muos_close(lfd);
+        muos_puts(ok ? "BACC-OK\n" : "BACC-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "perm")) {
         /* uid/gid enforcement: a non-root child may read a 0644 file but
          * must be denied a 0600 file owned by root. */

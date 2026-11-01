@@ -3679,8 +3679,16 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_accept4: {
             int id = net_accept(sock_id(regs->ebx));
-            if (id == NET_EAGAIN) ret = err(ERR_EAGAIN);
-            else if (id < 0) ret = err(ERR_EBADF);
+            if (id == NET_EAGAIN) {
+                proc_t* p = proc_current();
+                if (p && p->pid != 1 &&
+                    proc_block_current_ext(regs, PROC_WAIT_ACCEPT, 0, 0,
+                                           0, false, sock_id(regs->ebx))) {
+                    ret = 0;        /* frame switched; waker sets eax */
+                    break;
+                }
+                ret = err(ERR_EAGAIN);
+            } else if (id < 0) ret = err(ERR_EBADF);
             else ret = (uint32_t)(id + NET_FD_BASE);
             break;
         }

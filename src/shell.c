@@ -114,7 +114,7 @@ static const cmd_doc_t cmd_docs[] = {
 };
 
 static const char* run_modes[] = {
-    "fault","pie","dyn","tls","tcp","perm","sig","thread","blkpoll",
+    "fault","pie","dyn","tls","tcp","baccept","perm","sig","thread","blkpoll",
     "sched","p1","extra","poll","mmapfile","at","fork","pipefork","execbin",
     "pipe","net","ata","ataread","fsata","fsread","vfs",NULL
 };

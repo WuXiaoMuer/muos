@@ -7,6 +7,7 @@
 #include "gdt.h"
 #include "string.h"
 #include "pipe.h"
+#include "net.h"
 #include "keyboard.h"
 #include "serial.h"
 
@@ -919,6 +920,24 @@ static void proc_wake_readers(void) {
 void proc_notify_console(void) {
     proc_wake_pollers();
     proc_wake_readers();
+}
+
+/* A listener's child reached ESTAB: hand it to a process blocked in
+ * accept(), leaving the new socket fd in eax. */
+void proc_wake_accept(int listener_id) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        proc_t* p = &procs[i];
+        if (!p->used || p->pid == 1) continue;
+        if (p->state != PROC_BLOCKED || p->wait_kind != PROC_WAIT_ACCEPT) continue;
+        if (p->blk_fd != listener_id) continue;
+        int child = net_accept_now(listener_id);
+        if (child < 0) continue;
+        p->wait_kind = PROC_WAIT_NONE;
+        p->blk_fd = -1;
+        p->eax = (uint32_t)(child + NET_FD_BASE);
+        p->state = PROC_READY;
+        return;                         /* one acceptor takes this child */
+    }
 }
 
 void proc_notify_pipe(int pipe_id) {
