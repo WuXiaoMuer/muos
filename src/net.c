@@ -92,6 +92,8 @@ typedef struct {
     int      q_head, q_count;
     uint32_t q_deadline, rto;
     uint8_t  q_retries;
+    uint8_t  dupacks;       /* consecutive duplicate ACKs */
+    bool_t   fast_recover;  /* fast retransmit/recovery in progress */
 } net_sock_t;
 
 #define TCP_MSS 480u
@@ -669,10 +671,43 @@ static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
 }
 
 /* ACK processing: advance snd_una, retire acknowledged queue entries and
- * grow the congestion window (slow start / congestion avoidance). */
+ * grow the congestion window (slow start / congestion avoidance). Three
+ * duplicate ACKs retransmit the queue head immediately (fast retransmit)
+ * and enter fast recovery instead of waiting for the RTO. */
 static void tcp_ack(net_sock_t* s, uint32_t ack) {
-    if ((int32_t)(ack - s->snd_una) <= 0) return;
+    if ((int32_t)(ack - s->snd_una) < 0) return;
+
+    if (ack == s->snd_una) {
+        if (s->q_count > 0 && !s->fast_recover) {
+            if (++s->dupacks >= 3) {
+                s->fast_recover = true;
+                s->dupacks = 0;
+                s->ssthresh = s->cwnd > TCP_MSS * 2 ? s->cwnd / 2
+                                                    : TCP_MSS * 2;
+                s->cwnd = s->ssthresh + TCP_MSS * 3;
+                if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
+                int h = s->q_head;
+                uint32_t a = (s->txq[h].flags & TCP_F_SYN) ? 0 : s->rcv_nxt;
+                s->q_retries = 0;
+                s->rto = TCP_RTO_MIN;
+                s->q_deadline = pit_get_ticks() + s->rto;
+                tcp_emit(s, s->txq[h].seq, a, s->txq[h].flags,
+                         s->txq[h].data, s->txq[h].len);
+            }
+        } else if (s->fast_recover) {
+            s->cwnd += TCP_MSS;             /* inflate while recovering */
+            if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
+        }
+        return;
+    }
+
     s->snd_una = ack;
+    s->dupacks = 0;
+    bool_t exited_recovery = s->fast_recover;
+    if (s->fast_recover) {
+        s->cwnd = s->ssthresh;              /* exit fast recovery */
+        s->fast_recover = false;
+    }
 
     while (s->q_count > 0) {
         int h = s->q_head;
@@ -687,6 +722,7 @@ static void tcp_ack(net_sock_t* s, uint32_t ack) {
         s->q_deadline = pit_get_ticks() + s->rto;
     }
 
+    if (exited_recovery) return;            /* window already deflated */
     if (s->cwnd >= s->ssthresh)
         s->cwnd += (TCP_MSS * TCP_MSS) / (s->cwnd ? s->cwnd : TCP_MSS);
     else
@@ -713,6 +749,8 @@ static void tcp_timers(void) {
         s->q_retries++;
         s->ssthresh = s->cwnd > TCP_MSS * 2 ? s->cwnd / 2 : TCP_MSS * 2;
         s->cwnd = TCP_MSS;
+        s->dupacks = 0;
+        s->fast_recover = false;
         s->rto = s->rto < TCP_RTO_MAX / 2 ? s->rto * 2 : TCP_RTO_MAX;
 
         int h = s->q_head;
@@ -1050,6 +1088,40 @@ static bool_t tcp_ws_selftest(void) {
     return ok;
 }
 
+/* Exercise fast retransmit: three duplicate ACKs on a two-segment queue
+ * must halve ssthresh, inflate cwnd by 3*MSS and enter recovery; the full
+ * ACK then leaves recovery with cwnd == ssthresh. */
+static bool_t tcp_fastretx_selftest(void) {
+    net_sock_t* s = tcp_new_sock();
+    if (!s) return false;
+    s->tcp_state = TCP_ESTAB;
+    s->lport = 9003;
+    s->rport = 9103;
+    s->rip = my_ip;
+    s->snd_una = 1000;
+    s->snd_nxt = 1000;
+    s->rcv_nxt = 5000;
+    s->cwnd = TCP_MSS * 4;
+    s->ssthresh = TCP_CWND_MAX;
+
+    uint8_t d1[100], d2[100];
+    for (int i = 0; i < 100; i++) { d1[i] = (uint8_t)i; d2[i] = (uint8_t)(i + 1); }
+    tcp_send_seg(s, 1000, 5000, TCP_F_PSH | TCP_F_ACK, d1, 100);
+    s->snd_nxt = 1100;
+    tcp_send_seg(s, 1100, 5000, TCP_F_PSH | TCP_F_ACK, d2, 100);
+    s->snd_nxt = 1200;
+
+    uint32_t cw0 = s->cwnd;
+    for (int i = 0; i < 3; i++) tcp_ack(s, 1000);
+    bool_t ok = s->fast_recover && s->ssthresh == cw0 / 2 &&
+                s->cwnd == s->ssthresh + TCP_MSS * 3;
+
+    tcp_ack(s, 1200);
+    ok = ok && !s->fast_recover && s->cwnd == s->ssthresh && s->q_count == 0;
+    s->used = false;
+    return ok;
+}
+
 static int tcp_send_data(net_sock_t* s, const void* data, uint32_t len) {
     if (s->tcp_state != TCP_ESTAB && s->tcp_state != TCP_CLOSE_WAIT) return -1;
     uint32_t sent = 0;
@@ -1332,6 +1404,11 @@ bool_t net_init(void) {
         serial_write("[net] TCP-WSCALE-OK\n");
     else
         serial_write("[net] TCP-WSCALE-BAD\n");
+
+    if (tcp_fastretx_selftest())
+        serial_write("[net] TCP-FASTRETX-OK\n");
+    else
+        serial_write("[net] TCP-FASTRETX-BAD\n");
 
     if (dhcp_run()) {
         serial_write("[net] DHCP configured\n");
