@@ -37,6 +37,12 @@ uint32_t net_get_gateway(void);
 /* Socket operations. Socket ids are 0..NET_FD_MAX-NET_FD_BASE-1; the
  * syscall layer adds NET_FD_BASE. Return >=0 on success, negative error. */
 int net_socket(int type, int proto);
+/* Create a connected AF_UNIX pair (socketpair(2)); no NIC required.
+ * Returns 0 with ids in *a/*b, -1 when slots are exhausted, -2 for a
+ * supported-type mismatch. */
+int net_socketpair(int type, int* a, int* b);
+/* SOCK_STREAM/SOCK_DGRAM/SOCK_RAW of a live socket, 0 when invalid. */
+int net_socket_kind(int id);
 int net_bind(int id, uint32_t ip, uint16_t port);
 int net_connect(int id, uint32_t ip, uint16_t port);
 int net_listen(int id);

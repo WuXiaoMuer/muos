@@ -21,6 +21,24 @@
 #define MUOS_MAP_ANONYMOUS 0x20
 #define MUOS_RLIMIT_NOFILE 7
 
+/* AF_UNIX socketpair / socket options / msghdr I/O */
+#define MUOS_AF_UNIX     1
+#define MUOS_SOCK_STREAM 1
+#define MUOS_SOL_SOCKET  1
+#define MUOS_SO_TYPE     3
+
+typedef struct {
+    unsigned base;
+    unsigned len;
+} muos_iovec_t;
+
+typedef struct {
+    unsigned name, namelen;
+    unsigned iov, iovlen;
+    unsigned control, controllen;
+    unsigned flags;
+} muos_msghdr_t;
+
 /* *at resolver flags (Linux i386 values) */
 #define MUOS_AT_FDCWD     (-100)
 #define MUOS_AT_REMOVEDIR 0x200
@@ -54,6 +72,10 @@ unsigned muos_mmap(unsigned len);
 int  muos_munmap(unsigned addr, unsigned len);
 int  muos_mprotect(unsigned addr, unsigned len, int prot);
 int  muos_msync(unsigned addr, unsigned len, int flags);
+int  muos_socketpair(int type, int sv[2]);
+int  muos_getsockopt(int fd, int level, int opt, unsigned* val, unsigned* len);
+int  muos_sendmsg(int fd, muos_msghdr_t* msg, int flags);
+int  muos_recvmsg(int fd, muos_msghdr_t* msg, int flags);
 unsigned muos_mmap_file(int fd, unsigned len, int prot, int flags, unsigned offset);
 int  muos_chmod(const char* path, int mode);
 int  muos_setuid(int uid);

@@ -307,6 +307,22 @@ int muos_msync(unsigned addr, unsigned len, int flags) {
     return syscall3(144, (int)addr, (int)len, flags);
 }
 
+int muos_socketpair(int type, int sv[2]) {
+    return syscall4(360, MUOS_AF_UNIX, type, 0, (int)sv);
+}
+
+int muos_getsockopt(int fd, int level, int opt, unsigned* val, unsigned* len) {
+    return syscall5(365, fd, level, opt, (int)val, (int)len);
+}
+
+int muos_sendmsg(int fd, muos_msghdr_t* msg, int flags) {
+    return syscall3(370, fd, (int)msg, flags);
+}
+
+int muos_recvmsg(int fd, muos_msghdr_t* msg, int flags) {
+    return syscall3(372, fd, (int)msg, flags);
+}
+
 void muos_exit(int code) {
     syscall1(1, code);
     for (;;) { /* the kernel never returns here */ }

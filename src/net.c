@@ -132,6 +132,10 @@ typedef struct {
     uint8_t  tcp_state;
     int      parent;        /* listening socket that spawned us, -1 if none */
     bool_t   echo_mode;     /* kernel demo echo service (port 7) */
+    int      unix_peer;     /* AF_UNIX socketpair partner, -1 if none */
+    uint32_t unix_head;     /* incoming stream bytes (ring) */
+    uint32_t unix_len;
+    uint8_t  unix_buf[1024];
     uint32_t snd_nxt;
     uint32_t rcv_nxt;
     uint32_t snd_una;       /* first unacknowledged sequence number */
@@ -1046,6 +1050,7 @@ static net_sock_t* tcp_new_sock(void) {
         socks[i].type = NET_SOCK_STREAM;
         socks[i].proto = 6;
         socks[i].parent = -1;
+        socks[i].unix_peer = -1;
         socks[i].rcv_shift = 4;
         return &socks[i];
     }
@@ -1568,6 +1573,50 @@ bool_t net_socket_ok(int id) {
     return id >= 0 && id < NET_FD_MAX - NET_FD_BASE && socks[id].used;
 }
 
+int net_socket_kind(int id) {
+    return net_socket_ok(id) ? socks[id].type : 0;
+}
+
+/* Allocate a bare AF_UNIX endpoint (no NIC needed). */
+static net_sock_t* unix_alloc(int type) {
+    for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
+        if (socks[i].used) continue;
+        memset(&socks[i], 0, sizeof(socks[i]));
+        socks[i].used = true;
+        socks[i].type = type;
+        socks[i].proto = 0;
+        socks[i].parent = -1;
+        socks[i].unix_peer = -1;
+        return &socks[i];
+    }
+    return NULL;
+}
+
+/* Create a connected AF_UNIX pair (pipe-like, used by socketpair(2)). */
+int net_socketpair(int type, int* a, int* b) {
+    if (type != NET_SOCK_STREAM && type != NET_SOCK_DGRAM) return -2;
+    net_sock_t* s1 = unix_alloc(type);
+    if (!s1) return -1;
+    net_sock_t* s2 = unix_alloc(type);
+    if (!s2) { s1->used = false; return -1; }
+    s1->unix_peer = (int)(s2 - socks);
+    s2->unix_peer = (int)(s1 - socks);
+    *a = (int)(s1 - socks);
+    *b = (int)(s2 - socks);
+    return 0;
+}
+
+/* Append bytes to an endpoint's incoming stream buffer. */
+static bool_t unix_push(net_sock_t* dst, const void* data, uint32_t len) {
+    if (len > 1024 - dst->unix_len) return false;
+    const uint8_t* d = (const uint8_t*)data;
+    for (uint32_t i = 0; i < len; i++) {
+        dst->unix_buf[(dst->unix_head + dst->unix_len + i) & 1023u] = d[i];
+    }
+    dst->unix_len += len;
+    return true;
+}
+
 int net_socket(int type, int proto) {
     if (!present) return -1;
     if (type != NET_SOCK_DGRAM && type != NET_SOCK_RAW &&
@@ -1582,6 +1631,7 @@ int net_socket(int type, int proto) {
         else socks[i].proto = (type == NET_SOCK_DGRAM) ? 17 :
                               (type == NET_SOCK_STREAM) ? 6 : 1;
         socks[i].parent = -1;
+        socks[i].unix_peer = -1;
         socks[i].rcv_shift = 4;
         return i;
     }
@@ -1636,8 +1686,22 @@ int net_connect(int id, uint32_t ip, uint16_t port) {
 int net_sendto(int id, const void* data, uint32_t len,
                uint32_t ip, uint16_t port) {
     if (!net_socket_ok(id)) return -1;
-    if (!present) return -1;
     net_sock_t* s = &socks[id];
+    if (s->unix_peer >= 0) {
+        if (!net_socket_ok(s->unix_peer)) return -1;
+        net_sock_t* peer = &socks[s->unix_peer];
+        if (s->type == NET_SOCK_DGRAM) {
+            if (peer->has || len > sizeof(peer->data)) return -1;
+            memcpy(peer->data, data, len);
+            peer->plen = len;
+            peer->sip = 0;
+            peer->sport = 0;
+            peer->has = true;
+            return (int)len;
+        }
+        return unix_push(peer, data, len) ? (int)len : -1;
+    }
+    if (!present) return -1;
     if (!s->bound) {
         s->lport = (s->type == NET_SOCK_RAW) ? 0 : next_port++;
         s->bound = true;
@@ -1657,8 +1721,36 @@ int net_sendto(int id, const void* data, uint32_t len,
 int net_recvfrom(int id, void* buf, uint32_t maxlen,
                  uint32_t* ip, uint16_t* port) {
     if (!net_socket_ok(id)) return -1;
-    if (!present) return -1;
     net_sock_t* s = &socks[id];
+
+    if (s->unix_peer >= 0) {
+        for (uint32_t loops = 0; loops < 300; loops++) {   /* ~3 seconds */
+            if (s->type == NET_SOCK_DGRAM) {
+                if (s->has) {
+                    uint32_t n = s->plen;
+                    if (n > maxlen) n = maxlen;
+                    memcpy(buf, s->data, n);
+                    s->has = false;
+                    s->plen = 0;
+                    return (int)n;
+                }
+            } else if (s->unix_len) {
+                uint32_t n = s->unix_len;
+                if (n > maxlen) n = maxlen;
+                for (uint32_t i = 0; i < n; i++)
+                    ((uint8_t*)buf)[i] =
+                        s->unix_buf[(s->unix_head + i) & 1023u];
+                s->unix_head = (s->unix_head + n) & 1023u;
+                s->unix_len -= n;
+                return (int)n;
+            }
+            if (!net_socket_ok(s->unix_peer)) return 0;    /* peer closed */
+            __asm__ volatile ("sti; hlt; cli");
+        }
+        return NET_EAGAIN;
+    }
+
+    if (!present) return -1;
 
     if (s->type == NET_SOCK_STREAM) {
         for (uint32_t loops = 0; loops < 300; loops++) {   /* ~3 seconds */
@@ -1696,6 +1788,11 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
 int net_close(int id) {
     if (!net_socket_ok(id)) return -1;
     net_sock_t* s = &socks[id];
+    if (s->unix_peer >= 0) {
+        if (net_socket_ok(s->unix_peer)) socks[s->unix_peer].unix_peer = -1;
+        memset(s, 0, sizeof(*s));
+        return 0;
+    }
     if (s->type == NET_SOCK_STREAM &&
         (s->tcp_state == TCP_ESTAB || s->tcp_state == TCP_CLOSE_WAIT)) {
         tcp_send_seg(s, s->snd_nxt, s->rcv_nxt, TCP_F_FIN | TCP_F_ACK, NULL, 0);
@@ -1706,10 +1803,16 @@ int net_close(int id) {
 }
 
 /* getsockname/getpeername: report the real bind/connect tuple instead of
- * the 0.0.0.0:0 placeholders the old stub returned. */
+ * the 0.0.0.0:0 placeholders the old stub returned. AF_UNIX pairs have no
+ * address, so they report 0.0.0.0:0 (the sockaddr family stays AF_INET). */
 int net_getsockname(int id, uint32_t* ip, uint16_t* port) {
     if (!net_socket_ok(id)) return -1;
     net_sock_t* s = &socks[id];
+    if (s->unix_peer >= 0) {
+        if (ip)   *ip   = 0;
+        if (port) *port = 0;
+        return 0;
+    }
     if (ip)   *ip   = s->bound ? local_ip_for(s->rip) : 0;
     if (port) *port = s->bound ? s->lport : 0;
     return 0;

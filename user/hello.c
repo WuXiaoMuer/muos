@@ -540,6 +540,52 @@ int main(int argc, char** argv) {
         }
         muos_close(cli);
         muos_close(lfd);
+
+        /* AF_UNIX socketpair + getsockopt(SO_TYPE) + sendmsg/recvmsg. */
+        {
+            int sv[2];
+            if (muos_socketpair(MUOS_SOCK_STREAM, sv) == 0) {
+                unsigned so_type = 0, so_len = 4;
+                int grc = muos_getsockopt(sv[0], MUOS_SOL_SOCKET,
+                                          MUOS_SO_TYPE, &so_type, &so_len);
+                muos_puts("tcp: socketpair="); muos_putdec(sv[0]);
+                muos_puts(","); muos_putdec(sv[1]);
+                muos_puts(" so-type="); muos_putdec((int)so_type); muos_puts("\n");
+                ok = ok && grc == 0 && so_type == MUOS_SOCK_STREAM;
+
+                const char p1[] = "PAIR-";
+                const char p2[] = "OK";
+                char r1[3], r2[16];
+                muos_iovec_t iv[2], riv[2];
+                iv[0].base = (unsigned)p1; iv[0].len = 5;
+                iv[1].base = (unsigned)p2; iv[1].len = 2;
+                riv[0].base = (unsigned)r1; riv[0].len = 3;
+                riv[1].base = (unsigned)r2; riv[1].len = sizeof(r2);
+
+                muos_msghdr_t mh;
+                mh.name = 0; mh.namelen = 0;
+                mh.iov = (unsigned)iv; mh.iovlen = 2;
+                mh.control = 0; mh.controllen = 0; mh.flags = 0;
+                int sent = muos_sendmsg(sv[0], &mh, 0);
+                mh.iov = (unsigned)riv; mh.iovlen = 2;
+                int got = muos_recvmsg(sv[1], &mh, 0);
+
+                int pair_ok = (sent == 7 && got == 7 &&
+                               r1[0] == 'P' && r1[1] == 'A' && r1[2] == 'I' &&
+                               r2[0] == 'R' && r2[1] == '-' &&
+                               r2[2] == 'O' && r2[3] == 'K');
+                muos_puts("tcp: pair-send="); muos_putdec(sent);
+                muos_puts(" pair-recv="); muos_putdec(got);
+                muos_puts(pair_ok ? " pair-ok\n" : " pair-bad\n");
+                ok = ok && pair_ok;
+                muos_close(sv[0]);
+                muos_close(sv[1]);
+            } else {
+                muos_puts("tcp: socketpair-bad\n");
+                ok = 0;
+            }
+        }
+
         muos_puts(ok ? "ACCEPT-OK\n" : "ACCEPT-BAD\n");
         if (!ok) { muos_puts("TCP-BAD\n"); return 0; }
 

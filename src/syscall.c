@@ -293,6 +293,9 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define ERR_ENAMETOOLONG 36
 #define ERR_ENOSYS    38
 #define ERR_ENOTEMPTY 39
+#define ERR_ENOTSOCK 88
+#define ERR_EMSGSIZE 90
+#define ERR_ENOPROTOOPT 92
 #define ERR_EAFNOSUPPORT 97
 #define ERR_ENOTCONN 107
 
@@ -314,6 +317,20 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define SYS_recvmsg     372
 #define SYS_shutdown    373
 #define AF_INET          2
+#define AF_UNIX          1
+
+/* i386 iovec / msghdr layouts shared by readv/writev and sendmsg/recvmsg. */
+typedef struct {
+    uint32_t base;
+    uint32_t len;
+} iovec32_t;
+
+typedef struct {
+    uint32_t name, namelen;
+    uint32_t iov, iovlen;
+    uint32_t control, controllen;
+    uint32_t flags;
+} msghdr32_t;   /* 28 bytes */
 
 /* open(2) flags and mmap(2) constants (Linux i386 values) */
 #define O_WRONLY    0x01
@@ -1534,6 +1551,143 @@ static uint32_t do_getpeername(uint32_t fd, uint32_t addr, uint32_t alenp) {
     return 0;
 }
 
+/* ---- socket options, socketpair and msghdr I/O ---- */
+
+#define SOL_SOCKET   1
+#define SO_REUSEADDR 2
+#define SO_TYPE      3
+#define SO_ERROR     4
+#define SO_SNDBUF    7
+#define SO_RCVBUF    8
+#define SO_KEEPALIVE 9
+#define IPPROTO_TCP  6
+#define TCP_NODELAY  1
+
+static uint32_t do_setsockopt(uint32_t fd, uint32_t level, uint32_t opt,
+                              uint32_t valp, uint32_t len) {
+    if (sock_id(fd) < 0) return err(ERR_EBADF);
+    if (len && !user_ptr_ok(valp, len)) return err(ERR_EFAULT);
+    if (level == SOL_SOCKET && (opt == SO_REUSEADDR || opt == SO_KEEPALIVE ||
+                                opt == SO_SNDBUF || opt == SO_RCVBUF))
+        return 0;                       /* accepted, not enforced */
+    if (level == IPPROTO_TCP && opt == TCP_NODELAY) return 0;
+    return err(ERR_ENOPROTOOPT);
+}
+
+static uint32_t do_getsockopt(uint32_t fd, uint32_t level, uint32_t opt,
+                              uint32_t valp, uint32_t lenp) {
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    if (!lenp || !user_ptr_ok(lenp, 4)) return err(ERR_EFAULT);
+    if (!valp || !user_ptr_ok(valp, 4)) return err(ERR_EFAULT);
+    uint32_t optlen = *(uint32_t*)lenp;
+    if (optlen < 4) return err(ERR_EINVAL);
+
+    uint32_t v;
+    if (level == SOL_SOCKET && opt == SO_TYPE) {
+        v = (uint32_t)net_socket_kind(id);
+    } else if (level == SOL_SOCKET && opt == SO_ERROR) {
+        v = 0;
+    } else if (level == SOL_SOCKET && opt == SO_RCVBUF) {
+        v = 2048;
+    } else if (level == SOL_SOCKET && opt == SO_SNDBUF) {
+        v = 2048;
+    } else if (level == IPPROTO_TCP && opt == TCP_NODELAY) {
+        v = 0;
+    } else {
+        return err(ERR_ENOPROTOOPT);
+    }
+    *(uint32_t*)valp = v;
+    *(uint32_t*)lenp = 4;
+    return 0;
+}
+
+/* socketpair(2): only AF_UNIX is supported; type flags below 0x10. */
+static uint32_t do_socketpair(uint32_t domain, uint32_t type,
+                              uint32_t proto, uint32_t svp) {
+    if (domain != AF_UNIX) return err(ERR_EAFNOSUPPORT);
+    if (proto != 0) return err(ERR_EINVAL);
+    if (!svp || !user_ptr_ok(svp, 8)) return err(ERR_EFAULT);
+    int a = 0, b = 0;
+    int rc = net_socketpair((int)(type & 0x0F), &a, &b);
+    if (rc == -2) return err(ERR_ENOSYS);
+    if (rc < 0) return err(ERR_EMFILE);
+    ((uint32_t*)svp)[0] = (uint32_t)(a + NET_FD_BASE);
+    ((uint32_t*)svp)[1] = (uint32_t)(b + NET_FD_BASE);
+    return 0;
+}
+
+#define MSG_TMP_MAX 1400
+static uint8_t msg_tmp[MSG_TMP_MAX];   /* syscalls are not preempted */
+
+static uint32_t do_sendmsg(uint32_t fd, uint32_t msgp, uint32_t flags) {
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    if (!msgp || !user_ptr_ok(msgp, sizeof(msghdr32_t))) return err(ERR_EFAULT);
+    msghdr32_t m;
+    memcpy(&m, (const void*)msgp, sizeof(m));
+    (void)flags;
+    if (m.iovlen > 16) return err(ERR_EINVAL);
+    if (m.iovlen && !user_ptr_ok(m.iov, m.iovlen * 8)) return err(ERR_EFAULT);
+
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < m.iovlen; i++) {
+        iovec32_t v;
+        memcpy(&v, (const void*)(m.iov + i * 8), sizeof(v));
+        if (v.len > MSG_TMP_MAX - total) return err(ERR_EMSGSIZE);
+        if (v.len && !user_ptr_ok(v.base, v.len)) return err(ERR_EFAULT);
+        if (v.len) memcpy(msg_tmp + total, (const void*)v.base, v.len);
+        total += v.len;
+    }
+
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (m.name) {
+        if (!read_sockaddr(m.name, m.namelen, &ip, &port))
+            return err(ERR_EINVAL);
+    }
+    int n = net_sendto(id, msg_tmp, total, ip, port);
+    if (n < 0) return err(ERR_EAGAIN);
+    return (uint32_t)n;
+}
+
+static uint32_t do_recvmsg(uint32_t fd, uint32_t msgp, uint32_t flags) {
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    if (!msgp || !user_ptr_ok(msgp, sizeof(msghdr32_t))) return err(ERR_EFAULT);
+    msghdr32_t m;
+    memcpy(&m, (const void*)msgp, sizeof(m));
+    (void)flags;
+    if (m.iovlen > 16) return err(ERR_EINVAL);
+    if (m.iovlen && !user_ptr_ok(m.iov, m.iovlen * 8)) return err(ERR_EFAULT);
+
+    uint32_t want = 0;
+    for (uint32_t i = 0; i < m.iovlen; i++) {
+        iovec32_t v;
+        memcpy(&v, (const void*)(m.iov + i * 8), sizeof(v));
+        if (v.len && !user_ptr_ok(v.base, v.len)) return err(ERR_EFAULT);
+        if (v.len > MSG_TMP_MAX - want) return err(ERR_EMSGSIZE);
+        want += v.len;
+    }
+
+    int n = net_recvfrom(id, msg_tmp, want, NULL, NULL);
+    if (n < 0) return err(ERR_EAGAIN);
+
+    uint32_t left = (uint32_t)n;
+    for (uint32_t i = 0; i < m.iovlen && left; i++) {
+        iovec32_t v;
+        memcpy(&v, (const void*)(m.iov + i * 8), sizeof(v));
+        uint32_t k = v.len < left ? v.len : left;
+        if (k) memcpy((void*)v.base, msg_tmp + (uint32_t)n - left, k);
+        left -= k;
+    }
+    m.namelen = 0;
+    m.controllen = 0;
+    m.flags = 0;
+    memcpy((void*)msgp, &m, sizeof(m));
+    return (uint32_t)n;
+}
+
 /* i386 socketcall(102): huge switch over the old multiplexed ABI. */
 static uint32_t do_socketcall(uint32_t call, uint32_t args) {
     if (!args || !user_ptr_ok(args, 6 * 4)) return err(ERR_EFAULT);
@@ -1556,7 +1710,12 @@ static uint32_t do_socketcall(uint32_t call, uint32_t args) {
         case 10: return do_recvfrom(a[0], a[1], a[2], a[3], 0, 0);
         case 11: return do_sendto(a[0], a[1], a[2], a[3], a[4], a[5]);
         case 12: return do_recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]);
-        case 13: case 14: case 15: return 0;    /* shutdown/getsockopt/setsockopt */
+        case 8:  return do_socketpair(a[0], a[1], a[2], a[3]);
+        case 13: return 0;                       /* shutdown */
+        case 14: return do_setsockopt(a[0], a[1], a[2], a[3], a[4]);
+        case 15: return do_getsockopt(a[0], a[1], a[2], a[3], a[4]);
+        case 16: return do_sendmsg(a[0], a[1], a[2]);
+        case 17: return do_recvmsg(a[0], a[1], a[2]);
         default: return err(ERR_ENOSYS);
     }
 }
@@ -3413,11 +3572,6 @@ static uint32_t do_execve(registers_t* regs, uint32_t path_ptr, uint32_t argv_pt
 
 /* musl flushes buffered stdio with writev, so a working writev is required
  * for BusyBox applets that print through stdio (ls, ps, ...). */
-typedef struct {
-    uint32_t base;
-    uint32_t len;
-} iovec32_t;
-
 static uint32_t do_writev(uint32_t fd, uint32_t iov_ptr, uint32_t count) {
     if (count > 1024) return err(ERR_EINVAL);
     if (!user_ptr_ok(iov_ptr, count * 8)) return err(ERR_EFAULT);
@@ -3870,8 +4024,12 @@ void syscall_handler(registers_t* regs) {
             ret = 0;
             break;
         case SYS_setsockopt:
+            ret = do_setsockopt(regs->ebx, regs->ecx, regs->edx,
+                                regs->esi, regs->edi);
+            break;
         case SYS_getsockopt:
-            ret = 0;
+            ret = do_getsockopt(regs->ebx, regs->ecx, regs->edx,
+                                regs->esi, regs->edi);
             break;
         case SYS_getsockname:
             ret = do_getsockname(regs->ebx, regs->ecx, regs->edx);
@@ -3880,9 +4038,13 @@ void syscall_handler(registers_t* regs) {
             ret = do_getpeername(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_socketpair:
+            ret = do_socketpair(regs->ebx, regs->ecx, regs->edx, regs->esi);
+            break;
         case SYS_sendmsg:
+            ret = do_sendmsg(regs->ebx, regs->ecx, regs->edx);
+            break;
         case SYS_recvmsg:
-            ret = err(ERR_ENOSYS);
+            ret = do_recvmsg(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_unlink:
             ret = do_unlink(regs->ebx);
