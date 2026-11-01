@@ -38,6 +38,20 @@ static int vfs_vol_write(int vol, const char* path, const void* data,
     return r < 0 ? -1 : 0;
 }
 
+static int vfs_vol_delete(int vol, const char* path) {
+    return vol == VFS_VOL_FAT ? fat_delete_file(path)
+                              : ext2_delete_file(path);
+}
+
+static int vfs_vol_mkdir(int vol, const char* path) {
+    return vol == VFS_VOL_FAT ? fat_mkdir(path) : ext2_mkdir(path);
+}
+
+static int vfs_vol_rename(int vol, const char* old_path, const char* new_path) {
+    return vol == VFS_VOL_FAT ? fat_rename_file(old_path, new_path)
+                              : ext2_rename_file(old_path, new_path);
+}
+
 /* Defined with the virtual namespace below; do_read/do_write need them
  * before that point. */
 static bool_t vfs_mount_prefix(const char* path, int* vol, const char** sub);
@@ -253,6 +267,7 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define ERR_EACCES    13
 #define ERR_EBUSY     16
 #define ERR_EEXIST    17
+#define ERR_EXDEV     18
 #define ERR_ENOMEM    12
 #define ERR_EFAULT    14
 #define ERR_ENODEV    19
@@ -2233,6 +2248,28 @@ static uint32_t do_mkdir_buf(const char* buf) {
     if ((int32_t)rc == 0) return err(ERR_EEXIST);
     if ((uint32_t)(-(int32_t)rc) != ERR_ENOENT) return rc;
 
+    int mvol = 0;
+    const char* msub = NULL;
+    if (vfs_mount_prefix(e.path, &mvol, &msub)) {
+        if (!vfs_mount_present(mvol)) return err(ERR_ENOENT);
+        if (!*msub) return err(ERR_EEXIST);
+
+        /* The parent component must exist and be a directory. */
+        char parent[USER_FD_PATH_MAX];
+        uint32_t n = (uint32_t)strlen(msub);
+        if (n + 1 > sizeof(parent)) return err(ERR_ENAMETOOLONG);
+        memcpy(parent, msub, n + 1);
+        uint32_t cut = n;
+        while (cut > 0 && parent[cut - 1] != '/') cut--;
+        if (cut > 0) cut--;
+        parent[cut] = '\0';
+        bool_t pdir = false;
+        uint32_t psz = 0;
+        if (!vfs_mount_stat(mvol, parent, &pdir, &psz)) return err(ERR_ENOENT);
+        if (!pdir) return err(ERR_ENOTDIR);
+        return vfs_vol_mkdir(mvol, msub) == 0 ? 0 : err(ERR_EIO);
+    }
+
     const char* name = e.path + 1;
     if (!*name) return err(ERR_EEXIST);
     if (strlen(name) >= FS_MAX_NAME) return err(ERR_ENAMETOOLONG);
@@ -2270,6 +2307,12 @@ static uint32_t do_unlink_buf(const char* buf) {
     switch (e.type) {
         case VFS_T_FILE:
             return fs_delete(e.path + 1) == 0 ? 0 : err(ERR_ENOENT);
+        case VFS_T_EXT: {
+            int vol = 0;
+            const char* sub = NULL;
+            if (!vfs_mount_prefix(e.path, &vol, &sub)) return err(ERR_ENOENT);
+            return vfs_vol_delete(vol, sub) == 0 ? 0 : err(ERR_EIO);
+        }
         case VFS_T_DIR:
             return err(ERR_EISDIR);
         default:
@@ -2287,11 +2330,24 @@ static uint32_t do_rename_bufs(const char* obuf, const char* nbuf) {
     vfs_ent_t oe, ne;
     uint32_t rc = vfs_lookup(obuf, &oe);
     if ((int32_t)rc < 0) return rc;
-    if (oe.type != VFS_T_FILE && oe.type != VFS_T_DIR) return err(ERR_EPERM);
-    if (oe.type == VFS_T_DIR && oe.id != VFS_DIR_REAL) return err(ERR_EPERM);
 
     uint32_t nrc = vfs_lookup(nbuf, &ne);
     if ((int32_t)nrc < 0 && (uint32_t)(-(int32_t)nrc) != ERR_ENOENT) return nrc;
+
+    if (oe.type == VFS_T_EXT) {
+        int vol = 0, nvol = 0;
+        const char* osub = NULL;
+        const char* nsub = NULL;
+        if (!vfs_mount_prefix(oe.path, &vol, &osub)) return err(ERR_ENOENT);
+        if (!vfs_mount_prefix(ne.path, &nvol, &nsub)) return err(ERR_EXDEV);
+        if (nvol != vol) return err(ERR_EXDEV);
+        if (!*nsub) return err(ERR_EBUSY);
+        if ((int32_t)nrc == 0) return err(ERR_EEXIST);
+        return vfs_vol_rename(vol, osub, nsub) == 0 ? 0 : err(ERR_EIO);
+    }
+
+    if (oe.type != VFS_T_FILE && oe.type != VFS_T_DIR) return err(ERR_EPERM);
+    if (oe.type == VFS_T_DIR && oe.id != VFS_DIR_REAL) return err(ERR_EPERM);
 
     const char* oname = oe.path + 1;
     const char* nname = ne.path + 1;   /* normalized for ENOENT too */

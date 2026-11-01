@@ -48,7 +48,8 @@ def main():
                     "fatwrite /LongFileName.txt LONG-NAME-OK",
                     "fatcat /LongFileName.txt"], 4477, "fat")
     tfw = boot(fat, ["fatcat /NEW.TXT", "fatcat /HELLO.TXT",
-                     "fatcat /LongFileName.txt", "cat /fat/VFS.TXT"],
+                     "fatcat /LongFileName.txt", "cat /fat/VFS.TXT",
+                     "fatcat /VFSDIR/A.TXT", "fatcat /VFSDIR/B.TXT"],
                4480, "fat2")
     tg = boot(gpt, ["part", "fatcat /HELLO.TXT"], 4478, "gpt")
     te = boot(ext, ["part", "ext2ls /", "ext2cat /hello.txt",
@@ -58,7 +59,8 @@ def main():
                     "ext2write /hello.txt EXT2-OVERWRITE",
                     "ext2cat /hello.txt"], 4479, "ext2")
     tew = boot(ext, ["ext2cat /new.txt", "ext2cat /hello.txt",
-                     "cat /ext2/vfs.txt"], 4481, "ext2w")
+                     "cat /ext2/vfs.txt", "ext2cat /vfsdir/a.txt",
+                     "ext2cat /vfsdir/b.txt"], 4481, "ext2w")
 
     checks = {
         "fat part table": "[part] table ok" in tf,
@@ -73,6 +75,7 @@ def main():
         "fat long create": "LONG-NAME-OK" in tf and "LongFileName.txt" in tf,
         "fat persist": "FAT-WRITE-OK" in tfw and "FAT-OVERWRITE" in tfw,
         "fat long persist": "LONG-NAME-OK" in tfw,
+        "fat delete persist": tfw.count("[fat] cat fail") >= 2,
         "gpt partition": "GPT" in tg and "[part] table ok" in tg,
         "gpt fat read": "FAT-HELLO-OK" in tg,
         "ext2 part table": "[part] table ok" in te,
@@ -84,14 +87,21 @@ def main():
         "ext2 write": "[ext2] write ok" in te and "EXT2-WRITE-OK" in te,
         "ext2 overwrite": "EXT2-OVERWRITE" in te,
         "ext2 persist": "EXT2-WRITE-OK" in tew and "EXT2-OVERWRITE" in tew,
+        "ext2 delete persist": tew.count("[ext2] cat fail") >= 2,
         "vfs fat open/read": "VFS-FAT-OK" in tf and "VFS-OK" in tf,
         "vfs fat write": "VFS-WRITE-OK" in tf,
         "vfs fat persist": "VFS-WRITE-OK" in tfw,
         "vfs fat getdents": "VFS-LIST-OK" in tf,
+        "vfs fat mkdir/rename/unlink": "VFS-MKDIR-OK" in tf and
+                                       "VFS-RENAME-OK" in tf and
+                                       "VFS-UNLINK-OK" in tf,
         "vfs ext2 open/read": "VFS-EXT2-OK" in te and "VFS-OK" in te,
         "vfs ext2 write": "VFS-WRITE-OK" in te,
         "vfs ext2 persist": "VFS-WRITE-OK" in tew,
         "vfs ext2 getdents": "VFS-LIST-OK" in te,
+        "vfs ext2 mkdir/rename/unlink": "VFS-MKDIR-OK" in te and
+                                        "VFS-RENAME-OK" in te and
+                                        "VFS-UNLINK-OK" in te,
         "tcp reorder selftest": "TCP-REORDER-OK" in tf,
     }
     for k, v in checks.items():

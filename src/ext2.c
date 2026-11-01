@@ -619,6 +619,140 @@ int ext2_write_file(const char* path, const void* data, uint32_t len) {
     return (int)len;
 }
 
+/* Free an inode bitmap bit, its free count, and zero the inode. */
+static bool_t inode_release(uint32_t ino) {
+    if (ino < 1 || ino > vol.inodes_count) return false;
+    uint8_t gd[8];
+    if (!gd0_read(gd, 8)) return false;
+    uint32_t ibm = le32(gd + 4);
+    if (!bitmap_set(ibm, ino - 1, false)) return false;
+    adjust_free(EXT2_SB_FREE_INODES, EXT2_GD_FREE_INODES, 1);
+    uint8_t zero[256];
+    for (uint32_t i = 0; i < 256; i++) zero[i] = 0;
+    return write_inode(ino, zero);
+}
+
+/* Remove `name` from dir_ino, merging its record with the previous entry. */
+static bool_t dir_remove(uint32_t dir_ino, const char* name,
+                         uint32_t* child_out) {
+    uint8_t dinode[256];
+    if (!read_inode(dir_ino, dinode)) return false;
+    uint32_t bs = vol.block_size;
+    uint32_t size = le32(dinode + 4);
+
+    for (uint32_t logical = 0, done = 0; done < size; logical++) {
+        uint32_t block;
+        if (!inode_block(dinode, logical, &block)) break;
+        if (!read_block(block, blkbuf)) return false;
+        uint32_t prev = 0xFFFFFFFFu;
+        for (uint32_t off = 0; off + 8 <= bs && done < size; ) {
+            uint32_t ent_ino = le32(blkbuf + off);
+            uint16_t rec = le16(blkbuf + off + 4);
+            uint16_t eln = le16(blkbuf + off + 6);
+            if (rec < 8 || off + rec > bs) return false;
+            if (ent_ino && eln && off + 8 + eln <= bs) {
+                char nm[64];
+                uint32_t n = eln > 63 ? 63 : eln;
+                memcpy(nm, blkbuf + off + 8, n);
+                nm[n] = '\0';
+                if (ci_cmp(nm, name) == 0) {
+                    if (child_out) *child_out = ent_ino;
+                    if (prev == 0xFFFFFFFFu) put32(blkbuf + off, 0);
+                    else put16(blkbuf + prev + 4,
+                               (uint16_t)(le16(blkbuf + prev + 4) + rec));
+                    return write_block(block, blkbuf);
+                }
+            }
+            prev = off;
+            off += rec;
+            done += rec;
+        }
+    }
+    return false;
+}
+
+int ext2_delete_file(const char* path) {
+    if (!present || !path) return -1;
+    char parent[64], name[64];
+    if (!split_parent(path, parent, name)) return -1;
+
+    ext2_ent_t par, child;
+    if (!resolve(parent, &par) || (par.mode & 0xF000) != 0x4000) return -1;
+    if (!lookup_in_dir(par.ino, name, &child)) return -1;
+    if ((child.mode & 0xF000) == 0x4000) return -1;
+
+    uint8_t inode[256];
+    if (!read_inode(child.ino, inode)) return -1;
+    free_inode_blocks(inode);
+    uint32_t removed = 0;
+    if (!dir_remove(par.ino, name, &removed)) return -1;
+    if (!inode_release(child.ino)) return -1;
+    return 0;
+}
+
+int ext2_mkdir(const char* path) {
+    if (!present || !path) return -1;
+    char parent[64], name[64];
+    if (!split_parent(path, parent, name)) return -1;
+
+    ext2_ent_t par, existing;
+    if (!resolve(parent, &par) || (par.mode & 0xF000) != 0x4000) return -1;
+    if (lookup_in_dir(par.ino, name, &existing)) return -1;
+
+    int n = alloc_inode();
+    if (n < 0) return -1;
+    uint32_t ino = (uint32_t)n;
+
+    int blk = alloc_block();
+    if (blk < 0) { inode_release(ino); return -1; }
+
+    uint32_t bs = vol.block_size;
+    for (uint32_t i = 0; i < bs; i++) blkbuf[i] = 0;
+    write_dirent(blkbuf, ino, 12, ".", 1);
+    write_dirent(blkbuf + 12, par.ino, (uint16_t)(bs - 12), "..", 2);
+    if (!write_block((uint32_t)blk, blkbuf)) {
+        free_block((uint32_t)blk);
+        inode_release(ino);
+        return -1;
+    }
+
+    uint8_t inode[256];
+    for (uint32_t i = 0; i < 256; i++) inode[i] = 0;
+    put16(inode + 0, 0x41ED);           /* directory, 0755 */
+    put16(inode + 26, 2);               /* "." and ".." links */
+    put32(inode + 4, bs);
+    put32(inode + 28, bs / 512u);
+    put32(inode + 40, (uint32_t)blk);
+    if (!write_inode(ino, inode) || !dir_add(par.ino, name, ino)) {
+        free_block((uint32_t)blk);
+        inode_release(ino);
+        return -1;
+    }
+    return 0;
+}
+
+int ext2_rename_file(const char* old_path, const char* new_path) {
+    if (!present || !old_path || !new_path) return -1;
+    char oparent[64], oname[64], nparent[64], nname[64];
+    if (!split_parent(old_path, oparent, oname)
+        || !split_parent(new_path, nparent, nname))
+        return -1;
+    if (strcmp(oparent, nparent) == 0 && strcmp(oname, nname) == 0) return 0;
+
+    ext2_ent_t op, np, child, existing;
+    if (!resolve(oparent, &op) || (op.mode & 0xF000) != 0x4000) return -1;
+    if (!lookup_in_dir(op.ino, oname, &child)) return -1;
+    if ((child.mode & 0xF000) == 0x4000) return -1;
+
+    if (!resolve(nparent, &np) || (np.mode & 0xF000) != 0x4000) return -1;
+    if (lookup_in_dir(np.ino, nname, &existing)) return -1;
+
+    if (!dir_add(np.ino, nname, child.ino)) return -1;
+    uint32_t removed = 0;
+    if (!dir_remove(op.ino, oname, &removed)) return -1;
+    return 0;
+}
+
 const char* ext2_volume(void) { return vol.volume; }
 
 static bool_t try_volume(uint64_t base) {

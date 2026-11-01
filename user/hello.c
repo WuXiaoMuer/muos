@@ -132,6 +132,44 @@ int main(int argc, char** argv) {
                 ok = 0;
         }
 
+        /* Directory creation, rename and delete through the mount. */
+        int is_fat = (path[1] == 'f');
+        const char* mdir = is_fat ? "/fat/VFSDIR" : "/ext2/vfsdir";
+        const char* mfile = is_fat ? "/fat/VFSDIR/A.TXT" : "/ext2/vfsdir/a.txt";
+        const char* rfile = is_fat ? "/fat/VFSDIR/B.TXT" : "/ext2/vfsdir/b.txt";
+        int mk = muos_mkdirat(MUOS_AT_FDCWD, mdir, 0755);
+        muos_puts("vfs: mkdir="); muos_putdec(mk); muos_puts("\n");
+        if (mk == 0 || mk == -17) muos_puts("VFS-MKDIR-OK\n");
+        else ok = 0;
+
+        const char rmsg[] = "VFS-RENAME-OK\n";
+        int mfd = muos_open(mfile, MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        if (mfd >= 0) {
+            muos_write(mfd, rmsg, sizeof(rmsg) - 1);
+            muos_close(mfd);
+        }
+        int rr = muos_renameat(MUOS_AT_FDCWD, mfile, MUOS_AT_FDCWD, rfile);
+        muos_puts("vfs: rename="); muos_putdec(rr); muos_puts("\n");
+        int renamed = 0;
+        if (rr == 0) {
+            int rfd = muos_open(rfile, 0);
+            char rb2[24];
+            int rn2 = rfd >= 0 ? muos_read(rfd, rb2, sizeof(rb2) - 1) : -1;
+            if (rfd >= 0) muos_close(rfd);
+            rb2[rn2 > 0 ? rn2 : 0] = '\0';
+            if (rn2 == (int)sizeof(rmsg) - 1 && arg_is(rb2, "VFS-RENAME-OK\n"))
+                renamed = 1;
+        }
+        if (renamed) muos_puts("VFS-RENAME-OK\n");
+        else ok = 0;
+
+        int urc = muos_unlinkat(MUOS_AT_FDCWD, rfile, 0);
+        int still = muos_open(rfile, 0);
+        if (still >= 0) muos_close(still);
+        muos_puts("vfs: unlink="); muos_putdec(urc); muos_puts("\n");
+        if (urc == 0 && still < 0) muos_puts("VFS-UNLINK-OK\n");
+        else ok = 0;
+
         /* The mount root must enumerate through getdents64 too. */
         int dfd = muos_open("/fat", MUOS_O_DIRECTORY);
         if (dfd < 0) dfd = muos_open("/ext2", MUOS_O_DIRECTORY);

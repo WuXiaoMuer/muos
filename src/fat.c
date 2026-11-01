@@ -578,7 +578,8 @@ static uint8_t lfn_checksum(const uint8_t sn[11]) {
 /* Write count LFN entries + the short entry into one cluster buffer. */
 static bool_t dir_write_long(uint32_t slot_c, uint32_t slot_off,
                              const char* name, const uint8_t sn[11],
-                             uint32_t first, uint32_t size, int entries) {
+                             uint32_t first, uint32_t size, int entries,
+                             uint8_t attr) {
     if (!read_cluster(slot_c, dirbuf)) return false;
     uint8_t csum = lfn_checksum(sn);
     int len = 0;
@@ -600,7 +601,7 @@ static bool_t dir_write_long(uint32_t slot_c, uint32_t slot_off,
     uint8_t* s = dirbuf + slot_off + (uint32_t)entries * 32;
     memset(s, 0, 32);
     for (int i = 0; i < 11; i++) s[i] = sn[i];
-    s[11] = 0x20;
+    s[11] = attr;
     s[20] = (uint8_t)(first >> 16);
     s[21] = (uint8_t)(first >> 24);
     s[26] = (uint8_t)first;
@@ -676,7 +677,7 @@ int fat_write_file(const char* path, const void* data, uint32_t len) {
     if (!first && len == 0) first = 0;
 
     if (use_lfn && !exists) {
-        if (!dir_write_long(slot_c, slot_off, name, sn, first, len, lfn_entries)) {
+        if (!dir_write_long(slot_c, slot_off, name, sn, first, len, lfn_entries, 0x20)) {
             if (first) free_chain(first);
             return -1;
         }
@@ -708,6 +709,162 @@ int fat_write_file(const char* path, const void* data, uint32_t len) {
         return -1;
     }
     return (int)len;
+}
+
+/* Split "/a/b" into parent "/a" and name "b". */
+static bool_t split_path(const char* path, char* parent, uint32_t pcap,
+                         char* name, uint32_t ncap) {
+    if (!path) return false;
+    const char* slash = 0;
+    for (const char* p = path; *p; p++) if (*p == '/') slash = p;
+    const char* nm = slash ? slash + 1 : path;
+    if (!nm[0]) return false;
+    uint32_t nl = (uint32_t)strlen(nm);
+    if (nl + 1 > ncap) return false;
+    memcpy(name, nm, nl + 1);
+    if (slash) {
+        uint32_t n = (uint32_t)(slash - path);
+        if (n == 0) { parent[0] = '/'; parent[1] = '\0'; }
+        else {
+            if (n + 1 > pcap) return false;
+            memcpy(parent, path, n);
+            parent[n] = '\0';
+        }
+    } else {
+        parent[0] = '/';
+        parent[1] = '\0';
+    }
+    return true;
+}
+
+/* Mark a short entry (and its LFN prefix) deleted. */
+static bool_t dir_delete_entry(uint32_t slot_c, uint32_t slot_off) {
+    if (!read_cluster(slot_c, dirbuf)) return false;
+    uint8_t* e = dirbuf + slot_off;
+    uint8_t csum = lfn_checksum(e);
+    for (int32_t off = (int32_t)slot_off - 32; off >= 0; off -= 32) {
+        uint8_t* l = dirbuf + off;
+        if (l[0] == 0xE5) break;                       /* free slot */
+        if ((l[11] & 0x3F) != 0x0F) break;             /* not LFN */
+        if (l[13] != csum) break;                      /* another file */
+        l[0] = 0xE5;
+    }
+    e[0] = 0xE5;
+    uint64_t off = (uint64_t)(vol.data_start + (slot_c - 2) * vol.spc) * SECTOR;
+    return wr(off, dirbuf, vol.spc * SECTOR);
+}
+
+/* Insert a fresh entry into dir_cluster (LFN + short name). */
+static bool_t dir_emit(uint32_t dir_cluster, const char* name, uint32_t first,
+                       uint32_t size, uint8_t attr) {
+    int nlen = 0;
+    while (name[nlen]) nlen++;
+    if (nlen < 1 || nlen > 255) return false;
+    bool_t use_lfn = !name_is_83(name);
+    uint8_t sn[11];
+    if (use_lfn) make_alias(name, sn);
+    else         make_short(name, sn);
+    int entries = use_lfn ? (nlen + 12) / 13 : 0;
+    if (entries > 19) return false;
+
+    bool_t exists;
+    uint32_t sc = 0, so = 0, ec = 0, es = 0;
+    if (!dir_find(dir_cluster, name, &exists, &sc, &so, &ec, &es)) return false;
+    if (exists) return false;
+    if (!dir_free_run(dir_cluster, entries + 1, &sc, &so)) return false;
+
+    if (use_lfn)
+        return dir_write_long(sc, so, name, sn, first, size, entries, attr);
+
+    if (!read_cluster(sc, dirbuf)) return false;
+    uint8_t* e = dirbuf + so;
+    memset(e, 0, 32);
+    for (int i = 0; i < 11; i++) e[i] = sn[i];
+    e[11] = attr;
+    e[20] = (uint8_t)(first >> 16);
+    e[21] = (uint8_t)(first >> 24);
+    e[26] = (uint8_t)first;
+    e[27] = (uint8_t)(first >> 8);
+    memcpy(e + 28, &size, 4);
+    uint64_t off = (uint64_t)(vol.data_start + (sc - 2) * vol.spc) * SECTOR;
+    return wr(off, dirbuf, vol.spc * SECTOR);
+}
+
+int fat_delete_file(const char* path) {
+    if (!present || !path) return -1;
+    char parent[96], name[128];
+    if (!split_path(path, parent, sizeof(parent), name, sizeof(name))) return -1;
+
+    dirent_t pd;
+    if (!resolve(parent, &pd) || !(pd.attr & 0x10)) return -1;
+    bool_t found;
+    uint32_t sc = 0, so = 0, ec = 0, es = 0;
+    if (!dir_find(pd.cluster, name, &found, &sc, &so, &ec, &es) || !found)
+        return -1;
+    uint8_t attr = dirbuf[so + 11];
+    if (attr & 0x10) return -1;                 /* directories use rmdir */
+    if (!dir_delete_entry(sc, so)) return -1;
+    if (ec) free_chain(ec);
+    return 0;
+}
+
+int fat_mkdir(const char* path) {
+    if (!present || !path) return -1;
+    char parent[96], name[128];
+    if (!split_path(path, parent, sizeof(parent), name, sizeof(name))) return -1;
+
+    dirent_t pd;
+    if (!resolve(parent, &pd) || !(pd.attr & 0x10)) return -1;
+
+    uint32_t c;
+    if (!alloc_cluster(&c)) return -1;
+    uint32_t bytes = vol.spc * SECTOR;
+    memset(dirbuf, 0, bytes);
+
+    /* "." points to this cluster, ".." to the parent (0 for root). */
+    uint8_t* dot = dirbuf;
+    for (int i = 0; i < 11; i++) dot[i] = ' ';
+    dot[0] = '.';
+    dot[11] = 0x10;
+    dot[20] = (uint8_t)(c >> 16); dot[21] = (uint8_t)(c >> 24);
+    dot[26] = (uint8_t)c;         dot[27] = (uint8_t)(c >> 8);
+
+    uint32_t pc = (pd.cluster == vol.root_cluster) ? 0 : pd.cluster;
+    uint8_t* dd = dirbuf + 32;
+    for (int i = 0; i < 11; i++) dd[i] = ' ';
+    dd[0] = '.'; dd[1] = '.';
+    dd[11] = 0x10;
+    dd[20] = (uint8_t)(pc >> 16); dd[21] = (uint8_t)(pc >> 24);
+    dd[26] = (uint8_t)pc;         dd[27] = (uint8_t)(pc >> 8);
+
+    uint64_t off = (uint64_t)(vol.data_start + (c - 2) * vol.spc) * SECTOR;
+    if (!wr(off, dirbuf, bytes)) { free_chain(c); return -1; }
+    if (!dir_emit(pd.cluster, name, c, 0, 0x10)) { free_chain(c); return -1; }
+    return 0;
+}
+
+int fat_rename_file(const char* old_path, const char* new_path) {
+    if (!present || !old_path || !new_path) return -1;
+    char oparent[96], oname[128], nparent[96], nname[128];
+    if (!split_path(old_path, oparent, sizeof(oparent), oname, sizeof(oname))
+        || !split_path(new_path, nparent, sizeof(nparent), nname, sizeof(nname)))
+        return -1;
+    if (strcmp(oparent, nparent) == 0 && strcmp(oname, nname) == 0) return 0;
+
+    dirent_t pd;
+    if (!resolve(oparent, &pd) || !(pd.attr & 0x10)) return -1;
+    bool_t found;
+    uint32_t sc = 0, so = 0, ec = 0, es = 0;
+    if (!dir_find(pd.cluster, oname, &found, &sc, &so, &ec, &es) || !found)
+        return -1;
+    uint8_t attr = dirbuf[so + 11];
+    if (attr & 0x10) return -1;
+
+    dirent_t np;
+    if (!resolve(nparent, &np) || !(np.attr & 0x10)) return -1;
+    if (!dir_emit(np.cluster, nname, ec, es, attr)) return -1;
+    if (!dir_delete_entry(sc, so)) return -1;
+    return 0;
 }
 
 const char* fat_label(void) { return vol.label; }

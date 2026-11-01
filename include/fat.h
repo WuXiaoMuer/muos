@@ -27,4 +27,13 @@ int fat_read_at(const char* path, uint32_t offset, void* buf, uint32_t cap);
  * or negative on error. Writes are write-through (no cache). */
 int fat_write_file(const char* path, const void* data, uint32_t len);
 
+/* Delete a file (removes its LFN entries and frees the cluster chain).
+ * Returns 0 on success, negative on error. */
+int fat_delete_file(const char* path);
+/* Create a directory (allocates one cluster, writes "." and "..").
+ * Returns 0 on success, negative on error. */
+int fat_mkdir(const char* path);
+/* Rename a file inside the volume (entries only; data clusters stay). */
+int fat_rename_file(const char* old_path, const char* new_path);
+
 #endif

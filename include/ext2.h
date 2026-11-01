@@ -15,5 +15,11 @@ bool_t ext2_stat(const char* path, bool_t* is_dir, uint32_t* size);
 int ext2_read_at(const char* path, uint32_t offset, void* buf, uint32_t cap);
 /* Create/truncate `path` and write `len` bytes. Returns len or -1. */
 int ext2_write_file(const char* path, const void* data, uint32_t len);
+/* Delete a regular file (frees its blocks and inode, compacts the dirent). */
+int ext2_delete_file(const char* path);
+/* Create a directory (allocates one data block for "." and ".."). */
+int ext2_mkdir(const char* path);
+/* Rename a regular file (new dirent + remove old, blocks stay). */
+int ext2_rename_file(const char* old_path, const char* new_path);
 
 #endif
