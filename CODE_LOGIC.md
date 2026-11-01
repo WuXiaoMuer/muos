@@ -1,6 +1,6 @@
 # MuOS 代码逻辑(v1.3)
 
-本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、Ring3 用户态(int 0x80 + ELF32/ET_DYN)、每进程页目录 + 按需分页 + 抢占调度、信号与 clone 线程、阻塞 poll/read、ATA 块设备、PS/2 鼠标 + RTC 桌面、88 项自检。演进计划见 ROADMAP.md。
+本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、Ring3 用户态(int 0x80 + ELF32/ET_DYN)、每进程页目录 + 按需分页 + 抢占调度、信号与 clone 线程、阻塞 poll/read、ATA 块设备、PS/2 鼠标 + RTC 桌面、90 项自检。演进计划见 ROADMAP.md。
 
 ## 一、总体结构
 
@@ -55,11 +55,11 @@ serial → vga → GDT → IDT(256 项)→ PIC(重映射+全屏蔽)
 → mm_init(mb, kernel_end)         [mmap 解析 + 位图 + 全 RAM 恒等映射 + 模块页预留]
 → mm_enable_paging()              [CR0.PG|WP]
 → fb_enable() + vga_repaint()     [仅 ISO 路径:映射 VBE 显存并重绘影子网格]
-→ kheap_init()                    [1MB 内核堆]
+→ kheap_init()                    [1MB 起步,按需增长到 16MB]
 → tss_init()                      [TSS + 8KB Ring0 入口栈 + ltr]
 → PIT 100Hz + IRQ0 → ATA 探测(primary master)→ keyboard → mouse(8042 aux / IRQ12)
 → task_init + task_register("kernel")
-→ tests_run()                     [88 项自检,失败打印 SELF-TEST FAILED]
+→ tests_run()                     [90 项自检,失败打印 SELF-TEST FAILED]
 → 启动动画 → shell_run()(内核栈上)
 ```
 
@@ -104,9 +104,9 @@ mm_init 末尾:for pfn in [0, total_pages):
 
 ### 4.4 内核堆(kheap.c)
 
-- 区域:`mm_alloc_pages(256)` = 1MB,恒等映射保证可达。
+- 区域:起步 `mm_alloc_pages(256)` = 1MB,映射在独立的 16MB 虚拟窗口(`kheap_va_base()` 从 `0xD0000000` 起按 4MB 跳过已映射的 RAM 别名/MMIO);耗尽时 `kheap_grow()` 逐页 `mm_alloc_page` + `mm_map_page(PAGE_KERNEL)` 追加 256KB,并与尾部空闲块合并,上限 16MB。窗口是 CPU-only 内存,不能交给 DMA。
 - 结构:first-fit 自由链表;**16 字节块头**(magic 'KHEO'/size/used/pad),负载 16 字节对齐;分配按 16 取整;释放时前后向合并(O(n) 回扫,块数极少可接受)。
-- 防护:magic 校验(野指针)、双重释放忽略、区间外指针忽略;耗尽返回 NULL(暂不 Grow,见 ROADMAP)。
+- 防护:magic 校验(野指针)、双重释放忽略、区间外指针忽略;超出 16MB 上限或物理页不足时返回 NULL。
 - 使用者:`task_register`(替代每任务 4KB 整页浪费)。**非可重入**:IRQ 上下文使用需外面包 cli/sti。
 
 ### 4.5 页面换出(swap.c)
@@ -185,7 +185,7 @@ USER_SIGTRAMP = 0x08847000
 - **阻塞 poll**:用户进程且当前有可运行目标时,`do_poll` 调 `proc_block_current_ext(PROC_WAIT_POLL, fds, nfds, deadline)` 后立即退回汇编 iret 到下一个进程;唤醒方 `proc_wake_pollers` 用 `user_fd_state_events(p->fd_state, fd, events)` 在**保存的 fd 表**上重算,把 `revents` 经 `proc_user_ptr` 的 PD 翻译写进阻塞进程的用户数组,置 `p->eax=ready` 后标记 READY;PIT 到期 `proc_poll_expire` 置 0。没有其他可运行进程(或 pid1 shell)时退回旧的 `sti; hlt` 有界循环。
 - **阻塞 read**:pipe 读端为空且有写端、stdin 无字符时同样阻塞(`PROC_WAIT_READ`,记录 fd/缓冲/长度);`pipe_write/pipe_writer_add/读端消费` 与键盘 IRQ 调 `proc_wake_readers`,后者直接 `pipe_read` 到内核临时缓冲并 `memcpy` 进 `proc_user_ptr` 解析出的用户缓冲,stdin 则取一个键盘字符,置 `eax`。信号会把这些等待以 `-EINTR` 唤醒。
 - `select/_newselect` 按 32 位 fd_set 字就地置位/清零;`pselect6` 立即扫描 + 有界 PIT 等待,`ppoll` 复用阻塞 poll;`pselect6/ppoll` 忽略 sigmask;nfds 上限 1024。
-- `mmap` 是沙箱内模拟:匿名取 bump 区,文件映射把 RAM FS/`/proc` 快照按页拷入并零填充,`mmap2` 的 ebp 页号乘 4096,`MAP_FIXED` 校验页对齐与顶部 64KB 栈保留区;映射不写回,`munmap/mprotect` 为空操作。`truncate/ftruncate` 调用 `fs_truncate`(增长零填充、缩小只改 size),64 位变体在 hi 非零时返回 EFBIG;`fsync/fdatasync/sync` 因 RAM FS 已在内核内存中直接成功。
+- `mmap` 是沙箱内模拟:匿名取 bump 区,文件映射把 RAM FS/`/proc` 快照按页拷入并零填充,`mmap2` 的 ebp 页号乘 4096,`MAP_FIXED` 校验页对齐与顶部 64KB 栈保留区。新增:①`MAP_SHARED` 文件映射登记到 `shared_maps[4]`(slot 用 `fs_ref` 保活),`msync(144)`/`munmap`/`exit`/`execve` 时按文件偏移写回(只写到 EOF,不扩文件);②`munmap(91)` 调 `mm_user_unmap` 真正清 PTE、`page_unref` 页帧或释放交换槽;③`mprotect(125)` 调 `mm_user_protect` 修改已映射页写位,只读页用 PTE bit9 标记,后续写故障直接作为违规杀掉进程(不再被 COW 放开);未映射页不预分配。`truncate/ftruncate` 调用 `fs_truncate`(增长零填充、缩小只改 size),64 位变体在 hi 非零时返回 EFBIG;`fsync(118)/fdatasync(148)/sync(36)` 因 RAM FS 已在内核内存中直接成功。
 - `nanosleep` 把秒/纳秒换算成 100Hz PIT tick,用 `sti; hlt; cli` 等待(不参与轮转,但中断仍可唤醒;换算全程 32 位避免 `__udivdi3`)。`times(43)` 返回启动以来 tick,`getrusage(77)` 校验 who 后清空 72 字节结构,`chown` 族复用 `do_chmod`/`do_fchmod` 只校验目标存在与类型,`readlink(85)` 对非符号链接返回 EINVAL。
 - `uname` 按 Linux i386 的 6×65 字节 utsname 填充 MuOS/muos/1.2.0/i386;`unlink/rename` 真正修改 RAM FS;`utimes/futimesat/utimensat` 会写入 atime/mtime(支持 `UTIME_NOW/OMIT`),`fs_set_times` 同时刷新 ctime。
 - 时钟:CMOS RTC 读出完整年月日(处理 BCD/12h/世纪寄存器),`rtc_datetime_to_epoch` 用 civil-days 算法换算 UTC 秒;`time(13)`、`gettimeofday(78)`、`clock_gettime(265/403)` 返回真实 epoch,monotonic 时钟用 PIT ticks,亚秒精度 10ms。
@@ -256,7 +256,9 @@ USER_SIGTRAMP = 0x08847000
   - `tcp_timers` 在每次 `net_poll` 末尾检查 RTO:初次 100 ticks(1s),超时后指数退避到 800 ticks,最多重传 5 次后关闭该 socket;每次超时把 `ssthresh = cwnd/2`、`cwnd = 1 MSS`。
   - `tcp_input` 处理 SYN→新建子连接(SYN-ACK)、ACK→ESTAB、数据段(校验序号后交给接收队列)、FIN→CLOSE_WAIT;`tcp_send_seg` 只对携带序号空间的段(SYN/FIN/数据)布置重传,纯 ACK 不占用重传槽。SYN 到端口 7 且无监听者时创建 `echo_mode` 内核服务。
   - 接收乱序重排:`tcp_rx_store` 裁剪低于 `rcv_nxt` 的重复字节、丢弃重叠段,把段放入 4 槽队列后从 `rcv_nxt` 起扫描连续段并推进 ACK 序号;`tcp_rx_take` 只从 `rx_delivered` 处取数据,支持部分读取(缩小/搬移剩余段)。`recvfrom` 因此按序返回,槽位满时丢段并回当前 ACK(对端重传)。
-  - 自检:`tcp_reorder_selftest` 在 `net_init` 里用同一 socket 队列压入 3 个乱序段并部分读取,校验拼接结果,串口输出 `TCP-REORDER-OK`。
+  - 选项:SYN 携带 MSS(480)、SACK-permitted(4)、时间戳(8,TSval=pit ticks×10ms,TSecr=最近对端值)与窗口缩放(3,shift=4);其他段携带时间戳,SACK-permitted 的对端还能收到 SACK 块(kind 5,最多 2 块,来自 `rxq` 中 `seq >= rcv_nxt` 的乱序段)。`tcp_parse_opts` 解析 kind 3/4/8,`tcp_process_sack` 把落在 SACK 块内的发送队列条目标记 `sacked`。
+  - SACK 重传:快速重传与 RTO 都通过 `tcp_first_unsacked` 选择第一个未被 SACK 覆盖的段,避免重传对端已收到的数据;ACK 退休后条目直接丢弃。
+  - 自检:`tcp_reorder_selftest` 在 `net_init` 里用同一 socket 队列压入 3 个乱序段并部分读取,校验拼接结果,串口输出 `TCP-REORDER-OK`;`tcp_sack_selftest` 手工构造 3 段发送队列 + 1 个 SACK 块,校验记分与首个空洞选择(`TCP-SACK-OK`);`tcp_ts_selftest` 喂入带 MSS/SACK/TS/WS 的 SYN,校验子连接记录 `ts_recent`/`sack_ok`(`TCP-TS-OK`)。
 - `getsockname(367)/getpeername(368)`:直接返回 socket 表里的真实 `(ip,port)`(本地侧经 `local_ip_for`,回环时为 127.0.0.1;未 connect 的 `getpeername` 返回 `-ENOTCONN`),socketcall 6/7 也走同一实现。
 - 用户侧 `hello.c net` / `tcp`:net 构造 ICMP echo(校验和按大端写入)发往 10.0.2.2,`recvfrom` 校验 type=0/id/seq;再用 UDP 向 10.0.2.3:53 发 DNS A 查询,校验事务号与 QR 位。tcp 依次验证:两条并发连接连到 127.0.0.1:7 的内核回显(交错收发)、`getpeername=127.0.0.1:7` 与 `getsockname` 的真实本地端口、以及 `bind(9000)/listen/connect/accept` 自连接(在 accepted socket 与 client socket 之间双向收发),最后打印 `ACCEPT-OK`/`TCP-OK`。
 
@@ -354,6 +356,7 @@ USER_SIGTRAMP = 0x08847000
 | `e_mmio / e_rx_ring / e_tx_ring` | net.c | E1000 MMIO 虚拟基址与 RX(16)/TX(8) 描述符环 |
 | `e_rx_buf / e_tx_buf` | net.c | E1000 每描述符 2KB 收发缓冲(DMA 物理地址) |
 | `socks[] / arp_cache[]` | net.c | 8 个 socket 槽与 4 项 ARP 缓存 |
+| `shared_maps[]` | syscall.c | 最多 4 个 `MAP_SHARED` 文件映射的回写登记 |
 | `info / fb / active` | fb.c | VBE 模式信息、恒等映射后的显存指针与启用状态 |
 | `cells[] / pending` | vga.c | 80×25 影子文本网格与"等待帧缓冲"标志 |
 
@@ -368,9 +371,9 @@ USER_SIGTRAMP = 0x08847000
 
 1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;用户页按需分配并可换出到 MuFS 盘尾部(单页与 600 页压力自检已过,但无文件页缓存、无 swapon 控制与换出优先级)
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
-3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc `.so` 验证(真实 musl loader + libc.so + 动态 BusyBox 已由 `tools/test_realso.py` 端到端跑通),遇到未知重定位会明确报错;`MAP_SHARED` 不写回;FAT32/ext2 已以 `/fat`、`/ext2` 接入 VFS(读写、文件与目录的删除/重命名/建目录,整文件回写且单文件 64KB 上限),ext2 尚无多级间接
-4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents/unlink/rename/mkdir/rmdir`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),文件与目录均可改名;ext2 支持创建/覆盖/删除文件与目录(位图分配、目录项插入与合并、单级间接),但无多级间接;FAT32 只识别第一个卷;网络为 RTL8139 或 Intel E1000(先试 RTL 再回退)+ ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列/WS 缩放/3 次重复 ACK 快速重传/阻塞 accept;尚无 SACK 与时间戳选项);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
-5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
+3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc `.so` 验证(真实 musl loader + libc.so + 动态 BusyBox 已由 `tools/test_realso.py` 端到端跑通),遇到未知重定位会明确报错;`MAP_SHARED` 已在 msync/munmap/exit 写回(`PROT_NONE` 按只读近似);FAT32/ext2 已以 `/fat`、`/ext2` 接入 VFS(读写、文件与目录的删除/重命名/建目录,整文件回写且单文件 64KB 上限),ext2 尚无多级间接
+4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents/unlink/rename/mkdir/rmdir`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),文件与目录均可改名;ext2 支持创建/覆盖/删除文件与目录(位图分配、目录项插入与合并、单级间接),但无多级间接;FAT32 只识别第一个卷;网络为 RTL8139 或 Intel E1000(先试 RTL 再回退)+ ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列/WS 缩放/3 次重复 ACK 快速重传/SACK 记分板/时间戳选项/阻塞 accept;尚无窗口探测与更精细的拥塞控制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
+5. 内核堆可增长但不可重入(IRQ 上下文需手工加锁),增到 16MB 后不再扩展
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标在文本桌面按 8×16 单元粗粒度移动,在 `pixel` 中映射到像素坐标;无滚轮/右键菜单/双击标题栏最大化
 8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 是合成器窗口管理器(每窗口后备缓冲 + 拖动/关闭/聚焦 + 滚动条 + 按钮/输入框/列表/下拉菜单 + 8 级裁剪栈),但尚无更多字体尺寸与工具栏控件

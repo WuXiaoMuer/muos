@@ -426,6 +426,11 @@ uint32_t mm_create_user_pd(uint32_t tramp_phys) {
     return (uint32_t)pd;
 }
 
+/* Software-only PTE bit (bit 9 is available on non-PAE i386): set by
+ * mprotect(PROT_READ/PROT_NONE) so a later write fault is a real violation
+ * instead of being mistaken for a COW fault. */
+#define PTE_RO_PROT 0x200u
+
 /* A non-present user PTE carrying a swap slot: bit1 marks it, bits 12+
  * hold the slot index. Bit1 is also PTE_WRITABLE, so the present bit must
  * be clear first. */
@@ -472,6 +477,7 @@ bool_t mm_user_fault(uint32_t pd_phys, uint32_t va, bool_t write) {
         return true;
     }
     if (!write || (*pte & PTE_WRITABLE)) return true;
+    if (*pte & PTE_RO_PROT) return false;      /* mprotect made it read-only */
     return mm_user_make_writable(pd_phys, va);
 }
 
@@ -590,6 +596,7 @@ uint32_t mm_user_translate(uint32_t pd_phys, uint32_t va) {
 bool_t mm_user_make_writable(uint32_t pd_phys, uint32_t va) {
     uint32_t* pte = user_pte(pd_phys, va);
     if (!pte || !(*pte & PTE_PRESENT)) return false;
+    if (*pte & PTE_RO_PROT) return false;      /* mprotect read-only */
     if (*pte & PTE_WRITABLE) return true;
 
     uint32_t old = *pte & PAGE_MASK;
@@ -605,6 +612,65 @@ bool_t mm_user_make_writable(uint32_t pd_phys, uint32_t va) {
     }
     if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
     return true;
+}
+
+bool_t mm_user_protect(uint32_t pd_phys, uint32_t va, uint32_t len,
+                       bool_t writable) {
+    if (!pd_phys || len == 0) return true;
+    if (va < USER_BASE || va >= USER_SIGTRAMP) return false;
+
+    uint32_t end = va + len;
+    if (end < va || end > USER_SIGTRAMP) end = USER_SIGTRAMP;
+
+    /* Pages that are not mapped yet keep their demand-paged default; only
+     * present pages (or swapped-out ones we can bring back) are adjusted. */
+    for (uint32_t a = va & PAGE_MASK; a < end; a += PAGE_SIZE) {
+        uint32_t* pte = user_pte(pd_phys, a);
+        if (!pte) continue;
+        if (PTE_IS_SWAP(*pte)) {
+            if (!mm_user_fault(pd_phys, a, false)) return false;
+            pte = user_pte(pd_phys, a);
+            if (!pte) continue;
+        }
+        if (!(*pte & PTE_PRESENT)) continue;
+
+        if (writable) {
+            *pte &= ~PTE_RO_PROT;
+            if (!mm_user_make_writable(pd_phys, a)) return false;
+        } else {
+            *pte &= ~PTE_WRITABLE;
+            *pte |= PTE_RO_PROT;
+        }
+    }
+    if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
+    return true;
+}
+
+/* Unmap a user range: drop frame references (or swap slots) and clear the
+ * PTEs. Returns the number of pages that were mapped there. */
+uint32_t mm_user_unmap(uint32_t pd_phys, uint32_t va, uint32_t len) {
+    if (!pd_phys || len == 0) return 0;
+    if (va < USER_BASE || va >= USER_SIGTRAMP) return 0;
+
+    uint32_t end = va + len;
+    if (end < va || end > USER_SIGTRAMP) end = USER_SIGTRAMP;
+
+    uint32_t n = 0;
+    for (uint32_t a = va & PAGE_MASK; a < end; a += PAGE_SIZE) {
+        uint32_t* pte = user_pte(pd_phys, a);
+        if (!pte) continue;
+        if (!(*pte & PTE_PRESENT) && (*pte & PTE_SWAP)) {
+            swap_free_slot(*pte >> PAGE_SHIFT);
+            *pte = 0;
+            n++;
+        } else if (*pte & PTE_PRESENT) {
+            page_unref((*pte & PAGE_MASK) >> PAGE_SHIFT);
+            *pte = 0;
+            n++;
+        }
+    }
+    if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
+    return n;
 }
 
 void mm_user_write_protect(uint32_t pd_phys) {

@@ -14,14 +14,14 @@
 
 - 版本 **v1.3**:Shell 帮助改为分组命令表(35 条命令 + 3 个别名,`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示);启动/`logo` 界面为带边框、竖向渐变与右下投影的立体 MuOS 字标;桌面命令统一为 `desktop`(`gui` 别名);ext2 增加创建/覆盖写入;新增 `run.bat` 模式化启动与 `release.bat`/`release.ps1`(构建 → 冒烟 → `release/muos-<ver>` 与 zip)。
 
-- 内核自检 **88/0**;`tools/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
+- 内核自检 **90/0**;`tools/verify_release.py` 的 kernel 与 ISO 两条路径均 PASS。
 - `src/syscall.c` 已定义 **120+ 个 Linux i386 系统调用号**,覆盖进程/stdio、信号、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。
 - 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
 - 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run tls`(静态 TLS:initial-exec + global-dynamic)、`run net`(RTL8139/E1000 + ICMP/UDP socket ABI;`tools/test_e1000.py` 用 `model=e1000` 复测)、`run tcp`(双连接回显 + 真实 getsockname/getpeername + listen/accept 自连接)、`part/fatls/fatcat/fatwrite/ext2ls/ext2cat/ext2write`(MBR/GPT FAT32 与 ext2 读写)、`run vfs`(/fat、/ext2 挂载的 open/read/write/stat/getdents64,`tools/test_fs_read.py`)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。ISO 路径额外用 QMP `screendump` 验证 VBE 文本渲染。
 - 进程模型:每进程页目录 + **按需分页用户窗口**(首次访问分配零页,无预分配物理块)、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持),并已用真实 musl loader + libc.so 端到端验证动态 BusyBox;真实 glibc 尚未验证;网络支持 RTL8139 与 Intel E1000(先试 RTL,再试 8086:100E;E1000 为 MMIO BAR0 + 16/8 项描述符环)+ ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列、对端窗口与 WS 缩放、3 次重复 ACK 快速重传、阻塞 accept;尚无 SACK/时间戳选项);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir/rmdir,文件与目录可改名,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB;ext2 支持创建/覆盖/删除文件与目录(位图分配、目录项插入与合并、单级间接),但无多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(有单页与 600 页压力自检,但无 swapon 控制、无换出优先级,也未在真实低空闲内存下压测调度换出);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持),并已用真实 musl loader + libc.so 端到端验证动态 BusyBox;真实 glibc 尚未验证;网络支持 RTL8139 与 Intel E1000(先试 RTL,再试 8086:100E;E1000 为 MMIO BAR0 + 16/8 项描述符环)+ ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列、对端窗口与 WS 缩放、3 次重复 ACK 快速重传、SACK 记分板(重传跳过已收段)与时间戳选项(TSval/TSecr)、阻塞 accept;尚无窗口探测与拥塞控制的精细算法);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents/unlink/rename/mkdir/rmdir,文件与目录可改名,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB;ext2 支持创建/覆盖/删除文件与目录(位图分配、目录项插入与合并、单级间接),但无多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;页面可换出到 MuFS 盘尾部(有单页与 600 页压力自检,但无 swapon 控制、无换出优先级,也未在真实低空闲内存下压测调度换出);UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
 
 ## 后续计划(建议顺序)
 
@@ -59,7 +59,7 @@
 - [x] MuFS 元数据写前日志:提交前把 meta/dir 副本写到扇区 10–15 并置扇区 9 头魔数,真实表写完后清除;挂载时发现有效头即重放。槽位引用计数归零后回收(空间回收已随 unlink 生效)
 - [x] FAT32/ext2 接入 VFS:`/fat`、`/ext2` 挂载,路径解析落到卷内文件;用户态 `open/read/write/stat/lseek/getdents64/unlink/rename/mkdir/rmdir` 直接读写分区文件(open 支持 `O_CREAT/O_TRUNC`,写为整文件回写,单文件 64KB 上限),`rename` 保留数据簇、`unlink` 回收簇链/inode 并清理 LFN 项,目录删除前校验仅剩 `.`/`..` 并回收目录簇/inode,目录改名会同步修正 `..` 与链接数;`ls /fat`、`cat /fat/<file>` 与 `run vfs` 实测通过
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/listen(363)/accept4(364)/sendto(369)/recvfrom(371)/shutdown(373)/getsockname(367)/getpeername(368)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽
-- [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;8 段发送队列 + 队列头 RTO 指数退避(最多 5 次)、ACK 逐段退休、慢开始/拥塞避免窗口;接收端 4 段乱序队列(按 `rcv_nxt` 连续推进)、对端窗口跟踪与 **WS 窗口缩放协商**(SYN/SYN-ACK 带 shift=4,按对端 shift 放大 `snd_wnd`);**快速重传**:连续 3 个重复 ACK 立即重传队头、`ssthresh=cwnd/2`、`cwnd=ssthresh+3*MSS` 进入快速恢复,完整 ACK 后退出并回落到 `ssthresh`;`accept` 在无待完成连接时阻塞(由握手完成事件唤醒,`run baccept` 实测);启动自检 `TCP-REORDER-OK`/`TCP-WSCALE-OK`/`TCP-FASTRETX-OK`;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)
+- [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;8 段发送队列 + 队列头 RTO 指数退避(最多 5 次)、ACK 逐段退休、慢开始/拥塞避免窗口;接收端 4 段乱序队列(按 `rcv_nxt` 连续推进)、对端窗口跟踪与 **WS 窗口缩放协商**(SYN/SYN-ACK 带 shift=4,按对端 shift 放大 `snd_wnd`);**快速重传**:连续 3 个重复 ACK 立即重传队头、`ssthresh=cwnd/2`、`cwnd=ssthresh+3*MSS` 进入快速恢复,完整 ACK 后退出并回落到 `ssthresh`;`accept` 在无待完成连接时阻塞(由握手完成事件唤醒,`run baccept` 实测);启动自检 `TCP-REORDER-OK`/`TCP-WSCALE-OK`/`TCP-FASTRETX-OK`;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`);**SACK/时间戳**:SYN 协商 MSS/SACK-permitted/TS/WS,ACK 携带 SACK 块(最多 2 段),发送队列按 `sacked` 标记,快速重传与 RTO 跳过已收段;时间戳回显 `TSecr`;自检 `TCP-SACK-OK`/`TCP-TS-OK`
 - [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
 - [x] 像素窗口管理器(`pixel`,ISO/VBE):4 个窗口(Terminal/System/Editor/Widgets),每窗口 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`);鼠标拖动标题栏/关闭/聚焦置顶,文本窗口可拖动滚动条,Widgets 提供按钮(Say Hello/Clear Log)、单行输入框(回车发送到 Terminal)、可点击选择/滚动的列表控件与 Menu 下拉菜单(2 倍字号标题);绘制使用 8 级裁剪栈(列表视口、菜单弹层、任务栏文本均受限);键盘输入到焦点窗口,任务栏与 8×16 文字(8×8 字模纵向 2 倍);ESC 返回文本 shell;`tools/test_wm.py` 用 QMP 相对鼠标点击列表行并校验高亮像素,再打开菜单并选择菜单项校验弹层像素
 - [ ] 更多字体尺寸、其他网卡
@@ -71,7 +71,7 @@
 - [x] 内核堆 kmalloc/kfree/kcalloc
 - [x] 调度器死代码清理,task_t 入堆;IDT 256 项全覆盖(0x80 现为系统调用门)
 - [x] 公共字符串库(标准名,防 freestanding 隐式调用链接失败)
-- [x] 键盘/中断 EFLAGS 纪律;自检套件扩到 46 项(含 >4MB 分页、堆、mmap;当前 88 项)
+- [x] 键盘/中断 EFLAGS 纪律;自检套件扩到 46 项(含 >4MB 分页、堆、mmap;当前 90 项)
 - [x] ISO 启动路径修复(入口=镜像首字节);构建脚本零硬编码路径
 
 ## 阶段 1:内核与用户态隔离(基本完成)
@@ -123,9 +123,9 @@
 - [x] 真实静态 i386 BusyBox 1.36.1 进入 Ring3 并运行 `echo`(i386 TLS、exit_group、uid32、ioctl、dup2、envp/auxv 栈)
 - [x] BusyBox `ls/cat` 需求集:根目录 fd + `getdents(141)/getdents64(220)`、`stat/lstat/fstat(64)`、`statx(383)`、`access(33)`、`getcwd(183)`、`writev/readv(145/146)`、`rt_sigaction(174)`、`fcntl(64)`、`llseek(140)`、`sendfile(64)`、可关闭的 stdio fd
 - [x] 扁平 VFS 文件变更:`unlink(10)`、`rename(38)`、`fs_rename`;`utimes/futimesat/utimensat` 校验路径后成功(时间戳不持久化)
-- [x] 元数据/截断/同步:`chmod(15)/fchmod(94)`、`chown(16)/lchown(182)/chown32(212)/lchown32(198)`、`fchown(95/207)/fchownat(298)`、`readlink(85)`、`truncate(92/193)/ftruncate(93/194)`(增长零填充、缩小改 size)、`fsync(118)/fdatasync(144)/sync(36)`;`getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340)`,`ulimit -n` 实测返回 11
+- [x] 元数据/截断/同步:`chmod(15)/fchmod(94)`、`chown(16)/lchown(182)/chown32(212)/lchown32(198)`、`fchown(95/207)/fchownat(298)`、`readlink(85)`、`truncate(92/193)/ftruncate(93/194)`(增长零填充、缩小改 size)、`fsync(118)/fdatasync(148)/sync(36)`;`getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340)`,`ulimit -n` 实测返回 11
 - [x] 睡眠/统计:`nanosleep(162)`(`sti; hlt` 等 PIT tick)、`times(43)`、`getrusage(77)`;BusyBox `sleep 0.1` 与 `chown 0 /notes.txt` 实测通过
-- [x] 文件 mmap:RAM FS 槽位与 `/proc` 快照按页拷入沙箱并零填充,`old_mmap` 字节偏移、`mmap2` 页偏移,`MAP_FIXED` 在沙箱内允许;映射是副本,`MAP_SHARED` 写回待做
+- [x] 文件 mmap:RAM FS 槽位与 `/proc` 快照按页拷入沙箱并零填充,`old_mmap` 字节偏移、`mmap2` 页偏移,`MAP_FIXED` 在沙箱内允许;`MAP_SHARED` 在 `msync(144)`、`munmap`、进程退出时回写文件
 - [x] 验收:`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a` 与 20+ applet(含 `ls -l`、`wc`、`grep`、`sed`、`od`、`cp/rm/mv/touch`)全部通过;`ENOENT`/`ENOTDIR`/`EBADF` 路径也符合 Linux 行为
 - [x] 设备与虚拟文件:`/dev/null` `/dev/zero` `/dev/console` 内核态字符设备;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/etc/mtab` 只读快照
 - [x] `statfs/fstatfs(99/100)`、`statfs64/fstatfs64(268/269)`、`sysinfo(116)`;统一 0..10 fd 表后 `dup/dup2` 支持 stdio 重定向,`free/df/dd/stat -f` 实测通过
@@ -161,12 +161,12 @@
 ## 附:近期工程债(不阻塞主线)
 
 - [ ] fs 截断告警(fs_write 返回实际写入量,调用方检查)
-- [ ] 内核堆 Grow(耗尽时向 vmm 要新页)
+- [x] 内核堆 Grow:1MB 起步,耗尽时按 256KB 追加映射新页(独立虚拟窗口,跳过 RAM 别名/MMIO),16MB 上限;大块分配自检通过
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
 - [x] 网卡(RTL8139 + Intel E1000)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] 更多网卡型号、IRQ 驱动方式;MuFS 仍是整槽布局,无块分配位图/碎片整理
 - [x] 符号版本化:解析 `DT_VERSYM/DT_VERDEF/DT_VERNEED`,按版本名筛选提供者并处理隐藏版本位;未版本化 `.so` 仍兼容
 - [ ] 动态链接器兼容真实 libc 产物(仍未用真实 glibc/musl `.so` 端到端验证;`.gnu.hash`/TLS/`R_386_COPY`/`IRELATIVE` 已支持)
-- [ ] `MAP_SHARED` 写回文件;`munmap/mprotect` 仍是空操作
+- [x] `MAP_SHARED` 写回文件;`munmap` 释放页帧/交换槽;`mprotect` 改已映射页写权限(只读页写入按违规故障处理)
 - [x] 安全基础:SMEP(CPUID leaf7 EBX bit7 时置 CR4 bit20);弱 ASLR(栈顶 0..7 页、`AT_RANDOM` 使库基址偏移 0..31 页)
 - [x] uid/gid 与文件权限:MuFS 元数据保存 owner/mode(v2),`getuid/getgid/setuid/setgid` 生效,open/access 按 rwx 检查(目录需 x),chmod/chown 落盘;`run perm` 实测非 root 读 0600 被拒、读 0644 成功
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)

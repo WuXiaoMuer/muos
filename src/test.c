@@ -203,7 +203,19 @@ static void test_heap(void) {
     CHECK(e != NULL, "heap usable after double-free attempt");
     kfree(e);
 
-    CHECK(kmalloc(2u * 1024 * 1024) == NULL, "oversized kmalloc returns NULL");
+    /* Grow-on-demand: a request larger than the initial 1MB capacity must
+     * extend the heap, and anything beyond the 16MB ceiling fails. */
+    uint8_t* big = (uint8_t*)kmalloc(1024u * 1024u + 64u);
+    CHECK(big != NULL, "heap grows for a 1MB+ allocation");
+    if (big) {
+        big[0] = 0x5A;
+        big[1024u * 1024u + 63u] = 0xA5;
+        CHECK(big[0] == 0x5A && big[1024u * 1024u + 63u] == 0xA5,
+              "grown heap memory is usable");
+        kfree(big);
+    }
+    CHECK(kmalloc(KHEAP_MAX_BYTES) == NULL,
+          "kmalloc beyond heap ceiling returns NULL");
 }
 
 /* ---------- Paging beyond 4MB ---------- */

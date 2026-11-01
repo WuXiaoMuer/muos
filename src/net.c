@@ -140,6 +140,9 @@ typedef struct {
     uint32_t snd_wnd;       /* peer-advertised receive window (scaled) */
     uint8_t  snd_shift;     /* WS shift requested by the peer */
     uint8_t  rcv_shift;     /* our WS shift advertised in SYN/SYN-ACK */
+    bool_t   sack_ok;       /* peer permits SACK options */
+    bool_t   ts_ok;         /* timestamps negotiated for this connection */
+    uint32_t ts_recent;     /* last TSval seen from the peer (echoed) */
 
     /* TCP receive queue: out-of-order segments wait here until the gap
      * fills; rx_delivered is the sequence number next handed to recvfrom. */
@@ -153,10 +156,12 @@ typedef struct {
     uint32_t rx_delivered;
 
     /* Small send queue: segments that carry sequence space stay here until
-     * acknowledged; the head is retransmitted on RTO with backoff. */
+     * acknowledged. SACK marks entries the peer already holds, so RTO and
+     * fast-retransmit skip them. */
     #define TXQ_MAX 8
     struct {
         bool_t   used;
+        bool_t   sacked;
         uint32_t seq, end;
         uint8_t  flags;
         uint16_t len;
@@ -813,9 +818,59 @@ static uint16_t tcp_cksum(uint32_t src, uint32_t dst,
     return net_cksum(seg, len, sum);
 }
 
-/* Build and transmit one TCP segment without touching retransmission state.
- * SYN segments carry a window-scale option (shift = rcv_shift); data and
- * ACK segments use the 20-byte header. */
+/* Monotonic millisecond clock for the timestamp option (100Hz PIT). */
+static uint32_t tcp_tsval(void) {
+    return pit_get_ticks() * 10u;
+}
+
+/* Append TCP options to `o` (max 40 bytes). SYN offers MSS, SACK-permitted,
+ * a timestamp and window scale; other segments carry a timestamp and, when
+ * the peer allows it, SACK blocks for out-of-order data. */
+static uint32_t tcp_build_opts(net_sock_t* s, uint8_t* o, bool_t syn,
+                               bool_t want_sack) {
+    uint32_t n = 0;
+    if (syn) {
+        o[n++] = 2; o[n++] = 4;
+        put16be(o + n, TCP_MSS); n += 2;        /* MSS */
+        o[n++] = 4; o[n++] = 2;                 /* SACK permitted */
+        if (s->ts_ok) {
+            o[n++] = 1; o[n++] = 1;             /* NOPs align the TS option */
+            o[n++] = 8; o[n++] = 10;
+            put32be(o + n, tcp_tsval()); n += 4;
+            put32be(o + n, s->ts_recent); n += 4;
+        }
+        o[n++] = 3; o[n++] = 3;
+        o[n++] = (uint8_t)(s->rcv_shift & 0x0F);
+        o[n++] = 0;                             /* end of options */
+    } else {
+        if (s->ts_ok) {
+            o[n++] = 8; o[n++] = 10;
+            put32be(o + n, tcp_tsval()); n += 4;
+            put32be(o + n, s->ts_recent); n += 4;
+        }
+        if (want_sack && s->sack_ok) {
+            o[n++] = 5;                         /* SACK, length patched below */
+            uint32_t lp = n++;
+            int blocks = 0;
+            for (int i = 0; i < TCP_RXQ_MAX && blocks < 2; i++) {
+                if (!s->rxq[i].used || !s->rxq[i].len) continue;
+                if ((int32_t)(s->rxq[i].seq - s->rcv_nxt) < 0) continue;
+                put32be(o + n, s->rxq[i].seq); n += 4;
+                put32be(o + n, s->rxq[i].seq + s->rxq[i].len); n += 4;
+                blocks++;
+            }
+            if (blocks) {
+                o[lp] = (uint8_t)(2 + 8 * blocks);
+            } else {
+                n -= 2;                         /* nothing to report: omit */
+            }
+        }
+    }
+    while ((n & 3u) && n < 40) o[n++] = 1;      /* pad to a word boundary */
+    return n;
+}
+
+/* Build and transmit one TCP segment without touching retransmission state. */
 static void tcp_emit(net_sock_t* s, uint32_t seq, uint32_t ack,
                      uint8_t flags, const uint8_t* data, uint32_t len) {
     if (len > 512) len = 512;
@@ -824,21 +879,18 @@ static void tcp_emit(net_sock_t* s, uint32_t seq, uint32_t ack,
     put16be(t + 2, s->rport);
     put32be(t + 4, seq);
     put32be(t + 8, ack);
-    uint32_t hdr = 20;
-    if (flags & TCP_F_SYN) {
-        t[12] = 0x60;                   /* data offset 6 words (24 bytes) */
-        t[20] = 3;                      /* kind: window scale */
-        t[21] = 3;                      /* length */
-        t[22] = (uint8_t)(s->rcv_shift & 0x0F);
-        t[23] = 0;                      /* NOP padding */
-        hdr = 24;
-    } else {
-        t[12] = 0x50;                   /* data offset 5 words */
-    }
+
+    uint8_t opts[40];
+    uint32_t optlen = tcp_build_opts(s, opts,
+                                     (flags & TCP_F_SYN) != 0,
+                                     (flags & TCP_F_ACK) != 0);
+    uint32_t hdr = 20 + optlen;
+    t[12] = (uint8_t)(((hdr / 4) & 0x0F) << 4);
     t[13] = flags;
     put16be(t + 14, (uint16_t)(2048u >> s->rcv_shift));  /* advertised window */
     put16be(t + 16, 0);
     put16be(t + 18, 0);
+    if (optlen) memcpy(t + 20, opts, optlen);
     if (len) memcpy(t + hdr, data, len);
     put16be(t + 16, tcp_cksum(local_ip_for(s->rip), s->rip, t, hdr + len));
     net_send_ip_raw(6, s->rip, t, hdr + len);
@@ -853,6 +905,7 @@ static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
     if (s->q_count >= TXQ_MAX) return;          /* queue full: drop new */
     int idx = (s->q_head + s->q_count) % TXQ_MAX;
     s->txq[idx].used = true;
+    s->txq[idx].sacked = false;
     s->txq[idx].seq = seq;
     s->txq[idx].end = seq + len +
                       ((flags & TCP_F_SYN) ? 1u : 0u) +
@@ -868,10 +921,20 @@ static void tcp_send_seg(net_sock_t* s, uint32_t seq, uint32_t ack,
     s->q_count++;
 }
 
+/* First queue entry the peer has not reported as received (SACK-aware).
+ * Falls back to the head when every entry is sacked. */
+static int tcp_first_unsacked(net_sock_t* s) {
+    for (int k = 0; k < s->q_count; k++) {
+        int idx = (s->q_head + k) % TXQ_MAX;
+        if (!s->txq[idx].sacked) return idx;
+    }
+    return s->q_head;
+}
+
 /* ACK processing: advance snd_una, retire acknowledged queue entries and
  * grow the congestion window (slow start / congestion avoidance). Three
- * duplicate ACKs retransmit the queue head immediately (fast retransmit)
- * and enter fast recovery instead of waiting for the RTO. */
+ * duplicate ACKs retransmit the first unsacked segment immediately (fast
+ * retransmit) and enter fast recovery instead of waiting for the RTO. */
 static void tcp_ack(net_sock_t* s, uint32_t ack) {
     if ((int32_t)(ack - s->snd_una) < 0) return;
 
@@ -884,7 +947,7 @@ static void tcp_ack(net_sock_t* s, uint32_t ack) {
                                                     : TCP_MSS * 2;
                 s->cwnd = s->ssthresh + TCP_MSS * 3;
                 if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
-                int h = s->q_head;
+                int h = tcp_first_unsacked(s);
                 uint32_t a = (s->txq[h].flags & TCP_F_SYN) ? 0 : s->rcv_nxt;
                 s->q_retries = 0;
                 s->rto = TCP_RTO_MIN;
@@ -928,8 +991,8 @@ static void tcp_ack(net_sock_t* s, uint32_t ack) {
     if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
 }
 
-/* RTO timer: retransmit the queue head with exponential backoff; collapse
- * the congestion window on every timeout. */
+/* RTO timer: retransmit the first unsacked queue entry with exponential
+ * backoff; collapse the congestion window on every timeout. */
 static void tcp_timers(void) {
     uint32_t now = pit_get_ticks();
     int n = NET_FD_MAX - NET_FD_BASE;
@@ -951,7 +1014,7 @@ static void tcp_timers(void) {
         s->fast_recover = false;
         s->rto = s->rto < TCP_RTO_MAX / 2 ? s->rto * 2 : TCP_RTO_MAX;
 
-        int h = s->q_head;
+        int h = tcp_first_unsacked(s);
         uint32_t ack = (s->txq[h].flags & TCP_F_SYN) ? 0 : s->rcv_nxt;
         s->q_deadline = now + s->rto;
         tcp_emit(s, s->txq[h].seq, ack, s->txq[h].flags,
@@ -1100,9 +1163,17 @@ static bool_t tcp_reorder_selftest(void) {
     return true;
 }
 
-/* Parse a TCP window-scale option (kind 3, length 3). Returns the shift or
- * 0xFF when the option is absent/malformed. */
-static uint8_t tcp_parse_ws(const uint8_t* opt, uint32_t n) {
+/* Parsed TCP options that matter to this stack. */
+typedef struct {
+    uint8_t ws;             /* window-scale shift, 0xFF when absent */
+    bool_t  sack_ok;        /* 4: SACK permitted */
+    bool_t  has_ts;         /* 8: timestamp present */
+    uint32_t tsval;         /* peer's TSval */
+} tcp_opts_t;
+
+static void tcp_parse_opts(const uint8_t* opt, uint32_t n, tcp_opts_t* out) {
+    memset(out, 0, sizeof(*out));
+    out->ws = 0xFF;
     for (uint32_t i = 0; i < n; ) {
         uint8_t kind = opt[i];
         if (kind == 0) break;               /* end of options */
@@ -1110,10 +1181,44 @@ static uint8_t tcp_parse_ws(const uint8_t* opt, uint32_t n) {
         if (i + 1 >= n) break;
         uint8_t olen = opt[i + 1];
         if (olen < 2 || i + olen > n) break;
-        if (kind == 3 && olen == 3) return (uint8_t)(opt[i + 2] & 0x0F);
+        if (kind == 3 && olen == 3) {
+            out->ws = (uint8_t)(opt[i + 2] & 0x0F);
+        } else if (kind == 4 && olen == 2) {
+            out->sack_ok = true;
+        } else if (kind == 8 && olen == 10) {
+            out->has_ts = true;
+            out->tsval = be32(opt + i + 2);
+        }
         i += olen;
     }
-    return 0xFF;
+}
+
+/* Mark queued segments covered by the peer's SACK blocks (kind 5). Each
+ * block is a received range [left, right); entries fully inside it are
+ * already in the peer's hands and are skipped on retransmit. */
+static void tcp_process_sack(net_sock_t* s, const uint8_t* opt, uint32_t n) {
+    for (uint32_t i = 0; i < n; ) {
+        uint8_t kind = opt[i];
+        if (kind == 0) break;
+        if (kind == 1) { i++; continue; }
+        if (i + 1 >= n) break;
+        uint8_t olen = opt[i + 1];
+        if (olen < 2 || i + olen > n) break;
+        if (kind == 5) {
+            for (uint32_t b = i + 2; b + 8 <= i + olen; b += 8) {
+                uint32_t left = be32(opt + b);
+                uint32_t right = be32(opt + b + 4);
+                if ((int32_t)(right - left) <= 0) continue;
+                for (int k = 0; k < s->q_count; k++) {
+                    int idx = (s->q_head + k) % TXQ_MAX;
+                    int32_t ds = (int32_t)(s->txq[idx].seq - left);
+                    int32_t de = (int32_t)(s->txq[idx].end - right);
+                    if (ds >= 0 && de <= 0) s->txq[idx].sacked = true;
+                }
+            }
+        }
+        i += olen;
+    }
 }
 
 static void tcp_input(uint32_t src, uint32_t dst,
@@ -1129,7 +1234,10 @@ static void tcp_input(uint32_t src, uint32_t dst,
     uint8_t flags = seg[13];
     const uint8_t* data = seg + off;
     uint32_t dlen = len - off;
-    uint8_t peer_shift = (off > 20) ? tcp_parse_ws(seg + 20, off - 20) : 0xFF;
+    tcp_opts_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.ws = 0xFF;
+    if (off > 20) tcp_parse_opts(seg + 20, off - 20, &opt);
 
     int listener_id = -1;
     net_sock_t* s = tcp_find(src, sport, dport, &listener_id);
@@ -1152,7 +1260,10 @@ static void tcp_input(uint32_t src, uint32_t dst,
             child->cwnd = TCP_MSS;
             child->ssthresh = TCP_CWND_MAX;
             child->rcv_shift = 4;
-            child->snd_shift = (peer_shift != 0xFF) ? peer_shift : 0;
+            child->snd_shift = (opt.ws != 0xFF) ? opt.ws : 0;
+            child->sack_ok = opt.sack_ok;
+            child->ts_ok = opt.has_ts;
+            child->ts_recent = opt.tsval;
             child->tcp_state = TCP_SYN_RCVD;
             /* Consume the SYN sequence number before transmitting: loopback
              * delivers the reply synchronously, so the peer's ACK can arrive
@@ -1178,7 +1289,10 @@ static void tcp_input(uint32_t src, uint32_t dst,
             child->cwnd = TCP_MSS;
             child->ssthresh = TCP_CWND_MAX;
             child->rcv_shift = 4;
-            child->snd_shift = (peer_shift != 0xFF) ? peer_shift : 0;
+            child->snd_shift = (opt.ws != 0xFF) ? opt.ws : 0;
+            child->sack_ok = opt.sack_ok;
+            child->ts_ok = opt.has_ts;
+            child->ts_recent = opt.tsval;
             child->tcp_state = TCP_SYN_RCVD;
             uint32_t cseq = child->snd_nxt;
             child->snd_nxt = cseq + 1;
@@ -1193,10 +1307,19 @@ static void tcp_input(uint32_t src, uint32_t dst,
         return;
     }
 
-    if ((flags & TCP_F_SYN) && peer_shift != 0xFF)
-        s->snd_shift = peer_shift;      /* client learns WS from SYN-ACK */
+    if ((flags & TCP_F_SYN) && opt.ws != 0xFF)
+        s->snd_shift = opt.ws;          /* client learns WS from SYN-ACK */
+    if (flags & TCP_F_SYN) {
+        /* Negotiated options come from the SYN/SYN-ACK only. */
+        s->sack_ok = opt.sack_ok;
+        s->ts_ok = opt.has_ts;
+        s->ts_recent = opt.tsval;
+    } else if (s->ts_ok && opt.has_ts) {
+        s->ts_recent = opt.tsval;
+    }
 
     if (flags & TCP_F_ACK) {
+        if (off > 20) tcp_process_sack(s, seg + 20, off - 20);
         tcp_ack(s, ack);
         uint16_t wnd = be16(seg + 14);
         if (wnd) s->snd_wnd = (uint32_t)wnd << s->snd_shift;
@@ -1281,6 +1404,89 @@ static bool_t tcp_ws_selftest(void) {
         tcp_input(my_ip, my_ip, ackseg, sizeof(ackseg));
         ok = child->tcp_state == TCP_ESTAB && child->snd_wnd == (128u << 4);
     }
+    if (child) child->used = false;
+    l->used = false;
+    return ok;
+}
+
+/* Exercise SACK scoring: queued segments covered by a SACK block are
+ * marked, and retransmission prefers the first hole. */
+static bool_t tcp_sack_selftest(void) {
+    net_sock_t* s = tcp_new_sock();
+    if (!s) return false;
+    s->tcp_state = TCP_ESTAB;
+    s->lport = 9004;
+    s->rport = 9104;
+    s->rip = my_ip;
+    s->snd_una = 2000;
+    s->snd_nxt = 2000;
+    s->rcv_nxt = 6000;
+    s->sack_ok = true;
+
+    /* Build a three-segment queue by hand (no transmission). */
+    for (int i = 0; i < 3; i++) {
+        s->txq[i].used = true;
+        s->txq[i].sacked = false;
+        s->txq[i].seq = 2000 + (uint32_t)i * 100;
+        s->txq[i].end = s->txq[i].seq + 100;
+        s->txq[i].flags = TCP_F_ACK;
+        s->txq[i].len = 100;
+    }
+    s->q_count = 3;
+
+    /* One SACK block covering the second and third segments. */
+    uint8_t opt[18];
+    opt[0] = 5;
+    opt[1] = 18;
+    put32be(opt + 2, 2100);
+    put32be(opt + 6, 2300);
+    tcp_process_sack(s, opt, sizeof(opt));
+
+    bool_t ok = !s->txq[0].sacked && s->txq[1].sacked && s->txq[2].sacked;
+    ok = ok && tcp_first_unsacked(s) == 0;      /* the hole is the head */
+
+    tcp_ack(s, 2100);                           /* fill the hole */
+    ok = ok && s->q_count == 2 && s->q_head == 1;
+    s->used = false;
+    return ok;
+}
+
+/* Exercise option negotiation: a SYN carrying MSS/SACK/TS/WS must make the
+ * child remember timestamps and SACK permission. */
+static bool_t tcp_ts_selftest(void) {
+    net_sock_t* l = tcp_new_sock();
+    if (!l) return false;
+    int lid = (int)(l - socks);
+    l->lport = 9002;
+    l->bound = true;
+    l->tcp_state = TCP_LISTEN;
+
+    uint8_t syn[44];
+    memset(syn, 0, sizeof(syn));
+    put16be(syn + 0, 9102);
+    put16be(syn + 2, 9002);
+    put32be(syn + 4, 8000);
+    syn[12] = 0xB0;                             /* data offset 11 words */
+    syn[13] = TCP_F_SYN;
+    put16be(syn + 14, 64);
+
+    uint32_t n = 20;
+    syn[n++] = 2; syn[n++] = 4; put16be(syn + n, TCP_MSS); n += 2;
+    syn[n++] = 4; syn[n++] = 2;                 /* SACK permitted */
+    syn[n++] = 1; syn[n++] = 1;                 /* NOPs */
+    syn[n++] = 8; syn[n++] = 10;                /* timestamps */
+    put32be(syn + n, 7777); n += 4;
+    put32be(syn + n, 0); n += 4;
+    syn[n++] = 3; syn[n++] = 3; syn[n++] = 4; syn[n++] = 0;
+
+    tcp_input(my_ip, my_ip, syn, sizeof(syn));
+
+    net_sock_t* child = NULL;
+    for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
+        if (socks[i].used && socks[i].parent == lid) { child = &socks[i]; break; }
+    }
+    bool_t ok = child && child->ts_ok && child->ts_recent == 7777 &&
+                child->sack_ok && child->snd_shift == 4;
     if (child) child->used = false;
     l->used = false;
     return ok;
@@ -1696,6 +1902,16 @@ bool_t net_init(void) {
         serial_write("[net] TCP-FASTRETX-OK\n");
     else
         serial_write("[net] TCP-FASTRETX-BAD\n");
+
+    if (tcp_sack_selftest())
+        serial_write("[net] TCP-SACK-OK\n");
+    else
+        serial_write("[net] TCP-SACK-BAD\n");
+
+    if (tcp_ts_selftest())
+        serial_write("[net] TCP-TS-OK\n");
+    else
+        serial_write("[net] TCP-TS-BAD\n");
 
     if (dhcp_run()) {
         serial_write("[net] DHCP configured\n");

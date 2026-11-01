@@ -13,6 +13,9 @@
 
 /* mmap(2) prot/flags and rlimit resources */
 #define MUOS_PROT_READ  0x1
+#define MUOS_PROT_WRITE 0x2
+#define MUOS_PROT_EXEC  0x4
+#define MUOS_MAP_SHARED 0x1
 #define MUOS_MAP_PRIVATE 0x2
 #define MUOS_MAP_FIXED  0x10
 #define MUOS_MAP_ANONYMOUS 0x20
@@ -49,6 +52,8 @@ int  muos_getpid(void);
 int  muos_uname(char* out /* 390 bytes */);
 unsigned muos_mmap(unsigned len);
 int  muos_munmap(unsigned addr, unsigned len);
+int  muos_mprotect(unsigned addr, unsigned len, int prot);
+int  muos_msync(unsigned addr, unsigned len, int flags);
 unsigned muos_mmap_file(int fd, unsigned len, int prot, int flags, unsigned offset);
 int  muos_chmod(const char* path, int mode);
 int  muos_setuid(int uid);

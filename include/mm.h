@@ -99,6 +99,13 @@ uint32_t mm_user_translate(uint32_t pd_phys, uint32_t va);
 /* Make the page containing `va` writable in `pd_phys`, copying it first
  * when it is shared (frame refcount > 1). Returns false when not mapped. */
 bool_t   mm_user_make_writable(uint32_t pd_phys, uint32_t va);
+/* mprotect: adjust writability of the present pages in [va, va+len). A
+ * page marked read-only this way stays protected against user writes. */
+bool_t   mm_user_protect(uint32_t pd_phys, uint32_t va, uint32_t len,
+                         bool_t writable);
+/* munmap: unmap [va, va+len), dropping frame references and swap slots.
+ * Returns the number of pages that were mapped. */
+uint32_t mm_user_unmap(uint32_t pd_phys, uint32_t va, uint32_t len);
 /* Clear the writable bit on every user page (fork marks both sides). */
 void     mm_user_write_protect(uint32_t pd_phys);
 /* Drop one reference from every user page this directory maps. */

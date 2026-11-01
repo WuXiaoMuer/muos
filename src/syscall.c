@@ -134,6 +134,7 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define SYS_uname    122
 #define SYS_modify_ldt 123
 #define SYS_mprotect 125
+#define SYS_msync    144
 #define SYS_rt_sigaction   174
 #define SYS_rt_sigprocmask 175
 #define SYS_getcwd   183
@@ -216,7 +217,7 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define SYS_ftruncate       93
 #define SYS_fchmod          94
 #define SYS_fsync          118
-#define SYS_fdatasync      144
+#define SYS_fdatasync      148      /* i386 fdatasync (144 is msync) */
 #define SYS_ugetrlimit     191
 #define SYS_truncate64     193
 #define SYS_ftruncate64    194
@@ -339,6 +340,9 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define MAP_PRIVATE   0x02
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
+#define PROT_READ     0x1
+#define PROT_WRITE    0x2
+#define PROT_EXEC     0x4
 
 #define UTS_FIELD 65          /* sizeof each utsname field */
 #define UTS_SIZE  390         /* 6 fields */
@@ -3325,9 +3329,14 @@ static uint32_t do_waitid(registers_t* regs, uint32_t idtype, uint32_t id,
     return 0;   /* siginfo is filled by the exiting child */
 }
 
+static void shared_flush_pid(uint32_t pid);
+
 static uint32_t do_execve(registers_t* regs, uint32_t path_ptr, uint32_t argv_ptr) {
     char path[128];
     if (!copy_user_string(path_ptr, path, sizeof(path))) return err(ERR_EFAULT);
+
+    /* A replaced image no longer owns its shared mappings: flush them. */
+    if (proc_current()) shared_flush_pid(proc_current()->pid);
 
     vfs_ent_t e;
     uint32_t rc = vfs_lookup(path, &e);
@@ -3507,6 +3516,61 @@ static uint32_t do_uname(uint32_t ptr) {
     return 0;
 }
 
+/* MAP_SHARED write-back bookkeeping. File-backed mappings are materialized
+ * as private copies in the user window, so a shared mapping reaches the
+ * file only through an explicit flush (msync/munmap/exit). Slots are
+ * fs_ref'd while mapped so an unlinked file survives until we are done. */
+#define MMAP_SHARED_MAX 4
+typedef struct {
+    bool_t   used;
+    uint32_t pid;
+    uint32_t addr;      /* user range start */
+    uint32_t len;       /* rounded length */
+    uint32_t offset;    /* file offset of addr */
+    int      slot;      /* RAM FS slot (ref held) */
+} mmap_shared_t;
+
+static mmap_shared_t shared_maps[MMAP_SHARED_MAX];
+
+static void shared_drop(mmap_shared_t* m) {
+    if (!m->used) return;
+    fs_unref(m->slot);
+    m->used = false;
+}
+
+static void shared_writeback(mmap_shared_t* m) {
+    uint32_t fsize = fs_fd_size(m->slot);
+    if (m->offset >= fsize) return;
+    uint32_t n = fsize - m->offset;
+    if (n > m->len) n = m->len;
+    if (n) fs_write_at(m->slot, m->offset, (const char*)m->addr, n);
+}
+
+/* Flush (and optionally drop) this process's shared mappings overlapping
+ * [addr, addr+len); len == 0 means "all of them". */
+static void shared_flush(uint32_t pid, uint32_t addr, uint32_t len, bool_t drop) {
+    for (int i = 0; i < MMAP_SHARED_MAX; i++) {
+        mmap_shared_t* m = &shared_maps[i];
+        if (!m->used || m->pid != pid) continue;
+        if (len && (addr >= m->addr + m->len || addr + len <= m->addr)) continue;
+        shared_writeback(m);
+        if (drop) shared_drop(m);
+    }
+}
+
+static void shared_flush_pid(uint32_t pid) {
+    shared_flush(pid, 0, 0, true);
+}
+
+/* Processes killed by a fault never reach the exit syscall: reclaim their
+ * entries lazily when the table is next touched. */
+static void shared_purge_dead(void) {
+    for (int i = 0; i < MMAP_SHARED_MAX; i++) {
+        mmap_shared_t* m = &shared_maps[i];
+        if (m->used && !proc_find(m->pid)) shared_drop(m);
+    }
+}
+
 /* The sandbox is pre-mapped, so mappings are simulated inside it: anonymous
  * ones come from the bump arena, file-backed ones copy the file contents in
  * and zero-fill the remainder. MAP_FIXED is allowed inside the sandbox; the
@@ -3519,12 +3583,17 @@ static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
     uint32_t rounded = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1u);
     if (rounded < len || rounded > USER_SIZE) return err(ERR_ENOMEM);
 
+    proc_t* p = proc_current();
+    uint32_t pid = p ? p->pid : 0;
+
     uint32_t at;
     if (flags & MAP_FIXED) {
         if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
         if (addr < USER_BASE || rounded > USER_END - USER_STACK_RESERVE - addr)
             return err(ERR_ENOMEM);
         at = addr;
+        /* Replacing an existing shared mapping flushes its dirty content. */
+        shared_flush(pid, at, rounded, true);
     } else {
         at = user_mmap_anon(len);
         if (!at) return err(ERR_ENOMEM);
@@ -3541,9 +3610,10 @@ static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
 
     const char* data = NULL;
     uint32_t fsize = 0;
+    int slot = -1;
     int kind = user_fd_kind(fd);
     if (kind == USER_FD_FILE) {
-        int slot = user_fd_slot(fd);
+        slot = user_fd_slot(fd);
         if (slot < 0) return err(ERR_EBADF);
         data = fs_fd_data(slot);
         fsize = fs_fd_size(slot);
@@ -3558,6 +3628,22 @@ static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
         uint32_t avail = fsize - offset;
         uint32_t n = avail < rounded ? avail : rounded;
         memcpy((void*)at, data + offset, n);
+    }
+
+    if ((flags & MAP_SHARED) && slot >= 0) {
+        shared_purge_dead();
+        int idx = -1;
+        for (int i = 0; i < MMAP_SHARED_MAX; i++) {
+            if (!shared_maps[i].used) { idx = i; break; }
+        }
+        if (idx >= 0 && fs_ref(slot) == 0) {
+            shared_maps[idx].used = true;
+            shared_maps[idx].pid = pid;
+            shared_maps[idx].addr = at;
+            shared_maps[idx].len = rounded;
+            shared_maps[idx].offset = offset;
+            shared_maps[idx].slot = slot;
+        }
     }
     return at;
 }
@@ -3574,6 +3660,61 @@ static uint32_t do_old_mmap(uint32_t args_ptr) {
     uint32_t a[6];
     memcpy(a, (const void*)args_ptr, sizeof(a));
     return do_mmap(a[0], a[1], a[2], a[3], (int)a[4], a[5]);
+}
+
+/* Unmap a user range: dirty MAP_SHARED pages are flushed to their file
+ * first, then the frames (or swap slots) are released. */
+static uint32_t do_munmap(uint32_t addr, uint32_t len) {
+    if (len == 0) return err(ERR_EINVAL);
+    if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+    if (addr < USER_BASE || addr >= USER_SIGTRAMP) return err(ERR_EINVAL);
+
+    uint32_t end = addr + len;
+    if (end < addr || end > USER_SIGTRAMP) end = USER_SIGTRAMP;
+
+    proc_t* p = proc_current();
+    if (!p || !p->pd_phys) return err(ERR_EINVAL);
+
+    shared_purge_dead();
+    shared_flush(p->pid, addr, end - addr, true);
+    mm_user_unmap(p->pd_phys, addr, end - addr);
+    return 0;
+}
+
+/* mprotect: writability of present pages. PROT_NONE is approximated as
+ * read-only (the sandbox has no not-present protection). */
+static uint32_t do_mprotect(uint32_t addr, uint32_t len, uint32_t prot) {
+    if (!len) return 0;
+    if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+    if (addr < USER_BASE || addr >= USER_SIGTRAMP) return err(ERR_EINVAL);
+    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) return err(ERR_EINVAL);
+
+    uint32_t end = addr + len;
+    if (end < addr || end > USER_SIGTRAMP) end = USER_SIGTRAMP;
+
+    proc_t* p = proc_current();
+    if (!p || !p->pd_phys) return err(ERR_EINVAL);
+
+    bool_t writable = (prot & PROT_WRITE) != 0;
+    if (!mm_user_protect(p->pd_phys, addr, end - addr, writable))
+        return err(ERR_ENOMEM);
+    return 0;
+}
+
+/* msync: write dirty MAP_SHARED pages back. MS_ASYNC/MS_SYNC/MS_INVALIDATE
+ * all flush synchronously here. */
+static uint32_t do_msync(uint32_t addr, uint32_t len, uint32_t flags) {
+    (void)flags;
+    if (!len) return 0;
+    if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+    if (addr < USER_BASE || addr >= USER_END) return err(ERR_EINVAL);
+
+    proc_t* p = proc_current();
+    if (!p) return err(ERR_EINVAL);
+
+    shared_purge_dead();
+    shared_flush(p->pid, addr, len, false);
+    return 0;
 }
 
 /* Linux i386 user_desc (16 bytes): entry_number, base, limit, flags.
@@ -3641,6 +3782,7 @@ void syscall_handler(registers_t* regs) {
         case SYS_exit:
         case SYS_exit_group:
             user_set_active(false);
+            if (proc_current()) shared_flush_pid(proc_current()->pid);
             proc_exit_current(regs, (int)regs->ebx, false);
             ret = 0;   /* reached only when the scheduler switched frames */
             break;
@@ -4057,8 +4199,13 @@ void syscall_handler(registers_t* regs) {
                            (int)regs->edi, regs->ebp);
             break;
         case SYS_munmap:
+            ret = do_munmap(regs->ebx, regs->ecx);
+            break;
         case SYS_mprotect:
-            ret = 0;   /* flat, always-mapped sandbox: nothing to do */
+            ret = do_mprotect(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_msync:
+            ret = do_msync(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_uname:
             ret = do_uname(regs->ebx);

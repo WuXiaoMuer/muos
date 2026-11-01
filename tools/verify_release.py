@@ -1,7 +1,7 @@
 """verify_release.py - release smoke test for both boot paths.
 
-- kernel (-kernel): self-tests 88/0, exec hello.elf prints USER-HELLO-OK
-- ISO (-cdrom): self-tests 88/0, `run fault` kills only the process (no
+- kernel (-kernel): self-tests 90/0, exec hello.elf prints USER-HELLO-OK
+- ISO (-cdrom): self-tests 90/0, `run fault` kills only the process (no
   panic) and the shell still runs a program afterwards
 """
 import os
@@ -39,7 +39,7 @@ def kernel_path():
     sh = Shell(args, log, 4488)
     try:
         sh.start()
-        tests_ok = "Results: 88 passed, 0 failed" in sh.text()
+        tests_ok = "Results: 90 passed, 0 failed" in sh.text()
         hello_ok = exec_hello(sh)
         text = sh.text()
         mark = MARK in text
@@ -56,7 +56,7 @@ def iso_path():
     sh = Shell(args, log, 4489)
     try:
         sh.start()
-        tests_ok = "Results: 88 passed, 0 failed" in sh.text()
+        tests_ok = "Results: 90 passed, 0 failed" in sh.text()
         # The ISO loader now builds a synthetic Multiboot info with the BIOS
         # E820 map, so the sandbox usually fits and hello.elf runs. Very
         # small machines still get the graceful "sandbox above physical RAM"
@@ -83,10 +83,10 @@ def main():
         return 1
     ktests, kmark, kexec, _ = kernel_path()
     itests, igrace, ipanic, _ = iso_path()
-    print(f"kernel tests 88/0: {ktests}")
+    print(f"kernel tests 90/0: {ktests}")
     print(f"kernel exec marker: {kexec and kmark}")
     print(f"kernel USER-HELLO-OK: {kmark}")
-    print(f"ISO tests 88/0: {itests}")
+    print(f"ISO tests 90/0: {itests}")
     print(f"ISO user program (run or graceful reject): {igrace}")
     print(f"ISO panic: {ipanic}")
     ok = ktests and kmark and kexec and itests and igrace and not ipanic

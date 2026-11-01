@@ -1199,6 +1199,44 @@ int main(int argc, char** argv) {
             ok = ok && grown;
             if (p3) muos_munmap((unsigned)p3, 4096);
 
+            /* MAP_SHARED write-back: memory stores must reach the file
+             * through msync (and munmap). The file currently holds 64
+             * zero bytes, so the first 8 bytes are rewritten here. */
+            char* sh = (char*)muos_mmap_file(fd, 4096,
+                                             MUOS_PROT_READ | MUOS_PROT_WRITE,
+                                             MUOS_MAP_SHARED, 0);
+            int shared_ok = 0;
+            if (sh && (unsigned)sh >= 0x08048000u) {
+                for (unsigned i = 0; i < 8; i++) sh[i] = (char)('A' + i);
+                rc = muos_msync((unsigned)sh, 4096, 0);
+                char rb[8];
+                muos_lseek(fd, 0, 0);
+                int n = muos_read(fd, rb, 8);
+                shared_ok = (rc == 0 && n == 8);
+                for (unsigned i = 0; shared_ok && i < 8; i++)
+                    if (rb[i] != (char)('A' + i)) shared_ok = 0;
+                muos_puts(shared_ok ? "mfile: shared-ok\n" : "mfile: shared-bad\n");
+                ok = ok && shared_ok;
+                rc = muos_munmap((unsigned)sh, 4096);
+                ok = ok && rc == 0;
+            }
+
+            /* mprotect: drop to read-only, then re-enable writes. */
+            char* mp = (char*)muos_mmap(4096);
+            int prot_ok = 0;
+            if (mp && (unsigned)mp >= 0x08048000u) {
+                mp[0] = 'X';
+                rc = muos_mprotect((unsigned)mp, 4096, MUOS_PROT_READ);
+                int ro_ok = (rc == 0 && mp[0] == 'X');
+                rc = muos_mprotect((unsigned)mp, 4096,
+                                   MUOS_PROT_READ | MUOS_PROT_WRITE);
+                mp[1] = 'Y';
+                prot_ok = (ro_ok && rc == 0 && mp[1] == 'Y');
+                muos_puts(prot_ok ? "mfile: mprotect-ok\n" : "mfile: mprotect-bad\n");
+                ok = ok && prot_ok;
+                muos_munmap((unsigned)mp, 4096);
+            }
+
             rc = muos_fsync(fd);
             muos_puts("mfile: fsync="); muos_putdec(rc); muos_puts("\n");
             ok = ok && rc == 0;

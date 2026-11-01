@@ -2,9 +2,17 @@
 #include "mm.h"
 #include "string.h"
 
-/* Heap capacity in pages: 256 pages = 1MB, plenty for the few dozen
- * small kernel objects MuOS allocates today. */
-#define KHEAP_PAGES 256
+/* Grow-on-demand kernel heap.
+ *
+ * The heap lives in its own virtual window (not the RAM identity alias) so
+ * that fresh physical frames can be mapped contiguously as it grows. These
+ * addresses are CPU-only: never hand a kheap pointer to a DMA device.
+ *
+ * Initial capacity is 1MB; exhaustion appends 256KB chunks until the 16MB
+ * ceiling, then kmalloc returns NULL as before. */
+#define KHEAP_PAGES       256
+#define KHEAP_GROW_PAGES  64
+#define KHEAP_MAX_PAGES   (KHEAP_MAX_BYTES / PAGE_SIZE)   /* 16MB ceiling */
 
 /* Live-block marker in every header; a mismatch means corruption or
  * "pointer was never returned by kmalloc". */
@@ -24,13 +32,88 @@ typedef struct {
 
 static uint8_t* heap_start = NULL;
 static uint32_t heap_size  = 0;
+static uint32_t heap_pages = 0;
+
+/* Pick a free 16MB window above the RAM alias and below the top of the
+ * address space, skipping anything already mapped (RAM alias, E1000 MMIO). */
+static uint32_t kheap_va_base(void) {
+    uint32_t cand = 0xD0000000u;
+    while (cand < 0xFF000000u && mm_virt_to_phys(cand) != 0) cand += 0x400000u;
+    if (cand >= 0xE0000000u && cand < 0xE0020000u) cand = 0xE0020000u;
+    return cand;
+}
+
+/* Map `pages` fresh frames at the current heap end. Returns the number of
+ * pages actually mapped (0 on failure); the caller extends heap_size. */
+static uint32_t kheap_map(uint32_t pages) {
+    uint32_t done = 0;
+    while (done < pages) {
+        void* frame = mm_alloc_page();
+        if (!frame) break;
+        uint32_t virt = (uint32_t)heap_start + heap_size + done * PAGE_SIZE;
+        if (!mm_map_page((uint32_t)frame, virt, PAGE_KERNEL)) {
+            mm_free_page(frame);
+            break;
+        }
+        done++;
+    }
+    return done;
+}
+
+/* Find the last block header; NULL if the heap is corrupt. */
+static kheap_block_t* kheap_last(uint32_t end_offset) {
+    uint8_t* end = heap_start + end_offset;
+    uint8_t* p = heap_start;
+    kheap_block_t* last = NULL;
+    while (p + KHEAP_HEADER <= end) {
+        kheap_block_t* b = (kheap_block_t*)p;
+        if (b->magic != KHEAP_MAGIC) return NULL;
+        last = b;
+        p = (uint8_t*)b + KHEAP_HEADER + b->size;
+    }
+    return (p == end) ? last : NULL;
+}
+
+/* Append pages to the heap and extend (or create) the trailing free block. */
+static bool_t kheap_grow(void) {
+    if (!heap_start || heap_pages + 1 >= KHEAP_MAX_PAGES) return false;
+
+    /* Locate the trailing block before committing any pages. */
+    kheap_block_t* last = kheap_last(heap_size);
+    if (!last) return false;             /* corrupt heap */
+
+    uint32_t want = KHEAP_GROW_PAGES;
+    if (heap_pages + want > KHEAP_MAX_PAGES) want = KHEAP_MAX_PAGES - heap_pages;
+    uint32_t got = kheap_map(want);
+    if (!got) return false;
+
+    uint32_t add = got * PAGE_SIZE;
+    uint32_t old_size = heap_size;
+    heap_size += add;
+    heap_pages += got;
+
+    if (!last->used) {
+        last->size += add;               /* coalesce with the trailing free block */
+    } else {
+        kheap_block_t* nb = (kheap_block_t*)(heap_start + old_size);
+        nb->magic = KHEAP_MAGIC;
+        nb->size  = add - KHEAP_HEADER;
+        nb->used  = 0;
+        nb->pad   = 0;
+    }
+    return true;
+}
 
 void kheap_init(void) {
-    uint8_t* mem = (uint8_t*)mm_alloc_pages(KHEAP_PAGES);
-    if (!mem) return;  /* stays disabled; kmalloc returns NULL */
+    heap_start = (uint8_t*)kheap_va_base();
+    heap_size  = 0;
+    heap_pages = 0;
 
-    heap_start = mem;
-    heap_size  = KHEAP_PAGES * PAGE_SIZE;
+    uint32_t got = kheap_map(KHEAP_PAGES);
+    if (!got) { heap_start = NULL; return; }  /* stays disabled */
+
+    heap_size  = got * PAGE_SIZE;
+    heap_pages = got;
 
     /* One big free block spanning the whole heap */
     kheap_block_t* b = (kheap_block_t*)heap_start;
@@ -49,29 +132,33 @@ void* kmalloc(uint32_t size) {
     if (size == 0) size = 1;
     uint32_t need = ALIGN16(size);
     if (need < size) return NULL;  /* size too close to 2^32 */
+    if (need > KHEAP_MAX_BYTES - KHEAP_HEADER) return NULL;  /* never fits */
 
-    uint8_t* heap_end = heap_start + heap_size;
-    uint8_t* p = heap_start;
-    while (p + KHEAP_HEADER <= heap_end) {
-        kheap_block_t* b = (kheap_block_t*)p;
-        if (b->magic != KHEAP_MAGIC) return NULL;  /* heap corrupted */
-        if (!b->used && b->size >= need) {
-            /* Split off the tail when the remainder can hold a header
-             * plus a minimal (16-byte) payload */
-            if (b->size >= need + KHEAP_HEADER + 16) {
-                kheap_block_t* nb = (kheap_block_t*)(p + KHEAP_HEADER + need);
-                nb->magic = KHEAP_MAGIC;
-                nb->size  = b->size - need - KHEAP_HEADER;
-                nb->used  = 0;
-                nb->pad   = 0;
-                b->size   = need;
+    for (;;) {
+        uint8_t* heap_end = heap_start + heap_size;
+        uint8_t* p = heap_start;
+        while (p + KHEAP_HEADER <= heap_end) {
+            kheap_block_t* b = (kheap_block_t*)p;
+            if (b->magic != KHEAP_MAGIC) return NULL;  /* heap corrupted */
+            if (!b->used && b->size >= need) {
+                /* Split off the tail when the remainder can hold a header
+                 * plus a minimal (16-byte) payload */
+                if (b->size >= need + KHEAP_HEADER + 16) {
+                    kheap_block_t* nb = (kheap_block_t*)(p + KHEAP_HEADER + need);
+                    nb->magic = KHEAP_MAGIC;
+                    nb->size  = b->size - need - KHEAP_HEADER;
+                    nb->used  = 0;
+                    nb->pad   = 0;
+                    b->size   = need;
+                }
+                b->used = 1;
+                return (void*)(p + KHEAP_HEADER);
             }
-            b->used = 1;
-            return (void*)(p + KHEAP_HEADER);
+            p += KHEAP_HEADER + b->size;
         }
-        p += KHEAP_HEADER + b->size;
+        /* Exhausted: append more pages and retry; stops at the cap. */
+        if (!kheap_grow()) return NULL;
     }
-    return NULL;  /* exhausted (see kheap.h: no grow yet) */
 }
 
 void kfree(void* ptr) {

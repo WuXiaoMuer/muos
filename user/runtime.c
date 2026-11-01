@@ -299,6 +299,14 @@ int muos_munmap(unsigned addr, unsigned len) {
     return syscall2(91, (int)addr, (int)len);
 }
 
+int muos_mprotect(unsigned addr, unsigned len, int prot) {
+    return syscall3(125, (int)addr, (int)len, prot);
+}
+
+int muos_msync(unsigned addr, unsigned len, int flags) {
+    return syscall3(144, (int)addr, (int)len, flags);
+}
+
 void muos_exit(int code) {
     syscall1(1, code);
     for (;;) { /* the kernel never returns here */ }

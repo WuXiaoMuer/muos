@@ -49,7 +49,7 @@ def main():
 
     txt = sh.text()
     checks = {
-        "kernel self-tests": "88 passed, 0 failed" in txt,
+        "kernel self-tests": "90 passed, 0 failed" in txt,
         "three modules": "[mods] count=3" in txt,
         "real loader entry": "entry=0x08" in txt and "size=820500" in txt,
         "musl applet echo": "REAL-SO-OK" in txt,
