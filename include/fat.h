@@ -35,5 +35,9 @@ int fat_delete_file(const char* path);
 int fat_mkdir(const char* path);
 /* Rename a file inside the volume (entries only; data clusters stay). */
 int fat_rename_file(const char* old_path, const char* new_path);
+/* Delete an empty directory (checks "."/".." only, frees its cluster). */
+int fat_rmdir(const char* path);
+/* Rename an empty directory (moves the entry and fixes its ".."). */
+int fat_rename_dir(const char* old_path, const char* new_path);
 
 #endif

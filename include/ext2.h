@@ -21,5 +21,9 @@ int ext2_delete_file(const char* path);
 int ext2_mkdir(const char* path);
 /* Rename a regular file (new dirent + remove old, blocks stay). */
 int ext2_rename_file(const char* old_path, const char* new_path);
+/* Delete an empty directory (frees its block/inode, fixes parent links). */
+int ext2_rmdir(const char* path);
+/* Rename a directory (moves the dirent and fixes ".." plus link counts). */
+int ext2_rename_dir(const char* old_path, const char* new_path);
 
 #endif

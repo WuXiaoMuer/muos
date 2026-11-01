@@ -170,6 +170,33 @@ int main(int argc, char** argv) {
         if (urc == 0 && still < 0) muos_puts("VFS-UNLINK-OK\n");
         else ok = 0;
 
+        /* Directory create, non-empty rejection, rename and rmdir. */
+        const char* d1 = is_fat ? "/fat/VFSD2" : "/ext2/vfsd2";
+        const char* d2 = is_fat ? "/fat/VFSD3" : "/ext2/vfsd3";
+        const char* df = is_fat ? "/fat/VFSD2/K.TXT" : "/ext2/vfsd2/k.txt";
+        int dk = muos_mkdirat(MUOS_AT_FDCWD, d1, 0755);
+        if (dk != 0 && dk != -17) ok = 0;
+        int kfd = muos_open(df, MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        if (kfd >= 0) {
+            muos_write(kfd, "K", 1);
+            muos_close(kfd);
+        } else ok = 0;
+        int nr = muos_unlinkat(MUOS_AT_FDCWD, d1, MUOS_AT_REMOVEDIR);
+        muos_puts("vfs: rmdir-nonempty="); muos_putdec(nr); muos_puts("\n");
+        if (nr == -39) muos_puts("VFS-RMDIR-NONEMPTY-OK\n");
+        else ok = 0;
+
+        muos_unlinkat(MUOS_AT_FDCWD, df, 0);
+        int drn = muos_renameat(MUOS_AT_FDCWD, d1, MUOS_AT_FDCWD, d2);
+        muos_puts("vfs: dir-rename="); muos_putdec(drn); muos_puts("\n");
+        if (drn == 0) muos_puts("VFS-DIRRENAME-OK\n");
+        else ok = 0;
+
+        int drm = muos_unlinkat(MUOS_AT_FDCWD, d2, MUOS_AT_REMOVEDIR);
+        muos_puts("vfs: rmdir="); muos_putdec(drm); muos_puts("\n");
+        if (drm == 0) muos_puts("VFS-RMDIR-OK\n");
+        else ok = 0;
+
         /* The mount root must enumerate through getdents64 too. */
         int dfd = muos_open("/fat", MUOS_O_DIRECTORY);
         if (dfd < 0) dfd = muos_open("/ext2", MUOS_O_DIRECTORY);

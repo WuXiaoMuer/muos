@@ -96,6 +96,8 @@ typedef struct {
     uint16_t mode;
 } ext2_ent_t;
 
+static bool_t ext2_adjust_links(uint32_t ino, int delta);
+
 static int ci_cmp(const char* a, const char* b) {
     while (*a && *b) {
         char x = *a, y = *b;
@@ -728,6 +730,7 @@ int ext2_mkdir(const char* path) {
         inode_release(ino);
         return -1;
     }
+    ext2_adjust_links(par.ino, +1);      /* child's ".." link */
     return 0;
 }
 
@@ -747,6 +750,122 @@ int ext2_rename_file(const char* old_path, const char* new_path) {
     if (!resolve(nparent, &np) || (np.mode & 0xF000) != 0x4000) return -1;
     if (lookup_in_dir(np.ino, nname, &existing)) return -1;
 
+    if (!dir_add(np.ino, nname, child.ino)) return -1;
+    uint32_t removed = 0;
+    if (!dir_remove(op.ino, oname, &removed)) return -1;
+    return 0;
+}
+
+/* Directory is empty when only "." and ".." remain. */
+static bool_t ext2_dir_empty(uint32_t dir_ino) {
+    uint8_t dinode[256];
+    if (!read_inode(dir_ino, dinode)) return false;
+    uint32_t size = le32(dinode + 4);
+    for (uint32_t logical = 0, done = 0; done < size; logical++) {
+        uint32_t block;
+        if (!inode_block(dinode, logical, &block)) break;
+        if (!read_block(block, blkbuf)) return false;
+        for (uint32_t off = 0; off + 8 <= vol.block_size && done < size; ) {
+            uint32_t ino = le32(blkbuf + off);
+            uint16_t rec = le16(blkbuf + off + 4);
+            uint16_t nl = le16(blkbuf + off + 6);
+            if (rec < 8 || off + rec > vol.block_size) return false;
+            if (ino && nl && off + 8 + nl <= vol.block_size) {
+                if (!(nl == 1 && blkbuf[off + 8] == '.') &&
+                    !(nl == 2 && blkbuf[off + 8] == '.' && blkbuf[off + 9] == '.'))
+                    return false;
+            }
+            off += rec;
+            done += rec;
+        }
+    }
+    return true;
+}
+
+/* Inode number stored in the ".." entry (second dirent of the first block). */
+static uint32_t ext2_parent_inode(uint32_t dir_ino) {
+    uint8_t inode[256];
+    if (!read_inode(dir_ino, inode)) return 0;
+    uint32_t block;
+    if (!inode_block(inode, 0, &block)) return 0;
+    if (!read_block(block, blkbuf)) return 0;
+    return le32(blkbuf + 12);
+}
+
+/* Follow ".." links: is `start_parent` or any ancestor the `old_ino`? */
+static bool_t ext2_parent_inside(uint32_t old_ino, uint32_t start_parent) {
+    uint32_t cur = start_parent;
+    for (int depth = 0; depth < 32 && cur >= 2; depth++) {
+        if (cur == old_ino) return true;
+        cur = ext2_parent_inode(cur);
+    }
+    return false;
+}
+
+static bool_t ext2_set_dotdot(uint32_t child_ino, uint32_t parent_ino) {
+    uint8_t inode[256];
+    if (!read_inode(child_ino, inode)) return false;
+    uint32_t block;
+    if (!inode_block(inode, 0, &block)) return false;
+    if (!read_block(block, blkbuf)) return false;
+    put32(blkbuf + 12, parent_ino);       /* ".." dirent, after the 12-byte "." */
+    return write_block(block, blkbuf);
+}
+
+static bool_t ext2_adjust_links(uint32_t ino, int delta) {
+    uint8_t inode[256];
+    if (!read_inode(ino, inode)) return false;
+    uint16_t links = le16(inode + 26);
+    int32_t v = (int32_t)links + delta;
+    if (v < 0) return false;
+    put16(inode + 26, (uint16_t)v);
+    return write_inode(ino, inode);
+}
+
+int ext2_rmdir(const char* path) {
+    if (!present || !path) return -1;
+    char parent[64], name[64];
+    if (!split_parent(path, parent, name)) return -1;
+    if (strcmp(parent, "/") == 0 && !name[0]) return -1;
+
+    ext2_ent_t par, child;
+    if (!resolve(parent, &par) || (par.mode & 0xF000) != 0x4000) return -1;
+    if (!lookup_in_dir(par.ino, name, &child)) return -1;
+    if ((child.mode & 0xF000) != 0x4000 || child.ino == 2) return -1;
+    if (!ext2_dir_empty(child.ino)) return -2;       /* not empty */
+
+    uint8_t inode[256];
+    if (!read_inode(child.ino, inode)) return -1;
+    free_inode_blocks(inode);
+    uint32_t removed = 0;
+    if (!dir_remove(par.ino, name, &removed)) return -1;
+    if (!inode_release(child.ino)) return -1;
+    ext2_adjust_links(par.ino, -1);
+    return 0;
+}
+
+int ext2_rename_dir(const char* old_path, const char* new_path) {
+    if (!present || !old_path || !new_path) return -1;
+    char oparent[64], oname[64], nparent[64], nname[64];
+    if (!split_parent(old_path, oparent, oname)
+        || !split_parent(new_path, nparent, nname))
+        return -1;
+    if (strcmp(oparent, nparent) == 0 && strcmp(oname, nname) == 0) return 0;
+
+    ext2_ent_t op, np, child, existing;
+    if (!resolve(oparent, &op) || (op.mode & 0xF000) != 0x4000) return -1;
+    if (!lookup_in_dir(op.ino, oname, &child)) return -1;
+    if ((child.mode & 0xF000) != 0x4000 || child.ino == 2) return -1;
+
+    if (!resolve(nparent, &np) || (np.mode & 0xF000) != 0x4000) return -1;
+    if (lookup_in_dir(np.ino, nname, &existing)) return -1;
+    if (np.ino != op.ino && ext2_parent_inside(child.ino, np.ino)) return -1;
+
+    if (np.ino != op.ino) {
+        if (!ext2_set_dotdot(child.ino, np.ino)) return -1;
+        ext2_adjust_links(op.ino, -1);
+        ext2_adjust_links(np.ino, +1);
+    }
     if (!dir_add(np.ino, nname, child.ino)) return -1;
     uint32_t removed = 0;
     if (!dir_remove(op.ino, oname, &removed)) return -1;

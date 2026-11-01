@@ -867,6 +867,101 @@ int fat_rename_file(const char* old_path, const char* new_path) {
     return 0;
 }
 
+/* True when every entry in the directory chain is "." / ".." / free. */
+static bool_t dir_chain_empty(uint32_t cluster) {
+    for (uint32_t c = cluster, guard = 0;
+         c >= 2 && c < 0x0FFFFFF8u; c = fat_next(c)) {
+        if (++guard > 4096) return false;
+        if (!read_cluster(c, dirbuf)) return false;
+        for (uint32_t off = 0; off + 32 <= vol.spc * SECTOR; off += 32) {
+            const uint8_t* e = dirbuf + off;
+            if (e[0] == 0x00) return true;
+            if (e[0] == 0xE5) continue;
+            uint8_t attr = e[11];
+            if ((attr & 0x3F) == 0x0F || (attr & 0x08)) continue;
+            if (e[0] == '.' && (e[1] == ' ' || e[1] == '.')) continue;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Is `new_parent` a directory inside the subtree rooted at `old_cluster`? */
+static bool_t parent_inside(uint32_t old_cluster, const char* new_parent) {
+    uint32_t cur = vol.root_cluster;
+    const char* p = new_parent;
+    while (*p == '/') p++;
+    while (*p) {
+        char comp[64];
+        int n = 0;
+        while (*p && *p != '/' && n < 63) comp[n++] = *p++;
+        comp[n] = '\0';
+        while (*p == '/') p++;
+        dirent_t d;
+        if (!lookup_in_dir(cur, comp, &d) || !(d.attr & 0x10)) return false;
+        cur = d.cluster;
+        if (cur == old_cluster) return true;
+    }
+    return false;
+}
+
+/* Point the ".." entry of `child` at `parent` (0 when parent is root). */
+static bool_t set_dotdot(uint32_t child, uint32_t parent) {
+    if (!read_cluster(child, dirbuf)) return false;
+    uint8_t* e = dirbuf + 32;
+    if (e[0] != '.' || e[1] != '.') return false;
+    uint32_t pc = (parent == vol.root_cluster) ? 0 : parent;
+    e[20] = (uint8_t)(pc >> 16); e[21] = (uint8_t)(pc >> 24);
+    e[26] = (uint8_t)pc;         e[27] = (uint8_t)(pc >> 8);
+    uint64_t off = (uint64_t)(vol.data_start + (child - 2) * vol.spc) * SECTOR;
+    return wr(off, dirbuf, vol.spc * SECTOR);
+}
+
+int fat_rmdir(const char* path) {
+    if (!present || !path) return -1;
+    char parent[96], name[128];
+    if (!split_path(path, parent, sizeof(parent), name, sizeof(name))) return -1;
+
+    dirent_t pd;
+    if (!resolve(parent, &pd) || !(pd.attr & 0x10)) return -1;
+    bool_t found;
+    uint32_t sc = 0, so = 0, ec = 0, es = 0;
+    if (!dir_find(pd.cluster, name, &found, &sc, &so, &ec, &es) || !found)
+        return -1;
+    uint8_t attr = dirbuf[so + 11];
+    if (!(attr & 0x10) || ec < 2) return -1;
+    if (!dir_chain_empty(ec)) return -2;          /* not empty */
+    if (!dir_delete_entry(sc, so)) return -1;
+    free_chain(ec);
+    return 0;
+}
+
+int fat_rename_dir(const char* old_path, const char* new_path) {
+    if (!present || !old_path || !new_path) return -1;
+    char oparent[96], oname[128], nparent[96], nname[128];
+    if (!split_path(old_path, oparent, sizeof(oparent), oname, sizeof(oname))
+        || !split_path(new_path, nparent, sizeof(nparent), nname, sizeof(nname)))
+        return -1;
+    if (strcmp(oparent, nparent) == 0 && strcmp(oname, nname) == 0) return 0;
+
+    dirent_t pd;
+    if (!resolve(oparent, &pd) || !(pd.attr & 0x10)) return -1;
+    bool_t found;
+    uint32_t sc = 0, so = 0, ec = 0, es = 0;
+    if (!dir_find(pd.cluster, oname, &found, &sc, &so, &ec, &es) || !found)
+        return -1;
+    uint8_t attr = dirbuf[so + 11];
+    if (!(attr & 0x10) || ec < 2) return -1;
+
+    dirent_t np;
+    if (!resolve(nparent, &np) || !(np.attr & 0x10)) return -1;
+    if (parent_inside(ec, nparent)) return -1;    /* cannot move into itself */
+    if (!dir_emit(np.cluster, nname, ec, 0, 0x10)) return -1;
+    if (np.cluster != pd.cluster && !set_dotdot(ec, np.cluster)) return -1;
+    if (!dir_delete_entry(sc, so)) return -1;
+    return 0;
+}
+
 const char* fat_label(void) { return vol.label; }
 uint32_t fat_part_lba(void) { return (uint32_t)(vol.base / SECTOR); }
 

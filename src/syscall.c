@@ -52,6 +52,15 @@ static int vfs_vol_rename(int vol, const char* old_path, const char* new_path) {
                               : ext2_rename_file(old_path, new_path);
 }
 
+static int vfs_vol_rmdir(int vol, const char* path) {
+    return vol == VFS_VOL_FAT ? fat_rmdir(path) : ext2_rmdir(path);
+}
+
+static int vfs_vol_rename_dir(int vol, const char* old_path, const char* new_path) {
+    return vol == VFS_VOL_FAT ? fat_rename_dir(old_path, new_path)
+                              : ext2_rename_dir(old_path, new_path);
+}
+
 /* Defined with the virtual namespace below; do_read/do_write need them
  * before that point. */
 static bool_t vfs_mount_prefix(const char* path, int* vol, const char** sub);
@@ -2358,7 +2367,17 @@ static uint32_t do_rmdir_buf(const char* buf) {
     uint32_t rc = vfs_lookup(buf, &e);
     if ((int32_t)rc < 0) return rc;
 
-    if (e.type != VFS_T_DIR || e.id != VFS_DIR_REAL) return err(ERR_EPERM);
+    if (e.type != VFS_T_DIR) return err(ERR_ENOTDIR);
+    if (e.id == VFS_DIR_FAT || e.id == VFS_DIR_EXT2) {
+        int vol = 0;
+        const char* sub = NULL;
+        if (!vfs_mount_prefix(e.path, &vol, &sub)) return err(ERR_ENOENT);
+        if (!*sub) return err(ERR_EPERM);
+        int r = vfs_vol_rmdir(vol, sub);
+        if (r == -2) return err(ERR_ENOTEMPTY);
+        return r == 0 ? 0 : err(ERR_EIO);
+    }
+    if (e.id != VFS_DIR_REAL) return err(ERR_EPERM);
     const char* name = e.path + 1;
     if (!fs_dir_is_empty(name)) return err(ERR_ENOTEMPTY);
     return fs_rmdir(name) == 0 ? 0 : err(ERR_ENOENT);
@@ -2414,6 +2433,19 @@ static uint32_t do_rename_bufs(const char* obuf, const char* nbuf) {
         if (!*nsub) return err(ERR_EBUSY);
         if ((int32_t)nrc == 0) return err(ERR_EEXIST);
         return vfs_vol_rename(vol, osub, nsub) == 0 ? 0 : err(ERR_EIO);
+    }
+
+    if (oe.type == VFS_T_DIR &&
+        (oe.id == VFS_DIR_FAT || oe.id == VFS_DIR_EXT2)) {
+        int vol = 0, nvol = 0;
+        const char* osub = NULL;
+        const char* nsub = NULL;
+        if (!vfs_mount_prefix(oe.path, &vol, &osub)) return err(ERR_ENOENT);
+        if (!vfs_mount_prefix(ne.path, &nvol, &nsub)) return err(ERR_EXDEV);
+        if (nvol != vol) return err(ERR_EXDEV);
+        if (!*osub || !*nsub) return err(ERR_EBUSY);
+        if ((int32_t)nrc == 0) return err(ERR_EEXIST);
+        return vfs_vol_rename_dir(vol, osub, nsub) == 0 ? 0 : err(ERR_EIO);
     }
 
     if (oe.type != VFS_T_FILE && oe.type != VFS_T_DIR) return err(ERR_EPERM);

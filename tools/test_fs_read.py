@@ -49,8 +49,8 @@ def main():
                     "fatcat /LongFileName.txt"], 4477, "fat")
     tfw = boot(fat, ["fatcat /NEW.TXT", "fatcat /HELLO.TXT",
                      "fatcat /LongFileName.txt", "cat /fat/VFS.TXT",
-                     "fatcat /VFSDIR/A.TXT", "fatcat /VFSDIR/B.TXT"],
-               4480, "fat2")
+                     "fatcat /VFSDIR/A.TXT", "fatcat /VFSDIR/B.TXT",
+                     "fatls /"], 4480, "fat2")
     tg = boot(gpt, ["part", "fatcat /HELLO.TXT"], 4478, "gpt")
     te = boot(ext, ["part", "ext2ls /", "ext2cat /hello.txt",
                     "ext2ls /subdir", "ext2cat /subdir/inside.txt",
@@ -60,7 +60,7 @@ def main():
                     "ext2cat /hello.txt"], 4479, "ext2")
     tew = boot(ext, ["ext2cat /new.txt", "ext2cat /hello.txt",
                      "cat /ext2/vfs.txt", "ext2cat /vfsdir/a.txt",
-                     "ext2cat /vfsdir/b.txt"], 4481, "ext2w")
+                     "ext2cat /vfsdir/b.txt", "ext2ls /"], 4481, "ext2w")
 
     checks = {
         "fat part table": "[part] table ok" in tf,
@@ -76,6 +76,7 @@ def main():
         "fat persist": "FAT-WRITE-OK" in tfw and "FAT-OVERWRITE" in tfw,
         "fat long persist": "LONG-NAME-OK" in tfw,
         "fat delete persist": tfw.count("[fat] cat fail") >= 2,
+        "fat dir cleanup persist": "VFSD2" not in tfw and "VFSD3" not in tfw,
         "gpt partition": "GPT" in tg and "[part] table ok" in tg,
         "gpt fat read": "FAT-HELLO-OK" in tg,
         "ext2 part table": "[part] table ok" in te,
@@ -88,20 +89,27 @@ def main():
         "ext2 overwrite": "EXT2-OVERWRITE" in te,
         "ext2 persist": "EXT2-WRITE-OK" in tew and "EXT2-OVERWRITE" in tew,
         "ext2 delete persist": tew.count("[ext2] cat fail") >= 2,
+        "ext2 dir cleanup persist": "VFSD2" not in tew and "VFSD3" not in tew,
         "vfs fat open/read": "VFS-FAT-OK" in tf and "VFS-OK" in tf,
         "vfs fat write": "VFS-WRITE-OK" in tf,
         "vfs fat persist": "VFS-WRITE-OK" in tfw,
         "vfs fat getdents": "VFS-LIST-OK" in tf,
         "vfs fat mkdir/rename/unlink": "VFS-MKDIR-OK" in tf and
                                        "VFS-RENAME-OK" in tf and
-                                       "VFS-UNLINK-OK" in tf,
+                                       "VFS-UNLINK-OK" in tf and
+                                       "VFS-DIRRENAME-OK" in tf and
+                                       "VFS-RMDIR-OK" in tf and
+                                       "VFS-RMDIR-NONEMPTY-OK" in tf,
         "vfs ext2 open/read": "VFS-EXT2-OK" in te and "VFS-OK" in te,
         "vfs ext2 write": "VFS-WRITE-OK" in te,
         "vfs ext2 persist": "VFS-WRITE-OK" in tew,
         "vfs ext2 getdents": "VFS-LIST-OK" in te,
         "vfs ext2 mkdir/rename/unlink": "VFS-MKDIR-OK" in te and
                                         "VFS-RENAME-OK" in te and
-                                        "VFS-UNLINK-OK" in te,
+                                        "VFS-UNLINK-OK" in te and
+                                        "VFS-DIRRENAME-OK" in te and
+                                        "VFS-RMDIR-OK" in te and
+                                        "VFS-RMDIR-NONEMPTY-OK" in te,
         "tcp reorder selftest": "TCP-REORDER-OK" in tf,
         "tcp wscale selftest": "TCP-WSCALE-OK" in tf,
     }
