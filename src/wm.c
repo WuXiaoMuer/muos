@@ -18,7 +18,8 @@
 #include "string.h"
 #include "logo.h"
 
-#define WIN_COUNT 3
+#define WIN_COUNT 4
+#define WIDGET_WIN 3
 #define WIN_W     380
 #define WIN_H     260
 #define TITLE_H   22
@@ -29,12 +30,26 @@
 #define GLYPH_W   8
 #define GLYPH_H   16
 
+/* Widgets window geometry (body-local pixels). */
+#define W_BTN_X   10
+#define W_BTN_W   110
+#define W_BTN_H   22
+#define W_BTN1_Y  62
+#define W_BTN2_Y  90
+#define W_IN_X    10
+#define W_IN_Y    130
+#define W_IN_W    220
+#define W_IN_H    24
+
 typedef struct {
     int      x, y;
     bool_t   open;
     char     title[24];
     char     text[TEXT_MAX];
     int      tlen;
+    int      scroll;        /* first visible text line */
+    char     input[64];     /* Widgets input box */
+    int      ilen;
 } wm_window_t;
 
 static uint32_t* scr;                 /* full-screen back buffer */
@@ -88,40 +103,137 @@ static void buf_text(uint32_t* b, int w, int h, int x, int y,
     }
 }
 
-static void body_render(int i) {
+static int win_total_lines(wm_window_t* win) {
+    int cols = (BODY_W - 18) / GLYPH_W;
+    int lines = 1, col = 0;
+    for (int k = 0; k < win->tlen; k++) {
+        char ch = win->text[k];
+        if (ch == '\n') { lines++; col = 0; continue; }
+        if (col >= cols) { lines++; col = 0; }
+        col++;
+    }
+    return lines;
+}
+
+static void log_append(wm_window_t* win, const char* s) {
+    for (; *s && win->tlen < TEXT_MAX - 1; s++) win->text[win->tlen++] = *s;
+}
+
+/* Text window: wrapped lines with a vertical scrollbar on the right. */
+static void body_render_text(int i) {
     wm_window_t* win = &wins[i];
     uint32_t* b = wbuf[i];
     buf_fill(b, BODY_W, BODY_H, rgb(16, 20, 24));
 
-    const int cols = BODY_W / GLYPH_W;
+    const int cols = (BODY_W - 18) / GLYPH_W;
     const int rows = BODY_H / GLYPH_H;
-    int line_no = 0;
-    char buf[64];
-    int bp = 0;
-    for (int k = 0; k < win->tlen && line_no < rows; k++) {
-        char ch = win->text[k];
+    int total = win_total_lines(win);
+    int maxs = total > rows ? total - rows : 0;
+    if (win->scroll > maxs) win->scroll = maxs;
+    if (win->scroll < 0) win->scroll = 0;
+
+    char line[64];
+    int bp = 0, line_no = 0, drawn = 0;
+    int caret_line = 0, caret_col = 0;
+    for (int k = 0; k <= win->tlen; k++) {
+        char ch = (k < win->tlen) ? win->text[k] : '\n';
+        if (k == win->tlen) { caret_line = line_no; caret_col = bp; }
         if (ch == '\n' || bp >= cols) {
-            buf[bp < 63 ? bp : 63] = '\0';
-            buf_text(b, BODY_W, BODY_H, 8, 8 + line_no * GLYPH_H,
-                     buf, rgb(225, 225, 225), rgb(16, 20, 24));
+            if (line_no >= win->scroll && drawn < rows) {
+                line[bp < 63 ? bp : 63] = '\0';
+                buf_text(b, BODY_W, BODY_H, 8, 8 + drawn * GLYPH_H,
+                         line, rgb(225, 225, 225), rgb(16, 20, 24));
+                drawn++;
+            }
             line_no++;
             bp = 0;
             if (ch == '\n') continue;
         }
-        if (line_no >= rows) break;
-        buf[bp < 63 ? bp : 63] = ch;
+        line[bp < 63 ? bp : 63] = ch;
         bp++;
     }
-    buf[bp < 63 ? bp : 63] = '\0';
-    buf_text(b, BODY_W, BODY_H, 8, 8 + line_no * GLYPH_H,
-             buf, rgb(225, 225, 225), rgb(16, 20, 24));
 
-    /* Caret */
-    int cy = 8 + line_no * GLYPH_H;
-    if (cy + GLYPH_H < BODY_H) {
-        buf_rect(b, BODY_W, BODY_H, 8 + bp * GLYPH_W, cy,
+    int cy = 8 + (caret_line - win->scroll) * GLYPH_H;
+    if (caret_line >= win->scroll && caret_line < win->scroll + rows &&
+        cy + GLYPH_H < BODY_H) {
+        buf_rect(b, BODY_W, BODY_H, 8 + caret_col * GLYPH_W, cy,
                  GLYPH_W, GLYPH_H, rgb(120, 200, 120));
     }
+
+    int track_x = BODY_W - 10, track_y = 4, track_h = BODY_H - 8;
+    buf_rect(b, BODY_W, BODY_H, track_x, track_y, 6, track_h, rgb(34, 38, 46));
+    if (total > 0) {
+        int thumb_h = track_h * rows / total;
+        if (thumb_h < 16) thumb_h = 16;
+        if (thumb_h > track_h) thumb_h = track_h;
+        int span = track_h - thumb_h;
+        int thumb_y = track_y + (maxs ? span * win->scroll / maxs : 0);
+        buf_rect(b, BODY_W, BODY_H, track_x, thumb_y, 6, thumb_h,
+                 rgb(112, 128, 152));
+    }
+}
+
+static void draw_button(uint32_t* b, int x, int y, const char* label) {
+    buf_rect(b, BODY_W, BODY_H, x, y, W_BTN_W, W_BTN_H, rgb(42, 111, 219));
+    buf_rect(b, BODY_W, BODY_H, x, y, W_BTN_W, 2, rgb(96, 160, 240));
+    buf_rect(b, BODY_W, BODY_H, x, y + W_BTN_H - 2, W_BTN_W, 2, rgb(26, 70, 145));
+    buf_text(b, BODY_W, BODY_H, x + 8, y + 3, label,
+             rgb(245, 248, 255), rgb(42, 111, 219));
+}
+
+/* Widgets window: two buttons and a one-line input box. */
+static void body_render_widgets(int i) {
+    wm_window_t* win = &wins[i];
+    uint32_t* b = wbuf[i];
+    buf_fill(b, BODY_W, BODY_H, rgb(16, 20, 24));
+
+    buf_text(b, BODY_W, BODY_H, 10, 8, "Widgets demo",
+             rgb(230, 230, 230), rgb(16, 20, 24));
+    buf_text(b, BODY_W, BODY_H, 10, 32, "Type below, Enter sends to Terminal.",
+             rgb(160, 175, 190), rgb(16, 20, 24));
+
+    draw_button(b, W_BTN_X, W_BTN1_Y, "Say Hello");
+    draw_button(b, W_BTN_X, W_BTN2_Y, "Clear Log");
+
+    buf_rect(b, BODY_W, BODY_H, W_IN_X - 2, W_IN_Y - 2,
+             W_IN_W + 4, W_IN_H + 4, rgb(96, 106, 126));
+    buf_rect(b, BODY_W, BODY_H, W_IN_X, W_IN_Y, W_IN_W, W_IN_H,
+             rgb(10, 12, 16));
+    buf_text(b, BODY_W, BODY_H, W_IN_X + 6, W_IN_Y + 4, win->input,
+             rgb(225, 235, 245), rgb(10, 12, 16));
+    if (win->ilen < 31) {
+        buf_rect(b, BODY_W, BODY_H, W_IN_X + 6 + win->ilen * GLYPH_W,
+                 W_IN_Y + 4, 6, GLYPH_H, rgb(120, 200, 120));
+    }
+}
+
+static void body_render(int i) {
+    if (i == WIDGET_WIN) body_render_widgets(i);
+    else body_render_text(i);
+}
+
+static int widget_button_at(int bx, int by) {
+    if (bx >= W_BTN_X && bx < W_BTN_X + W_BTN_W) {
+        if (by >= W_BTN1_Y && by < W_BTN1_Y + W_BTN_H) return 1;
+        if (by >= W_BTN2_Y && by < W_BTN2_Y + W_BTN_H) return 2;
+    }
+    return 0;
+}
+
+/* Map a mouse y coordinate inside the window body to a scroll offset. */
+static void scroll_drag(wm_window_t* win, int my) {
+    int total = win_total_lines(win);
+    int rows = BODY_H / GLYPH_H;
+    if (total <= rows) { win->scroll = 0; return; }
+    int track_top = win->y + TITLE_H + 1 + 4;
+    int track_h = BODY_H - 8;
+    int thumb_h = track_h * rows / total;
+    if (thumb_h < 16) thumb_h = 16;
+    int span = track_h - thumb_h;
+    int y = my - track_top - thumb_h / 2;
+    if (y < 0) y = 0;
+    if (y > span) y = span;
+    win->scroll = span ? y * (total - rows) / span : 0;
 }
 
 /* 10x14 arrow cursor. */
@@ -194,7 +306,7 @@ static void compose(int mx, int my) {
     if (ty > 0) {
         buf_rect(scr, SW, SH, 0, ty, SW, TASKBAR_H, rgb(18, 22, 30));
         buf_text(scr, SW, SH, 10, ty + 6,
-                 "MuOS WM  drag title / click close / type text / ESC exits",
+                 "MuOS WM  drag / scrollbar / buttons / type / ESC exits",
                  rgb(200, 210, 225), rgb(18, 22, 30));
     }
 
@@ -258,6 +370,7 @@ void wm_run(void) {
     wins[0].x = 30;  wins[0].y = 40;
     wins[1].x = SW - WIN_W - 20; wins[1].y = 90;
     wins[2].x = (SW - WIN_W) / 2; wins[2].y = SH - WIN_H - TASKBAR_H - 10;
+    wins[3].x = 30; wins[3].y = SH - WIN_H - TASKBAR_H - 10;
     for (int i = 0; i < WIN_COUNT; i++) {
         wins[i].open = true;
         order[i] = i;
@@ -274,15 +387,19 @@ void wm_run(void) {
       wins[1].tlen = 0;
       for (int i = 0; s[i] && i < TEXT_MAX; i++) { wins[1].text[i] = s[i]; wins[1].tlen++; } }
     wins[2].tlen = 0;
+    wins[3].tlen = 0;
+    wins[3].input[0] = '\0';
     strncpy(wins[0].title, "Terminal", 23);
     strncpy(wins[1].title, "System", 23);
     strncpy(wins[2].title, "Editor", 23);
+    strncpy(wins[3].title, "Widgets", 23);
 
     int focus_i = -1;
     for (int i = 0; i < WIN_COUNT; i++) body_render(i);
 
     int mx = SW / 2, my = SH / 2;
     int drag_i = -1, drag_dx = 0, drag_dy = 0;
+    int scroll_i = -1;
     int prev_left = 0;
     uint32_t last = pit_get_ticks();
     bool_t running = true;
@@ -319,12 +436,35 @@ void wm_run(void) {
                     drag_i = i;
                     drag_dx = win->x - mx;
                     drag_dy = win->y - my;
+                } else if (i == WIDGET_WIN) {
+                    int bx = mx - (win->x + 1);
+                    int by = my - (win->y + TITLE_H + 1);
+                    int btn = widget_button_at(bx, by);
+                    if (btn == 1) {
+                        log_append(&wins[0], "Hello from Widgets!\n");
+                        wins[0].scroll = TEXT_MAX;      /* follow tail */
+                        body_render(0);
+                    } else if (btn == 2) {
+                        wins[0].tlen = 0;
+                        wins[0].scroll = 0;
+                        body_render(0);
+                    }
+                } else if (mx >= win->x + WIN_W - 12 &&
+                           my >= win->y + TITLE_H + 1 &&
+                           my < win->y + TITLE_H + 1 + BODY_H) {
+                    scroll_i = i;
+                    scroll_drag(win, my);
+                    body_render(i);
                 }
             } else {
                 focus_i = -1;
             }
         }
-        if (!left) drag_i = -1;
+        if (!left) { drag_i = -1; scroll_i = -1; }
+        if (left && scroll_i >= 0) {
+            scroll_drag(&wins[scroll_i], my);
+            body_render(scroll_i);
+        }
         if (left && drag_i >= 0) {
             wm_window_t* win = &wins[drag_i];
             win->x = mx + drag_dx;
@@ -341,12 +481,30 @@ void wm_run(void) {
             if (c == 27) { running = false; break; }
             if (focus_i < 0 || !wins[focus_i].open) continue;
             wm_window_t* win = &wins[focus_i];
-            if (c == 8) {
-                if (win->tlen > 0) win->tlen--;
-            } else if (c == '\r') {
-                if (win->tlen < TEXT_MAX - 1) win->text[win->tlen++] = '\n';
-            } else if (c >= 32 && c < 127) {
-                if (win->tlen < TEXT_MAX - 1) win->text[win->tlen++] = c;
+            if (focus_i == WIDGET_WIN) {
+                if (c == 8) {
+                    if (win->ilen > 0) win->ilen--;
+                } else if (c == '\r' || c == '\n') {
+                    if (win->ilen > 0) {
+                        log_append(&wins[0], win->input);
+                        log_append(&wins[0], "\n");
+                    }
+                    win->ilen = 0;
+                    wins[0].scroll = TEXT_MAX;      /* Terminal follows tail */
+                    body_render(0);
+                } else if (c >= 32 && c < 127) {
+                    if (win->ilen < 63) win->input[win->ilen++] = c;
+                }
+                win->input[win->ilen] = '\0';
+            } else {
+                if (c == 8) {
+                    if (win->tlen > 0) win->tlen--;
+                } else if (c == '\r' || c == '\n') {
+                    if (win->tlen < TEXT_MAX - 1) win->text[win->tlen++] = '\n';
+                } else if (c >= 32 && c < 127) {
+                    if (win->tlen < TEXT_MAX - 1) win->text[win->tlen++] = c;
+                }
+                win->scroll = TEXT_MAX;             /* follow tail while typing */
             }
             body_render(focus_i);
         }

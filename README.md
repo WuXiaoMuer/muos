@@ -13,7 +13,7 @@
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **MuOS v1.3 桌面(`desktop`/`gui`)**:文本模式 Win7 风格 GUI(任务栏、开始菜单、窗口 z-order、Calculator),启动 logo 为立体 ASCII 字标
-- **像素窗口管理器(`pixel`,ISO/VBE)**:每个窗口独立 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`),鼠标拖动标题栏/点击关闭/聚焦置顶、键盘输入到焦点窗口;文字用 8×8 字模纵向 2 倍渲染成 8×16;ESC 返回文本 shell
+- **像素窗口管理器(`pixel`,ISO/VBE)**:每个窗口独立 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`),鼠标拖动标题栏/点击关闭/聚焦置顶、键盘输入到焦点窗口;文本窗口带可拖动滚动条,`Widgets` 窗口提供按钮(Say Hello/Clear Log)与单行输入框(回车发送到 Terminal);文字用 8×8 字模纵向 2 倍渲染成 8×16;ESC 返回文本 shell
 - **安全与电源**:SMEP(CPUID 可用时置 CR4 bit20)、弱 ASLR(栈顶 0..7 页随机 + `AT_RANDOM` 驱动库加载基址随机)、**uid/gid 凭据与文件权限**(MuFS 元数据保存 owner/mode,open/access 按 rwx 位检查、root 绕过读写)、ACPI FADT 定位与 S5 关机(`poweroff`) / 8042 复位(`reboot`);`run perm` 实测非 root 子进程读 0600 被拒、读 0644 成功
 - **88 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
 
@@ -195,7 +195,7 @@ muos> run tls             # 静态 TLS:initial-exec(TPOFF)+ global-dynamic(__tls
 muos> run perm            # uid/gid 与文件权限:非 root 读 0600 被拒、读 0644 成功
 muos> run net             # 网卡:raw ICMP echo + UDP DNS 查询(QEMU -nic user,model=rtl8139)
 muos> run tcp             # TCP:双连接回显 + getsockname/getpeername + listen/accept 自连接
-muos> pixel               # 像素窗口管理器(仅 ISO/VBE):拖动/聚焦/关闭、键盘输入、双缓冲合成
+muos> pixel               # 像素窗口管理器(仅 ISO/VBE):拖动/聚焦/关闭、滚动条、按钮/输入框、双缓冲合成
 muos> run fsata           # MuFS 持久文件:创建/写/fsync/回读(重启后 run fsread)
 muos> run ata             # /dev/hda 写入并回读 PERSIST-DATA
 muos> disk                # ATA 型号、扇区数与 MuFS generation
@@ -232,7 +232,7 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - 静态 TLS(i386 变体 II):`ld-mu.so` 解析每个对象的 `PT_TLS`,在 `0x08780000` 的 TLS 区按“主程序最靠近 TP、其余库向下排列”布局,复制 `.tdata`、清零 `.tbss`,把自指针写入 `gs:0` 并通过 `set_thread_area(243)` 设置 GDT 槽 6、加载选择子 `0x33`。支持 `R_386_TLS_TPOFF/IE/GOTIE/LE/IE_32/LE_32/TPOFF32`(负偏移)与 `R_386_TLS_DTPMOD32/DTPOFF32`,并提供 `%eax` 传参约定的 `__tls_get_addr` 入口;`run tls` 实测 initial-exec 与 global-dynamic 两种模型(`TLS-OK`)。符号版本化:解析 `DT_VERSYM/DT_VERDEF/DT_VERNEED`,按 `verneed` 的版本名筛选提供者、隐藏版本位(`0x8000`)生效;自研 `.so` 无版本表时按未版本化兼容。尚未用真实 glibc/musl `.so` 做端到端验证。
 - 网络:`pci.c` 用 0xCF8/0xCFC 枚举并找到 RTL8139(10EC:8139),`net.c` 轮询 ISR 处理 32K RX 环与 4 个 TX 描述符;实现了 ARP 缓存/请求应答、IPv4 收发与校验和、ICMP echo 应答、UDP、**DHCP 客户端**(DISCOVER/OFFER/REQUEST/ACK,开机自动配置 10.0.2.x,失败时回退静态 10.0.2.15)以及**TCP**(SYN/SYN-ACK/ACK 握手、PSH 数据、FIN/ACK 关闭、**8 段发送队列 + 队列头 RTO 重传/指数退避**、**慢开始/拥塞避免窗口**、**接收端乱序重排队列(4 段,按 rcv_nxt 连续推进)**、**对端通告窗口跟踪**)和 127.0.0.1 回环;内核内置 port 7 echo 服务用于自测。socket ABI 提供 `socket/bind/connect/listen/accept/send/recv/sendto/recvfrom/shutdown/getsockname/getpeername`(以及旧式 `socketcall(102)`),fd 16–23 对应 8 个 socket 槽;`run net` 实测 ICMP ping 与 UDP DNS,`run tcp` 实测两条并发连接的握手/回显、真实 `getsockname/getpeername`,以及 `bind/listen/accept` 自连接的双向收发;启动时另跑一次纯内存乱序重排自检(`TCP-REORDER-OK`)。`-nic user,model=rtl8139` 才会启用。
 - 帧缓冲:ISO 引导在实模式设置 VBE 模式(优先 800×600×32,回退 1024×768×32 / 800×600×24/16),把 PhysBasePtr/分辨率/bpp/pitch 写到 `0x6F00`;内核在开分页后用 `mm_map_page` 以恒等、uncached 方式映射显存,`vga_*` 改为维护 80×25 影子单元数组并按 8×8 字模(纵向 2 倍)渲染;桌面/编辑器不再直接写 `0xB8000`,统一走 `vga_put_cell`。`-kernel` 路径无 VBE,自动保持 VGA 文本模式。
-- 像素 UI 原型:`pixel` 命令用 `fb_fill_rect/fb_pixel/fb_text` 画渐变桌面、两个带标题栏的窗口、任务栏,并按 PS/2 鼠标位置绘制/擦除箭头光标(保存光标下像素再恢复);ESC/q 返回文本 shell(先保存再恢复 80×25 影子网格)。这是视觉原型,不是窗口管理器(无 per-window 缓冲、裁剪栈与控件)。
+- 窗口管理器(源码 `wm.c`):`pixel` 命令进入 `wm_run()`,分配全屏 32-bit 屏幕缓冲与每个窗口的 body 后备缓冲;合成器按 z-order 画阴影/边框/标题栏/关闭按钮/任务栏,再 `fb_blit32` 一次性提交。四个窗口(Terminal/System/Editor/Widgets):标题栏拖动、关闭、点击聚焦置顶;文本窗口右侧有按内容比例伸缩的滚动条(点击/拖动轨道更新起始行),换行与逐行绘制由 `body_render_text` 处理;Widgets 窗口绘制两个按钮与单行输入框,按钮把消息追加到 Terminal 或清空日志,输入框接收键盘并以回车发送;ESC 退出并恢复 80×25 文本控制台。尚无裁剪栈、更多字体尺寸与列表控件。
 - `poll/select` 的**就绪检查**:文件/设备(含 `/dev/hda`)恒可读写,pipe 读端在缓冲区有数据时 `POLLIN`、无写端时 `POLLIN|POLLHUP`、写端在还有空间时 `POLLOUT`,stdin/console 仅在键盘缓冲已有字符时 `POLLIN`,坏 fd 返回 `POLLNVAL`。`poll/ppoll` 在用户进程里会真正阻塞(`PROC_WAIT_POLL`):唤醒方(pipe 写、键盘 IRQ、PIT 超时)用目标进程保存的 fd 表计算 `revents`,把结果写进它的内存并置 `eax`,再唤醒它;没有其他可运行进程时退回 `sti; hlt` 有界等待。`select/pselect6` 仍是即时扫描 + 有界等待,`pselect6/ppoll` 忽略 sigmask。
 - 阻塞 `read`:pipe 读端为空且仍有写端、stdin/console 无字符时,用户进程阻塞在 `PROC_WAIT_READ`;写端写数据或 `close`(最后一次 `pipe_writer_add`)、键盘 IRQ 会替它完成读取(直接写进它的沙箱内存并置 `eax`)。所有阻塞点都可被信号打断,返回 `-EINTR`。
 - 信号投递:每个进程有 `sig_pending/sig_blocked` 位图与 `signal/sigaction` 表;返回 Ring3 前或 tick 时投递,handler 运行在用户栈上的 sigframe,返回地址是内核窗口顶页的只读 trampoline(`mov eax,173; int 0x80`)或 libc 的 `SA_RESTORER`;`SIGKILL/SIGTERM/SIGINT/...` 默认终止(状态 128+sig),`SIGCHLD/SIGCONT/SIGWINCH` 默认忽略,`SIGKILL/SIGSTOP` 不可捕获/阻塞。

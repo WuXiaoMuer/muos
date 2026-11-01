@@ -257,10 +257,11 @@ USER_SIGTRAMP = 0x08847000
 ### 7.10 像素窗口管理器(wm.c;gui.c 仅保留旧原型)
 
 - `fb.c` 额外导出 `fb_pixel/fb_get_pixel/fb_fill_rect/fb_text/fb_palette`,按 bpp 读写任意像素;`mouse_get_pixels` 暴露 640×400 的原始鼠标坐标(文本桌面用的是 8×16 单元坐标)。
-- `pixel` 命令进入 `wm_run()`:运行时用 `mm_alloc_pages` 分配全屏 32-bit 后备缓冲(屏幕尺寸×4)与每个窗口的 body 后备缓冲(378×237×4);窗口结构保存位置/标题/文本/开关,`order[]` 是 z-order。
+- `pixel` 命令进入 `wm_run()`:运行时用 `mm_alloc_pages` 分配全屏 32-bit 后备缓冲(屏幕尺寸×4)与每个窗口的 body 后备缓冲(378×237×4);窗口结构保存位置/标题/文本/开关/滚动行/输入框,`order[]` 是 z-order;共 4 个窗口(Terminal/System/Editor/Widgets)。
 - 合成:先把渐变桌面写入屏幕缓冲,再按 z-order 画窗口阴影/边框/标题栏(焦点窗口蓝色)/关闭按钮,逐像素拷入该窗口 body 缓冲;底部任务栏显示操作提示;最后画 10×14 鼠标箭头并 `fb_blit32` 一次性提交(16/24/32bpp 都支持)。
-- 文本:`buf_text` 用 `font8x8_basic`,每个字模行重复两次得到 8×16;`body_render` 按窗口宽度换行并绘制绿色光标块。
-- 事件循环:每 10ms(PIT)读 `mouse_get_pixels`(640×400 缩放到屏幕)与按键;按下时按 z-order 命中窗口:关闭按钮关闭、标题栏开始拖动(下一次移动按偏移挪动并夹在屏内)、内容区聚焦并置顶;键盘字符/回车/退格写入焦点窗口并重绘其缓冲;ESC 退出。
+- 文本:`buf_text` 用 `font8x8_basic`,每个字模行重复两次得到 8×16;`body_render_text` 按窗口宽度预留右侧 10px 滚动条后换行,只绘制从 `scroll` 起的可见行并画绿色光标;`win_total_lines` 统计换行后的总行数,滚动条 thumb 高度按可视/总行数比例,点击或拖动轨道用 `scroll_drag` 反算起始行。
+- 控件:Widgets 窗口的 `body_render_widgets` 绘制两个按钮(Say Hello / Clear Log)与单行输入框(含光标);点击按钮通过 `widget_button_at` 命中后把消息写入 Terminal 日志或清空日志;Widgets 获得焦点时键盘写入输入框(退格/字符,回车同时接受 `\r` 与 `\n` 并把内容发送到 Terminal),其他窗口继续直接编辑文本。
+- 事件循环:每 10ms(PIT)读 `mouse_get_pixels`(640×400 缩放到屏幕)与按键;按下时按 z-order 命中窗口:关闭按钮关闭、标题栏开始拖动(下一次移动按偏移挪动并夹在屏内)、文本窗口右侧滚动条进入拖动、Widgets 按钮立即执行、内容区聚焦并置顶;ESC 退出。
 - 退出时保存的 80×25 文本单元经 `vga_put_cell` 恢复后 `vga_repaint()`。`-kernel`(无 VBE)下提示需要 ISO。
 
 ### 7.11 分区表与 FAT32 / ext2 读写(part.c / fat.c / ext2.c)
@@ -276,11 +277,11 @@ USER_SIGTRAMP = 0x08847000
 - SMEP:开分页后读 CPUID leaf0 最大叶号,leaf7.0 EBX bit7 置位时把 CR4 bit20 置 1;内核不执行用户页。
 - 弱 ASLR:`build_user_stack` 用 PIT tick 让栈顶下移 0..7 页;同时在栈上生成 16 字节随机数并以 `AT_RANDOM(25)` 传给 ld-mu,ld-mu 用它把首个共享库基址从 `0x08400000` 偏移 0..31 页。
 - ACPI:扫描 EBDA(0x40E 段)与 `0xE0000–0xFFFFF` 找 `RSD PTR `(校验 20 字节和),读 RSDT/XSDT 指针,遍历表项找 `FACP`(FADT),取 `pm1a_cnt_blk`。所有指针先用 `ram_ok` 校验落在恒等映射 RAM 内(SeaBIOS 的表可能位于 RAM 顶端保留区,直接解引用会内核页故障)。`poweroff` 向 PM1a 控制块写 `SLP_TYPa=5<<10 | SLP_EN(bit13)`,无 FADT 时回退 QEMU 端口 0x604/0xB004;`reboot` 走 8042 0xFE。
-- 未实现:uid/gid 强制、文件权限检查、UEFI、USB、音频、SMP。
+- 未实现:UEFI、USB HID/存储、音频、SMP;权限只覆盖 owner/group/other 的 rwx 与 root 绕过,无 ACL/能力集。
 
 ## 八、Shell / FS / 桌面
 
-- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;34 条命令 if/else 分发(命令表 `cmd_docs[]` 同时驱动分组 help、`help <cmd>` 详情与 Tab 补全;未知命令给出提示);`run [mode]` 运行内嵌 ELF(模式覆盖 fault/pie/dyn/tls/net/tcp/perm/fork/sched/thread/blkpoll/sig/poll/mmapfile/at/pipe/ata 等,`dyn` 先写 `/lib` 再跑动态程序),`desktop` 进入文本桌面、`pixel` 进入像素窗口管理器,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
+- **shell.c**:128 字节行编辑(方向键/历史/Tab 补全),`tokenize` 支持单双引号并保留引号内空格,MAX_ARGS=16 硬边界;35 条命令 if/else 分发(命令表 `cmd_docs[]` 同时驱动分组 help、`help <cmd>` 详情与 Tab 补全;未知命令给出提示);`run [mode]` 运行内嵌 ELF(模式覆盖 fault/pie/dyn/tls/net/tcp/perm/vfs/fork/sched/thread/blkpoll/sig/poll/mmapfile/at/pipe/ata 等,`dyn` 先写 `/lib` 再跑动态程序),`desktop` 进入文本桌面、`pixel` 进入像素窗口管理器,`exec <file>` 运行 RAM FS 中的 ELF,`mods`/`execmod <n> [args...]` 运行 Multiboot module。启动时把内嵌 ELF 复制为 `hello.elf`;`cat` 按 fd 流式输出完整 64KB 文件。
 - **fs.c**:16 文件槽 × 64KB + 16 目录槽;路径是相对 root 的多级字符串(如 `tmp/x`),`fs_mkdir/fs_rmdir/fs_dir_get/fs_parent_is_dir` 支持子目录、非空目录拒绝与直接子项枚举。文件槽位带 `refs` 与 `deleted` 标志:unlink 时若仍有 fd 打开则清空名字但保留数据,最后一个 `fs_unref` 才释放槽位;`fs_rename_dir` 整棵子树改名(先校验全部新名字长度、拒绝目标已存在/移入自身)。`fs_read_at/fs_write_at/fs_fd_truncate` 供系统调用层按偏移读写,`fs_rename` 可跨目录改名/覆盖(重名校验、父目录校验、内容保留)。
 - **MuFS 持久化(同一文件底部)**:磁盘布局 = 扇区 0 超级块(`MUFS` 魔数/版本/generation)、扇区 2–5 文件元数据表(16×88B)、扇区 6–8 目录元数据表(16×68B)、扇区 16 起 16 个 64KB 数据槽。`fs_persist_mount()` 在 `fs_init` 后调用:魔数/版本/槽参数匹配则读入命名空间与文件体,否则格式化为空;之后每个变更点(`create/write(_at)/truncate/delete/rename*/mkdir/rmdir/set_times/unref 释放`)调用 `persist_meta()` 并只写涉及的数据扇区(`persist_slot/persist_slot_range`)。`persist_meta()` 现在是写前日志提交:先把 meta/dir 副本写到扇区 10–12/13–15,再写扇区 9 的日志头(`MULJ` + generation),然后写真实元数据(扇区 2–4/6–8),最后清零日志头。`fs_persist_mount()` 在读取真实表之前先检查扇区 9:若日志头有效,就把副本重放回真实位置并清头,避免掉电时只写了一半的元数据。`fs_sync()` 递增 generation、重写超级块 + 全部元数据 + 全部已用槽;`fsync(118)/sync(36)` 调用它。无盘时 `persist_active=false`,全部是内存操作。槽位在最后一个 fd 关闭(`fs_unref`)且已删除时立即回收。
 - **editor.c**:128 行 × 79 列全屏编辑器;静态 10KB IO 缓冲(修复旧版 1KB 存盘截断),^S 保存 ^R 重载,PgUp/PgDn 翻页;运行时隐藏硬件光标、用反色单元作光标。
@@ -355,8 +356,8 @@ USER_SIGTRAMP = 0x08847000
 4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),但挂载面尚未提供删除/重命名/目录创建;ext2 支持创建/覆盖写入(位图分配、目录项插入、单级间接),但无删除/二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列;无窗口缩放选项,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
-7. 键盘仅 US QWERTY;PS/2 鼠标是文本模式粗粒度指针(按 8×16 单元),无滚轮/右键菜单/双击标题栏最大化
-8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 是合成器窗口管理器(每窗口后备缓冲 + 拖动/关闭/聚焦),但尚无滚动条/按钮/输入框等控件
+7. 键盘仅 US QWERTY;PS/2 鼠标在文本桌面按 8×16 单元粗粒度移动,在 `pixel` 中映射到像素坐标;无滚轮/右键菜单/双击标题栏最大化
+8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 是合成器窗口管理器(每窗口后备缓冲 + 拖动/关闭/聚焦 + 滚动条 + 按钮/输入框),但尚无裁剪栈、更多字体尺寸与列表控件
 9. 单处理器(PIC,非 APIC);用户进程由 IRQ0 抢占,内核 shell 本身仍在启动栈上协作运行
 10. 无内核栈溢出保护(16KB 栈,GUI 深调用链靠它撑着;用户态入口另有 8KB TSS 栈)
 11. 无 guard page / 无 KASLR / panic 信息只有寄存器 dump(有 -g,可 addr2line)
