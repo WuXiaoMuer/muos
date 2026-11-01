@@ -1,6 +1,6 @@
-# MuOS 代码逻辑(v1.2)
+# MuOS 代码逻辑(v1.3)
 
-本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、Ring3 用户态(int 0x80 + ELF32/ET_DYN)、每进程页目录 + 抢占调度、信号与 clone 线程、阻塞 poll/read、ATA 块设备、PS/2 鼠标 + RTC 桌面、88 项自检。演进计划见 ROADMAP.md。
+本文对应重构后的代码现状:multiboot mmap 解析、全 RAM 恒等映射、内核堆、Ring3 用户态(int 0x80 + ELF32/ET_DYN)、每进程页目录 + 按需分页 + 抢占调度、信号与 clone 线程、阻塞 poll/read、ATA 块设备、PS/2 鼠标 + RTC 桌面、88 项自检。演进计划见 ROADMAP.md。
 
 ## 一、总体结构
 
@@ -100,7 +100,7 @@ mm_init 末尾:for pfn in [0, total_pages):
 - 这消除了旧版"分配器发放 4MB 以上帧但分页只映射前 4MB"的失配——任何越线访问立刻 Page Fault(当年任务栈交接崩溃的真实根因,详见 §六)。
 - `mm_map_page` 返回 `bool_t`(拒绝重复映射/分配失败),`mm_virt_to_phys`/`mm_unmap_page` 是未来用户态的基础原语。
 - **higher-half 别名**:映射完 identity 后,把 PDE[0..255] 原样复制到 PDE[768..1023](`0xC0000000 + phys` 指向同一物理页)。内核镜像链接在 0xC0100000,物理装载在 0x100000;boot.s 用自举页目录(identity 0..8MB + PDE[768] -> 物理 0..4MB)完成这段切换。RAM 上限 1GB 正好用满 256 个别名 PDE。
-- 物理内存仍可通过 identity 地址直接访问(进程块 `p->mem`、页表、内核堆都返回物理地址),因此用户窗口占用的物理区间继续用 `mm_reserve_range` 预留。
+- 物理内存仍可通过 identity 地址直接访问(页表、内核堆、trampoline 页等内核结构都返回物理地址)。**用户页是例外**:它们只存在于进程私有页目录中,内核不再用恒等地址访问,而是 `mm_user_translate(pd, va)` 取物理地址(详见 §7.1)。
 
 ### 4.4 内核堆(kheap.c)
 
@@ -120,15 +120,15 @@ mm_init 末尾:for pfn in [0, total_pages):
 ## 六、任务模型(如实版)
 
 - **内核 shell(pid 1)不参与调度**:它直接跑在内核栈上,PIT 中断只 tick + 驱动用户进程抢占;`task_t` 仅作 `tasks`/`ps`/自检的 introspection。
-- **用户进程调度器**:`proc_t`(proc.c)固定 8 槽,每个进程/线程有独立 8MB 物理块 + 页目录 + 8KB TSS 内核栈;IRQ0 每 tick 调 `proc_sched_tick`,保存当前 Registers_t 现场并改写同一中断帧切换到下一个 READY 进程(`iret` 直接进入它)。无 READY 进程时,`proc_exit_current` 切回内核页目录并用 `user_kernel_esp_launch` 返回 shell。
-- 阻塞点(`wait4/waitid/poll/read/sigsuspend`)把进程标为 BLOCKED 后让出;唤醒方(子进程 exit、pipe 写/关、键盘 IRQ、PIT)直接把结果写进阻塞进程的保存现场(它的用户内存通过 `p->mem + (uva - USER_BASE)` 访问),或标记 READY 由调度器恢复。
+- **用户进程调度器**:`proc_t`(proc.c)固定 8 槽,每个进程/线程有私有页目录(用户页按需缺页)+ 8KB TSS 内核栈;IRQ0 每 tick 调 `proc_sched_tick`,保存当前 Registers_t 现场并改写同一中断帧切换到下一个 READY 进程(`iret` 直接进入它)。无 READY 进程时,`proc_exit_current` 切回内核页目录并用 `user_kernel_esp_launch` 返回 shell。
+- 阻塞点(`wait4/waitid/poll/read/sigsuspend`)把进程标为 BLOCKED 后让出;唤醒方(子进程 exit、pipe 写/关、键盘 IRQ、PIT)直接把结果写进阻塞进程的保存现场(它的用户内存通过 `proc_user_ptr` 的 PD 翻译访问,必要时先缺页/私有化),或标记 READY 由调度器恢复。
 - GDT 槽 3/4 是 Ring3 代码/数据段(0x1B/0x23),槽 5 是 TSS(0x28),槽 6 是 TLS(0x33)。
 
 ## 七、Ring3 用户态与系统调用
 
-### 7.1 沙箱为什么是固定地址
+### 7.1 沙箱为什么是固定地址,以及按需分页
 
-内核代码/数据跑在 higher-half,但物理内存仍保留全 RAM 恒等映射用于直接访问;用户窗口占用的物理区间必须从分配器里整段预留,避免与内核页冲突:
+内核代码/数据跑在 higher-half,物理内存保留全 RAM 恒等映射用于访问内核结构;但用户窗口是**纯虚拟**区间,物理页从通用 frame 池按需分配,不再整段预留:
 
 ```
 USER_BASE  = 0x08048000 (经典 Linux i386 ET_EXEC 地址)
@@ -136,11 +136,14 @@ USER_SIZE  = 8MB,末端 64KB 留给用户栈,最后一页是只读 sigreturn tra
 USER_SIGTRAMP = 0x08847000
 ```
 
-- `mm_init` 用 `mm_reserve_range(0x08000000, 0x08C00000)` 永久占用用户窗口的物理区间(包括所有可能的进程块)。
-- 每个进程 `proc_snapshot_alloc` 分配连续 8MB 物理块 + 一个 trampoline 页,`mm_create_user_pd(block, tramp)` 复制内核页目录后只改 PDE 32–34:窗口内 2047 页映射到该进程块(USER|RW),最后一页映射只读 trampoline;其余 PDE 与内核共享恒等映射。
-- 调度器 `mm_switch_pd(pd_phys)` 切 CR3;因此同一虚拟地址在不同进程指向不同物理块,内核仍可用恒等地址直接访问任意进程块(`p->mem`)。
+- `mm_create_user_pd(tramp_phys)`:复制内核页目录(内核 PDE 共享),把 PDE 32–34 的用户窗口项清零,只为 `USER_SIGTRAMP` 分配一个页表并映射只读 trampoline。进程刚创建时用户窗口**没有任何物理页**,`p->mem = NULL`、`mem_pages = 0`。
+- 首次访问(用户态取指/读写,或内核经 `proc_user_ptr` 写用户缓冲)触发 #PF:ISR 判定"当前 CR3 ≠ 内核页目录且 CR2 落在 `[USER_BASE, USER_SIGTRAMP)`",调 `mm_user_fault(pd, va, write)`。缺页处理按需分配页表(PDE 为空时)与零页帧,置 `USER|RW`,然后 iret 重试原指令。
+- 写故障命中只读页(COW)走 `mm_user_make_writable`:帧引用计数 >1 时新分配一页、memcpy、改 PTE;否则只恢复 RW 位。
+- fork 用 `mm_clone_user_pd` 复制父进程**当前** PTE(只为已映射页),`mm_user_write_protect` 两侧清 RW,并对每个已映射帧 `mm_page_ref_inc`;子进程未映射的页同样按需缺页。
+- `execve` 前 `proc_reset_current` → `mm_user_reset_pages`:遍历用户窗口逐页 `page_unref` 并清 PTE,释放全部旧页;新镜像的段再按需缺页装入。`run` 路径不再 memset 整段沙箱——那会一次性触发 2047 次缺页,等于退回整块分配。
+- 调度器 `mm_switch_pd(pd_phys)` 切 CR3;同一虚拟地址在不同进程指向不同物理页。内核不使用恒等地址访问用户页,而是 `mm_user_translate(pd, va)` 拿到物理地址(必要时先缺页/私有化)。
 
-代价:每个进程 8MB 物理块、最多 8 个进程/线程槽、要求 RAM > 128MB;收益:真正并发的进程地址空间,不需要搬移快照。higher-half 仍未做。
+收益:空闲进程几乎不占物理页,8 个槽位不再需要 64MB 常驻,也不再要求 RAM > 128MB;代价:首次访问有缺页开销,且尚无页面换出(swap)与文件页缓存。
 
 ### 7.2 进入/退出 Ring3(isr_stubs.s)
 
@@ -171,8 +174,8 @@ USER_SIGTRAMP = 0x08847000
 - `writev/readv` 按 iovec 顺序复用 `do_write/do_read`,部分成功时返回已处理字节数。musl 的 stdio 缓冲正是用 `writev` 刷出——这是 BusyBox `ls` 能打印的关键。
 - `sendfile64(239)` 从 in_fd(可选用户 offset 指针)读入内核缓冲并写 out_fd,更新偏移;BusyBox 的 fd 拷贝优先用它,失败再退回 read/write。
 - `poll/select` 就绪规则:`fd_read_ready` 中文件/VFILE/目录/`/dev/null|zero|hda` 恒真,pipe 读端看 `pipe_fill>0` 或无写端(EOF),stdin/console 看 `keyboard_haschar()`;`fd_write_ready` 中文件/stdio/console/null/zero/hda 恒真,pipe 写端看缓冲区未满。`poll(168)` 逐项填 `revents`(请求的 `POLLIN/POLLOUT`、pipe 无写端附加 `POLLHUP`、坏 fd 给 `POLLNVAL`)。
-- **阻塞 poll**:用户进程且当前有可运行目标时,`do_poll` 调 `proc_block_current_ext(PROC_WAIT_POLL, fds, nfds, deadline)` 后立即退回汇编 iret 到下一个进程;唤醒方 `proc_wake_pollers` 用 `user_fd_state_events(p->fd_state, fd, events)` 在**保存的 fd 表**上重算,把 `revents` 通过 `p->mem` 写进阻塞进程的用户数组,置 `p->eax=ready` 后标记 READY;PIT 到期 `proc_poll_expire` 置 0。没有其他可运行进程(或 pid1 shell)时退回旧的 `sti; hlt` 有界循环。
-- **阻塞 read**:pipe 读端为空且有写端、stdin 无字符时同样阻塞(`PROC_WAIT_READ`,记录 fd/缓冲/长度);`pipe_write/pipe_writer_add/读端消费` 与键盘 IRQ 调 `proc_wake_readers`,后者直接 `pipe_read` 到内核临时缓冲并 `memcpy` 进 `p->mem`,stdin 则取一个键盘字符,置 `eax`。信号会把这些等待以 `-EINTR` 唤醒。
+- **阻塞 poll**:用户进程且当前有可运行目标时,`do_poll` 调 `proc_block_current_ext(PROC_WAIT_POLL, fds, nfds, deadline)` 后立即退回汇编 iret 到下一个进程;唤醒方 `proc_wake_pollers` 用 `user_fd_state_events(p->fd_state, fd, events)` 在**保存的 fd 表**上重算,把 `revents` 经 `proc_user_ptr` 的 PD 翻译写进阻塞进程的用户数组,置 `p->eax=ready` 后标记 READY;PIT 到期 `proc_poll_expire` 置 0。没有其他可运行进程(或 pid1 shell)时退回旧的 `sti; hlt` 有界循环。
+- **阻塞 read**:pipe 读端为空且有写端、stdin 无字符时同样阻塞(`PROC_WAIT_READ`,记录 fd/缓冲/长度);`pipe_write/pipe_writer_add/读端消费` 与键盘 IRQ 调 `proc_wake_readers`,后者直接 `pipe_read` 到内核临时缓冲并 `memcpy` 进 `proc_user_ptr` 解析出的用户缓冲,stdin 则取一个键盘字符,置 `eax`。信号会把这些等待以 `-EINTR` 唤醒。
 - `select/_newselect` 按 32 位 fd_set 字就地置位/清零;`pselect6` 立即扫描 + 有界 PIT 等待,`ppoll` 复用阻塞 poll;`pselect6/ppoll` 忽略 sigmask;nfds 上限 1024。
 - `mmap` 是沙箱内模拟:匿名取 bump 区,文件映射把 RAM FS/`/proc` 快照按页拷入并零填充,`mmap2` 的 ebp 页号乘 4096,`MAP_FIXED` 校验页对齐与顶部 64KB 栈保留区;映射不写回,`munmap/mprotect` 为空操作。`truncate/ftruncate` 调用 `fs_truncate`(增长零填充、缩小只改 size),64 位变体在 hi 非零时返回 EFBIG;`fsync/fdatasync/sync` 因 RAM FS 已在内核内存中直接成功。
 - `nanosleep` 把秒/纳秒换算成 100Hz PIT tick,用 `sti; hlt; cli` 等待(不参与轮转,但中断仍可唤醒;换算全程 32 位避免 `__udivdi3`)。`times(43)` 返回启动以来 tick,`getrusage(77)` 校验 who 后清空 72 字节结构,`chown` 族复用 `do_chmod`/`do_fchmod` 只校验目标存在与类型,`readlink(85)` 对非符号链接返回 EINVAL。
@@ -187,9 +190,9 @@ USER_SIGTRAMP = 0x08847000
 - `PT_DYNAMIC`:遍历 `DT_REL/DT_RELSZ` 与 `DT_JMPREL/DT_PLTRELSZ`(i386 `Elf32_Rel`),支持 `R_386_RELATIVE`、`R_386_GLOB_DAT`、`R_386_JMP_SLOT`、`R_386_32`;符号未定义(需要共享库)或 `COPY/IRELATIVE/TLS` 时返回 `ELF_ERR_RELOC`。这是 `run pie` 能工作的关键。
 - `PT_INTERP`:读取解释器路径并回填 `elf32_load_info_t.interp`。`elf32_load_program` 在动态镜像只映射段、**不**应用重定位(交给用户态 ld.so);`user_load_for_exec` 随后按 `/lib/ld-mu.so`(MuFS 优先、内嵌 blob 回退)把解释器映射到 `USER_INTERP_BASE=0x08200000`,入口改为解释器 entry,`AT_BASE` 为其 load bias,`AT_ENTRY`/`AT_PHDR` 仍是主程序的值。
 - 初始栈的 auxv 由 `build_user_stack(argc,argv,li,interp_base)` 按 `AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_BASE/AT_ENTRY/AT_NULL` 写入。
-- 镜像由 build.ps1 用同一交叉编译器链接到 0x08048000,再用 `objcopy -I binary -O elf32-i386` 变成 `hello_elf.o` 链进内核(`_binary_hello_elf_start/end`);运行前整段 memset 清零,重复 `run` 安全。
+- 镜像由 build.ps1 用同一交叉编译器链接到 0x08048000,再用 `objcopy -I binary -O elf32-i386` 变成 `hello_elf.o` 链进内核(`_binary_hello_elf_start/end`);运行前先 `proc_reset_current` 释放旧用户页、由新镜像按需缺页装入,重复 `run` 安全。
 - 三个入口共用 `user_run_image_argv(image,size,argc,argv)`:`run` 用内嵌 blob,`exec <file>` 用 `fs_open` + `fs_fd_data/size` 从 RAM FS 读取,`execmod <n> [args...]` 用 Multiboot module。ELF 加载器只读源镜像,不依赖它在沙箱内。
-- `execmod` 先把模块镜像复制到 `mm_alloc_pages` 的连续内核页再清零沙箱;模块页在 mm_init 已预留,不会被堆/页表覆盖。
+- `execmod` 先把模块镜像复制到 `mm_alloc_pages` 的连续内核页,再交给 `user_exec_image`(内部先释放旧用户页);模块页在 mm_init 已预留,不会被堆/页表覆盖。
 
 ### 7.5 用户程序(user/)
 
@@ -217,10 +220,10 @@ USER_SIGTRAMP = 0x08847000
 ### 7.7 进程、线程与信号(proc.c)
 
 - `proc_t` 固定 8 槽:pid/ppid/tgid、state、exit_code/faulted、`proc_space_t*`(mem/pd/tramp/refs,`CLONE_VM` 线程共享)、8KB 独立内核栈(每线程一个)、fd 表(`proc_fdstate_t` 引用计数,`CLONE_FILES` 可共享)、cwd/brk/TLS、完整寄存器组、阻塞等待字段(poll fds/deadline/read fd)、信号字段(pending/blocked/handler/flags/restorer/sigframe 栈)。
-- `fork/clone`:分配槽位 + 内核栈;非 `CLONE_VM` 走**页级 COW**(`proc_space_cow`):克隆父进程当前页表(保留已 COW 的页映射)、两侧用户 PTE 清 RW、对每个已映射帧 `mm_page_ref_inc`;写故障在 `isr_handler` 里先于杀进程判定:用户在窗口内且错误码 bit1(写)→ `mm_user_make_writable`(帧引用>1 时分配新页 memcpy 并改 PTE,否则仅置 RW)后 iret 重试。内核经用户指针写(等待状态/poll revents/read 完成)走 `proc_user_ptr` 的 PD 翻译并先私有化,避免写到共享页。`execve` 前 `proc_detach_current` 把共享页全部私有化。`CLONE_VM` 只加地址空间引用并共享 `p->mem`;`CLONE_FILES` 共享 fd 表;`CLONE_SETTLS` 写入子线程 TLS;子线程 `eax=0`、`esp=stack`(由 `muos_thread_start` 预置),父进程返回 tid。`SIGCHLD` 语义由 wait4 处理。
+- `fork/clone`:分配槽位 + 内核栈;非 `CLONE_VM` 走**页级 COW**(`proc_space_cow`):克隆父进程当前页表(保留已 COW 的页映射)、两侧用户 PTE 清 RW、对每个已映射帧 `mm_page_ref_inc`;写故障在 `isr_handler` 里先于杀进程判定:用户在窗口内且错误码 bit1(写)→ `mm_user_make_writable`(帧引用>1 时分配新页 memcpy 并改 PTE,否则仅置 RW)后 iret 重试。内核经用户指针写(等待状态/poll revents/read 完成)走 `proc_user_ptr` 的 PD 翻译并先私有化,避免写到共享页。`execve` 前 `proc_reset_current` 释放全部用户页再按新镜像缺页装入。`CLONE_VM` 只加地址空间引用,子线程共享父页目录与已映射用户页;`CLONE_FILES` 共享 fd 表;`CLONE_SETTLS` 写入子线程 TLS;子线程 `eax=0`、`esp=stack`(由 `muos_thread_start` 预置),父进程返回 tid。`SIGCHLD` 语义由 wait4 处理。
 - `wait4/waitid`:先找 ZOMBIE 直接收尸;否则 `proc_block_current` 保存现场并切到下一个 READY;子进程 `proc_exit_current` 经 `proc_wake_parent` 把 status/siginfo 写进父进程内存并置 `parent->eax=pid`,父进程恢复后如同 syscall 正常返回。
 - `exit`:标记 ZOMBIE、释放 fd 快照引用、唤醒父进程;若无可运行进程则切回内核页目录并返回 shell。僵尸的地址空间在 `proc_reap`(父进程 wait 或 `proc_cleanup_children`)时按引用计数释放。
-- `execve(11)`:先把 path/argv 拷到内核,`vfs_lookup` 找到 RAM FS 文件,`elf32_validate` 预校验;`user_exec_image` 清空当前进程块、重载段+栈(保留 fd/cwd),再把 syscall 的 iret 帧改成新 entry/esp——同一个 pid 原地替换。
+- `execve(11)`:先把 path/argv 拷到内核,`vfs_lookup` 找到 RAM FS 文件,`elf32_validate` 预校验;`user_exec_image` 先 `proc_reset_current` 释放全部用户页,再装载段+栈(缺页时分配,保留 fd/cwd),再把 syscall 的 iret 帧改成新 entry/esp——同一个 pid 原地替换。
 - 信号:`proc_signal_send` 置 pending 位;若目标 BLOCKED,把 `eax=-EINTR`、清 wait_kind 并置 READY。`proc_signal_deliver` 在 syscall 返回前与 tick 中运行:handler 为空则执行默认动作(SIGKILL/SIGTERM 等终止,状态 128+sig;SIGCHLD/SIGCONT 忽略);有 handler 则把 12 个寄存器 + eip 存到用户栈(handler 栈之上),入口设为 handler、返回地址为 `USER_SIGTRAMP`(只读 `mov eax,173; int 0x80`)或 libc restorer,并记录 frame 供 `proc_sigreturn` 恢复。屏蔽位只推迟投递,不会丢弃 pending。
 - `sched_load` 恢复 CR3/TSS.esp0/fd 表/cwd/brk/TLS,并把 `registers_t` 全部改写后置 `frame_switched`;syscall/IRQ epilogue 的 `iret` 因此进入下一个进程。
 - `/proc` 目录由 proc 表动态生成 PID 子目录;`/proc/self` 解析为当前进程。`ps` 读取 `/proc/<pid>/stat` 与 `cmdline`;另有 `/proc/loadavg`、`/proc/stat`、`/proc/self/maps`。
@@ -350,7 +353,7 @@ USER_SIGTRAMP = 0x08847000
 
 ## 十一、已知局限(真实清单)
 
-1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;无按需分页/换出
+1. 用户窗口仍是**固定虚拟地址** `0x08048000`(每进程独立页目录,内核已 higher-half,但用户态无地址随机化);窗口大小构建期可配(`-SandboxMB`,默认 8MB),最多 8 个进程/线程槽;用户页按需分配,但无页面换出(swap)、无文件页缓存
 2. 调度器是单核 100Hz 轮转,无优先级/时间片配额;`nanosleep` 仍独占 CPU(不参与轮转);`kill` 的进程组语义只支持 pid/0/-1;等待唤醒路径上报的子进程要等父进程下一次 wait 才真正 reaped(`last_wait_pid`)
 3. 动态链接由自研 `ld-mu.so` 完成:SysV/GNU hash、`R_386_COPY`、`R_386_IRELATIVE`、静态 TLS(TPOFF/IE/LE/DTPMOD32/DTPOFF32 + 内建 `__tls_get_addr`)与 `.gnu.version`(VERSYM/VERDEF/VERNEED)已支持;仍未用真实 glibc/musl `.so` 端到端验证,遇到未知重定位会明确报错;`MAP_SHARED` 不写回;FAT32/ext2 已以 `/fat`、`/ext2` 接入 VFS(读写,整文件回写且单文件 64KB 上限),ext2 尚不支持删除与多级间接
 4. MuFS 是整槽布局(16×64KB,无块分配位图/碎片整理),只支持 16 文件 + 16 目录,元数据表每次全量重写(≈3 扇区),元数据提交有写前日志;FAT32/ext2 已挂载到 `open/read/write/stat/getdents`(O_CREAT/O_TRUNC;写为整文件回写,单文件 64KB 上限),但挂载面尚未提供删除/重命名/目录创建;ext2 支持创建/覆盖写入(位图分配、目录项插入、单级间接),但无删除/二级间接;FAT32 只识别第一个卷;网络仅 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免/4 段接收乱序队列;无窗口缩放选项,用户态 client/server 并发仍受内核态轮询不可抢占限制);VBE 帧缓冲只在自研 ISO 引导路径可用,`-kernel` 仍是 VGA 文本模式;显存按 uncached 恒等映射,桌面依旧是 80×25 字符网格(8×8 字模),并非真正的图形 UI

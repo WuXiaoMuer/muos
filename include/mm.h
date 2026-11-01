@@ -65,18 +65,21 @@ bool_t mm_user_map_range(uint32_t start, uint32_t end);
 /* Get page directory physical address */
 uint32_t mm_get_page_directory(void);
 
-/* Per-process user address spaces. Each process owns an 8MB physical
- * block mapped at USER_BASE through a private page directory. The kernel
- * identity map remains shared for every other range, so the physical
- * window [0x08000000,0x08C00000) is reserved for user mappings only. */
+/* Per-process user address spaces. Each process has a private page
+ * directory; the kernel identity map is shared for every other range. The
+ * user window itself is virtual-only (frames come from the general pool),
+ * so these macros only describe its 4MB-rounded bounds. */
 #define MM_USER_WINDOW_START 0x08000000u
-/* Reserve physical frames shadowed by the configured user window (rounded
- * up to a 4MB PDE boundary). */
 #define MM_USER_WINDOW_END   ((USER_END + 0x3FFFFFu) & ~0x3FFFFFu)
 
-/* The last page of the user window is left unmapped by the block and holds
- * a per-process sigreturn trampoline instead (read-only for user code). */
-uint32_t mm_create_user_pd(uint32_t block_phys, uint32_t tramp_phys);
+/* Per-process user address spaces are demand-paged: the page directory
+ * starts with only the sigreturn trampoline mapped and physical frames are
+ * allocated on the first touch (zero-filled) or on a COW write. */
+uint32_t mm_create_user_pd(uint32_t tramp_phys);
+/* Fault in (or privatize) the user page containing `va` in `pd_phys`. */
+bool_t   mm_user_fault(uint32_t pd_phys, uint32_t va, bool_t write);
+/* Unmap and release every user page (image replacement on execve). */
+void     mm_user_reset_pages(uint32_t pd_phys);
 /* Clone a user page directory (kernel PDEs shared, user PTEs copied into
  * fresh page tables) so COW'd remaps are preserved; gives the child its
  * own sigreturn trampoline page. */

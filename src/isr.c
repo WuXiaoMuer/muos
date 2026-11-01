@@ -54,15 +54,17 @@ static const char* hex32(uint32_t n, char* buf) {
 }
 
 void isr_handler(registers_t* regs) {
-    /* Copy-on-write: a write to a shared user page is resolved before any
-     * fault handling, whether the store came from Ring3 or from a syscall
-     * writing through a user pointer. */
-    if (regs->int_no == 14 && user_is_active() && (regs->err_code & 2)) {
+    /* Demand paging + copy-on-write for the live user address space.
+     * The check uses the *current* page directory (not user_is_active):
+     * execve loads the image before the process becomes active, and syscalls
+     * may write through user pointers while still in Ring0. */
+    if (regs->int_no == 14) {
         uint32_t cr2 = 0;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-        proc_t* p = proc_current();
-        if (p && p->pd_phys && cr2 >= USER_BASE && cr2 < USER_SIGTRAMP &&
-            mm_user_make_writable(p->pd_phys, cr2))
+        uint32_t cur = mm_get_current_pd();
+        if (cur && cur != mm_get_page_directory() &&
+            cr2 >= USER_BASE && cr2 < USER_SIGTRAMP &&
+            mm_user_fault(cur, cr2, (regs->err_code & 2) != 0))
             return;             /* iret retries the faulting instruction */
     }
 

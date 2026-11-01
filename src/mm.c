@@ -175,12 +175,9 @@ void mm_init(const multiboot_info_t* mb, uint32_t kernel_end) {
         }
     }
 
-    /* The virtual window used by per-process user mappings must never be
-     * handed out as kernel memory: while a process page directory is live,
-     * those virtual addresses map the process block, shadowing the identity
-     * map. Reserve the physical window permanently (fails harmlessly when
-     * RAM is smaller than the window). */
-    (void)mm_reserve_range(MM_USER_WINDOW_START, MM_USER_WINDOW_END);
+    /* User pages are allocated on demand from the general frame pool and
+     * mapped at arbitrary physical addresses, so no physical window is
+     * reserved anymore. */
 
     /* Allocate page directory */
     page_directory = (uint32_t*)mm_alloc_page();
@@ -398,12 +395,13 @@ bool_t mm_user_map_range(uint32_t start, uint32_t end) {
 
 /* ---- per-process user address spaces ---- */
 
-/* Build a page directory that shares every kernel mapping but maps the
- * process's 8MB block at USER_BASE with user permissions. The last page
- * of the block is replaced by a read-only sigreturn trampoline page so
- * signal delivery has a fixed user-space return path (like the vDSO). */
-uint32_t mm_create_user_pd(uint32_t block_phys, uint32_t tramp_phys) {
-    if (!block_phys || (block_phys & (PAGE_SIZE - 1))) return 0;
+static uint32_t* user_pte(uint32_t pd_phys, uint32_t va);
+
+/* Build an empty user page directory. Kernel mappings are shared; the user
+ * window PDEs start empty and pages are allocated on demand by
+ * mm_user_fault(). The last window page is the read-only sigreturn
+ * trampoline so signal delivery has a fixed user-space return path. */
+uint32_t mm_create_user_pd(uint32_t tramp_phys) {
     if (!tramp_phys || (tramp_phys & (PAGE_SIZE - 1))) return 0;
 
     uint32_t* pd = (uint32_t*)mm_alloc_page();
@@ -414,38 +412,60 @@ uint32_t mm_create_user_pd(uint32_t block_phys, uint32_t tramp_phys) {
     uint32_t last_pde  = (USER_END - 1) >> 22;
     for (uint32_t d = first_pde; d <= last_pde; d++) pd[d] = 0;
 
-    uint32_t pages = USER_SIZE / PAGE_SIZE;
-    for (uint32_t i = 0; i + 1 < pages; i++) {
-        uint32_t va = USER_BASE + i * PAGE_SIZE;
-        uint32_t pde = va >> 22;
-        uint32_t pti = (va >> 12) & 0x3FF;
-        if (!(pd[pde] & PDE_PRESENT)) {
-            uint32_t* pt = (uint32_t*)mm_alloc_page();
-            if (!pt) {
-                mm_free_user_pd((uint32_t)pd);
-                return 0;
-            }
-            for (uint32_t j = 0; j < 1024; j++) pt[j] = 0;
-            pd[pde] = (uint32_t)pt | PAGE_KERNEL | PDE_USER;
-        }
-        uint32_t* pt = (uint32_t*)(pd[pde] & PAGE_MASK);
-        pt[pti] = (block_phys + i * PAGE_SIZE) | PAGE_KERNEL | PTE_USER;
-    }
-
     /* Last page: sigreturn trampoline, user-readable but not writable. */
     uint32_t tva = USER_SIGTRAMP;
     uint32_t tpde = tva >> 22;
     uint32_t tpti = (tva >> 12) & 0x3FF;
-    if (!(pd[tpde] & PDE_PRESENT)) {
-        uint32_t* pt = (uint32_t*)mm_alloc_page();
-        if (!pt) { mm_free_user_pd((uint32_t)pd); return 0; }
-        for (uint32_t j = 0; j < 1024; j++) pt[j] = 0;
-        pd[tpde] = (uint32_t)pt | PAGE_KERNEL | PDE_USER;
-    }
-    uint32_t* tpt = (uint32_t*)(pd[tpde] & PAGE_MASK);
+    uint32_t* tpt = (uint32_t*)mm_alloc_page();
+    if (!tpt) { mm_free_user_pd((uint32_t)pd); return 0; }
+    for (uint32_t j = 0; j < 1024; j++) tpt[j] = 0;
+    pd[tpde] = (uint32_t)tpt | PAGE_KERNEL | PDE_USER;
     tpt[tpti] = tramp_phys | PTE_PRESENT | PTE_USER;
 
     return (uint32_t)pd;
+}
+
+/* Demand paging: map a fresh zero page for an absent user address, or
+ * privatize a COW page on write. The kernel can reach the frame through
+ * the identity map, so no user VA/PA relationship is required. */
+bool_t mm_user_fault(uint32_t pd_phys, uint32_t va, bool_t write) {
+    if (!pd_phys || va < USER_BASE || va >= USER_SIGTRAMP) return false;
+    (void)write;
+
+    uint32_t* pd = (uint32_t*)pd_phys;
+    uint32_t d = va >> 22;
+    if (!(pd[d] & PDE_PRESENT)) {
+        uint32_t* pt = (uint32_t*)mm_alloc_page();
+        if (!pt) return false;
+        for (uint32_t i = 0; i < 1024; i++) pt[i] = 0;
+        pd[d] = (uint32_t)pt | PAGE_KERNEL | PDE_USER;
+    }
+    uint32_t* pte = (uint32_t*)(pd[d] & PAGE_MASK);
+    pte = &pte[(va >> 12) & 0x3FF];
+
+    if (!(*pte & PTE_PRESENT)) {
+        uint32_t frame = (uint32_t)mm_alloc_page();
+        if (!frame) return false;
+        memset((void*)frame, 0, PAGE_SIZE);
+        *pte = frame | PAGE_KERNEL | PTE_USER | PTE_WRITABLE;
+        if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
+        return true;
+    }
+    if (!write || (*pte & PTE_WRITABLE)) return true;
+    return mm_user_make_writable(pd_phys, va);
+}
+
+/* Drop every user page (execve image replacement). Page tables stay
+ * allocated and are reused by later faults. */
+void mm_user_reset_pages(uint32_t pd_phys) {
+    if (!pd_phys) return;
+    for (uint32_t va = USER_BASE; va < USER_SIGTRAMP; va += PAGE_SIZE) {
+        uint32_t* pte = user_pte(pd_phys, va);
+        if (!pte || !(*pte & PTE_PRESENT)) continue;
+        page_unref((*pte & PAGE_MASK) >> PAGE_SHIFT);
+        *pte = 0;
+    }
+    if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
 }
 
 void mm_free_user_pd(uint32_t pd_phys) {

@@ -214,9 +214,9 @@ muos> poweroff            # ACPI S5 关机(无 FADT 时用 QEMU 0x604/0xB004 端
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```
 
-hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用,`run p1` 验证目录改名、打开后 unlink、pipe HUP、超时等待与 `waitid`。`run sig/thread/blkpoll` 覆盖 P2 的进程模型,`run pie` 覆盖 P3 的 ET_DYN 装载,`run dyn` 覆盖 P3 的动态链接(PT_INTERP → ld-mu.so → libmu.so),`run tls` 覆盖静态 TLS(主程序 local-exec、库 initial-exec 与 global-dynamic `__tls_get_addr`),`run ata` 覆盖 P4 的 ATA 块设备(配合 `build/test_ata.py` 做两次启动的持久化验证),`run net` 覆盖 P4 的网卡与 socket ABI(ICMP ping + UDP DNS),`run tcp` 覆盖 TCP 握手/双连接回显/真实 socket 名/accept 自连接,`pixel` 启动像素窗口管理器(仅 ISO 路径;三个窗口、拖动/关闭/聚焦、任务栏与鼠标箭头)。
+hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用,`run p1` 验证目录改名、打开后 unlink、pipe HUP、超时等待与 `waitid`。`run sig/thread/blkpoll` 覆盖 P2 的进程模型,`run pie` 覆盖 P3 的 ET_DYN 装载,`run dyn` 覆盖 P3 的动态链接(PT_INTERP → ld-mu.so → libmu.so),`run tls` 覆盖静态 TLS(主程序 local-exec、库 initial-exec 与 global-dynamic `__tls_get_addr`),`run ata` 覆盖 P4 的 ATA 块设备(配合 `build/test_ata.py` 做两次启动的持久化验证),`run net` 覆盖 P4 的网卡与 socket ABI(ICMP ping + UDP DNS),`run tcp` 覆盖 TCP 握手/双连接回显/真实 socket 名/accept 自连接,`pixel` 启动像素窗口管理器(仅 ISO 路径;四个窗口、拖动/关闭/聚焦、滚动条、按钮/输入框、任务栏与鼠标箭头)。
 
-- 用户地址空间固定为 `0x08048000` 起 8MB 的**虚拟**窗口(经典 Linux i386 ET_EXEC 地址),但每个进程拥有独立 8MB 物理块和页目录:分配时仅该窗口的 PDE 32–34 指向进程块,其余 PDE 与内核页目录共享恒等映射;调度器切换 CR3 即可切换进程。窗口最后一页是内核提供的只读 sigreturn trampoline(类似 vDSO)。
+- 用户地址空间固定为 `0x08048000` 起 8MB 的**虚拟**窗口(经典 Linux i386 ET_EXEC 地址),每个进程拥有**私有页目录**,但**不再预分配 8MB 物理块**:页目录初始只映射只读 sigreturn trampoline,其余页在首次访问时由缺页处理分配零页(按需分页);调度器切换 CR3 即可切换进程。fork 用页级 COW 共享已有物理页,exec 前释放全部用户页再按新镜像重新缺页装入。
 - 进入 Ring3 使用 TSS.esp0 切换内核栈;`int 0x80`(DPL3 门)按 Linux i386 ABI 分发(eax=号,ebx/ecx/edx 传参);Ring3 进程可被 IRQ0 抢占,`wait4/waitid/poll/read` 阻塞时让出 CPU;退出/故障时若无其他可运行进程则恢复 `user_enter` 保存的内核上下文返回 Shell。
 - 已实现调用(按用途分组):
   - 进程/stdio:`exit(1)`、`exit_group(252)`、`fork(2)`、`vfork(190)`、`clone(120,支持 CLONE_VM/FILES/SIGHAND/THREAD/SETTLS/PTID/CTID)`、`waitpid(7)`、`wait4(114)`、`waitid(284)`、`execve(11)`、`pipe(42)`、`pipe2(331)`、`poll(168)/ppoll(309,阻塞)`、`select(82)`、`_newselect(142)`、`pselect6(308)`、`kill(37,真实投递)`、`getpid(20)`、`getppid(64)`、`gettid(224)`、`setpgid/getpgrp/setsid/getpgid/getsid`、`read(3)`、`write(4)`、`readv(145)`、`writev(146)`、uid/gid 及其 32 位变体(24/47/49/50、199-202)、`getgroups(80/205)`;`close(6)` 可关闭 0/1/2
@@ -240,7 +240,7 @@ hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname
 - `nanosleep` 在单进程/没有其他可运行进程时用 `sti; hlt` 等 PIT tick(100Hz),整机暂停到时间到期;`times` 返回 tick 数,`getrusage` 返回全零结构,`chown/lchown/fchown/fchownat` 只校验目标(不跟踪所有权),`readlink` 对非符号链接返回 `EINVAL`。
 - `*at` 路径解析:绝对路径忽略 dirfd;相对路径在 `AT_FDCWD(-100)` 时按 cwd,在目录 fd 时拼接该 fd 的绝对路径;`fstatat64` 空路径 + `AT_EMPTY_PATH` 直接 stat dirfd,`unlinkat` 的 `AT_REMOVEDIR` 走 rmdir 语义。VFS 暂无符号链接,`readlinkat` 对已存在目标返回 `EINVAL`。
 - 路径统一规范化:支持绝对/相对路径、`.` 与 `..`(父目录越界时停在 `/`)。命名空间 = 扁平 RAM FS 根目录 + `/dev`、`/proc`、`/etc` 虚拟目录;`open` 支持 `O_CREAT/O_TRUNC/O_DIRECTORY`。
-- 沙箱要求物理 RAM > 128MB;ISO 路径现在通过自建 E820 info 获得真实内存图,内存足够时 `exec` 可正常运行,内存不足时才提示并优雅拒绝。沙箱大小在构建期可配(`-SandboxMB`,默认 8);fork 使用页级 COW(帧引用计数 + 写故障内存复制),但尚无按需分页/页面换出。
+- 沙箱要求物理 RAM > 128MB;ISO 路径现在通过自建 E820 info 获得真实内存图,内存足够时 `exec` 可正常运行,内存不足时才提示并优雅拒绝。沙箱大小在构建期可配(`-SandboxMB`,默认 8);fork 使用页级 COW(帧引用计数 + 写故障内存复制),用户页按需分配(缺页时零页装入),尚无页面换出/swap。
 
 ## 真实 Linux 二进制(BusyBox)
 
@@ -286,7 +286,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 注意:
 - BusyBox 静态包约 1MB,OS 模块只接受外部 `-initrd`,不放进 64KB RAM FS。
-- RAM FS 已支持多级目录(`mkdir/rmdir`、`mkdir -p`、跨目录 `cp/mv`),虚拟 `/dev`、`/proc`、`/etc`、`/bin` 只读;`*at` 族支持 dirfd 相对路径,目录 `rename` 整棵子树改名。进程是**每进程地址空间 + 抢占并发**:fork 复制 8MB 物理块,子进程立即运行;`clone(CLONE_VM)` 支持线程,`kill` 真实投递信号(含 SIGTERM/SIGKILL 默认终止)。
+- RAM FS 已支持多级目录(`mkdir/rmdir`、`mkdir -p`、跨目录 `cp/mv`),虚拟 `/dev`、`/proc`、`/etc`、`/bin` 只读;`*at` 族支持 dirfd 相对路径,目录 `rename` 整棵子树改名。进程是**每进程地址空间 + 抢占并发**:fork 页级 COW 共享物理页、用户页按需缺页分配;`clone(CLONE_VM)` 支持线程,`kill` 真实投递信号(含 SIGTERM/SIGKILL 默认终止)。
 - BusyBox shell 已能通过虚拟 `/bin/<applet>` → BusyBox 模块执行外部 applet,并跑通管道:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`(管道读端为空时会阻塞,直到写端写入或关闭)。`pipe/pipe2` 是 8 个 4KB 环形缓冲,管道写满会截断返回部分写入。
 - 时间戳来自 CMOS RTC。无磁盘时文件系统是纯 RAM(重启丢失);带 `-drive` 时 MuFS 把命名空间与文件数据写到盘上,`date`/`ls -l`/`stat` 显示真实时间,`touch`/`utimensat` 会实际修改 atime/mtime 并持久化。
 - MuFS 布局:扇区 0 超级块(`MUFS` 魔数 + 版本 + generation),扇区 2–8 文件/目录元数据表,扇区 16 起每槽 128 扇区(64KB)。每次 `create/write/truncate/delete/rename/mkdir` 都写穿元数据表,数据只写涉及的扇区;`fsync(118)/sync(36)` 触发全量刷新。磁盘首次使用时自动格式化。
@@ -326,7 +326,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 | `int 0x80` 里 read 键盘死锁 | 中断门自动清 IF,键盘环形缓冲永远进不了数据 | `keyboard_getchar` 内部 `sti; hlt; cli` 等待(本次直接复用) |
 | 用户页置了 PTE_USER 仍不可访问 | U/S 检查同时看 PDE,页目录项还是 supervisor | `mm_user_map_range` 同时置 PDE_USER/PTE_USER 并重载 CR3 |
 | 用户程序退出后内核栈/寄存器错乱 | 同特权级 iret 不会恢复 ESP/SS | `user_enter` 保存 callee-saved + ESP,`user_return_to_kernel` 恢复后 ret |
-| 用户 ELF 地址与内核物理页冲突 | 恒等映射下 VA=PA,沙箱页必须先物理预留 | `mm_reserve_range` 一次性占用 8MB 沙箱,分配器不再发放 |
+| 用户 ELF 地址与内核物理页冲突 | 早期恒等映射下 VA=PA,沙箱页必须先物理预留 | 改为按需分页:用户窗口只映射 trampoline,缺页时从通用帧池分配并以任意物理地址映射 |
 | 编辑器底栏右侧出现别的字符串 | `draw_help` 按 i=0..78 无条件索引字符串,越过 `\0` 读到 .rodata 下一条字面量 | 先 `strlen`,超界补空格(见 editor.c) |
 | 键盘/鼠标中断偶发丢事件 | kbd_irq_handler 和 irq.c 都发 EOI(双重 EOI 会提前放行低优先级 IRQ) | EOI 只在 irq.c 发一次;IRQ12 走同一 8042 路由并解蔽 IRQ2 级联 |
 | 鼠标数据被当键盘扫描码 / 鼠标无反应 | 8042 输出缓冲共用,状态位 bit5 才标识 aux;未解蔽 IRQ12/IRQ2 | keyboard.c 统一 drain,按 bit5 分流 `mouse_handle_byte`;初始化时同步读掉 ACK |
@@ -340,7 +340,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 | `df` 只打印表头(`can't find mount point`) | BusyBox 跳过 `rootfs` 行,需要真实设备名 | `/proc/mounts` 与 `/etc/mtab` 输出 `/dev/root / ext2`、`proc /proc`、`devtmpfs /dev` |
 | `dd` 报 `can't duplicate file descriptor` | dd 会 `dup2(if_fd, 0)`,旧实现把 0/1/2 当作固定 stdio | fd 表统一管理 0..10,`dup/dup2` 复制任意条目(含 stdio 重定向) |
 | `ps` 打印表头后 Page Fault | `/proc/<pid>/stat` 字段数不足且缺少尾随空格,解析器越过字符串扫到 `USER_END` | 输出 Linux 的 52 字段并以空格结尾 |
-| fork 子进程不并发,只在 waitpid 时运行 | 早期只有单地址空间,两个 8MB 沙箱无法同时映射 | 每进程 8MB 物理块 + 私有页目录(PDE 32–34)+ CR3 切换;tick 抢占调度 |
+| fork 子进程不并发,只在 waitpid 时运行 | 早期只有单地址空间 | 每进程私有页目录 + CR3 切换;页级 COW 共享物理页;tick 抢占调度 |
 | 信号返回后进程崩溃/栈被踩 | 早期打算把 trampoline 也压进用户栈,handler 的向下栈增长会覆盖它 | 窗口最后一页映射只读 trampoline(vDSO 方案);sigframe 存在 handler 栈之上 |
 | `clone` 线程一启动就 `ret` 到野地址 | 子线程的 esp 没有返回地址,直接复用父栈 | 汇编 `muos_thread_start` 在子栈上先放参数,子线程 `call fn(arg)` 后 exit |
 | higher-half 内核一启动就三重故障 | e_entry 写成 0xC0100000,而装载器/CPU 关分页时跳到虚拟地址;或只映射了高半区却没保留 identity | `ENTRY(entry_phys)` 让 e_entry=0x100000;boot.s 保留 0..8MB identity 映射,再用绝对地址跳高半区;mm_init 建立全 RAM 的 0xC0000000 别名 |
@@ -350,7 +350,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 ## 版本
 
-当前 **v1.3**(2026-10-31):在 v1.2 的 Ring3/TSS/`int 0x80`/ELF32 加载器与 RAM FS 基础上,已加入 **higher-half 内核(0xC0100000)**、每进程页目录 + 抢占调度、**页级 COW fork** 与可配置沙箱(`-SandboxMB`)、信号与 `clone` 线程、**ATA PIO + MuFS 持久化(元数据日志)**、MBR/GPT + **FAT32 读写(含长名创建)** 与 **ext2 读写(创建/覆盖)**、**PT_INTERP 动态链接 + 静态 TLS + 符号版本化**、RTL8139 + ARP/ICMP/UDP/DHCP + **TCP 8 段发送队列/退避/拥塞窗口 + 接收乱序重排 + 对端窗口**、**uid/gid 与文件权限检查**、SMEP + 弱 ASLR、**ACPI 关机/重启**、**VBE 帧缓冲 + 8×16 字体 + 合成器窗口管理器(`pixel`)**。v1.3 同时把 Shell 帮助重写为分组命令表(`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示),启动/`logo` 界面升级为带边框、渐变与投影的立体 MuOS 字标,桌面命令统一为 `desktop`(保留 `gui` 别名),ext2 增加创建/覆盖写入(块与 inode 位图分配、目录项插入),FAT32/ext2 以 `/fat`、`/ext2` 挂载接入 VFS(open/read/write/stat/getdents,O_CREAT/O_TRUNC,写为整文件回写),并提供批处理启动模式与 `release.bat` 打包。
+当前 **v1.3**(2026-10-31):在 v1.2 的 Ring3/TSS/`int 0x80`/ELF32 加载器与 RAM FS 基础上,已加入 **higher-half 内核(0xC0100000)**、每进程页目录 + 抢占调度、**页级 COW fork** 与可配置沙箱(`-SandboxMB`)、**用户页按需分页**、信号与 `clone` 线程、**ATA PIO + MuFS 持久化(元数据日志)**、MBR/GPT + **FAT32 读写(含长名创建)** 与 **ext2 读写(创建/覆盖)**、**PT_INTERP 动态链接 + 静态 TLS + 符号版本化**、RTL8139 + ARP/ICMP/UDP/DHCP + **TCP 8 段发送队列/退避/拥塞窗口 + 接收乱序重排 + 对端窗口**、**uid/gid 与文件权限检查**、SMEP + 弱 ASLR、**ACPI 关机/重启**、**VBE 帧缓冲 + 8×16 字体 + 合成器窗口管理器(`pixel`)**。v1.3 同时把 Shell 帮助重写为分组命令表(`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示),启动/`logo` 界面升级为带边框、渐变与投影的立体 MuOS 字标,桌面命令统一为 `desktop`(保留 `gui` 别名),ext2 增加创建/覆盖写入(块与 inode 位图分配、目录项插入),FAT32/ext2 以 `/fat`、`/ext2` 挂载接入 VFS(open/read/write/stat/getdents,O_CREAT/O_TRUNC,写为整文件回写),并提供批处理启动模式与 `release.bat` 打包。
 
 **v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)** → **MuFS 持久化文件系统(ATA 写穿 + 开机挂载)** → **动态链接:`PT_INTERP` + 用户态 `ld-mu.so`(`DT_NEEDED`/SysV hash 符号解析/共享库映射)** → **RTL8139 + ARP/IPv4/ICMP/UDP 与 socket ABI** → **VBE 线性帧缓冲文本控制台(ISO 引导 800×600×32)** → **DHCP 自动配置 + 最小 TCP(SOCK_STREAM)与回环** → **`.gnu.hash`/`R_386_COPY` 支持 + 像素桌面原型(`pixel`)**。
 

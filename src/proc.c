@@ -46,27 +46,26 @@ static bool_t proc_space_alloc(proc_t* p) {
     proc_space_t* s = kmalloc(sizeof(*s));
     if (!s) return false;
     memset(s, 0, sizeof(*s));
-    s->mem_pages = USER_SIZE / PAGE_SIZE;
-    s->mem = mm_alloc_pages(s->mem_pages);
-    if (!s->mem) { kfree(s); return false; }
+    /* Demand paging: no physical block is reserved; pages are allocated on
+     * first touch by mm_user_fault(). */
+    s->mem = NULL;
+    s->mem_pages = 0;
     s->tramp_phys = (uint32_t)mm_alloc_page();
     if (!s->tramp_phys) {
-        mm_free_pages(s->mem, s->mem_pages);
         kfree(s);
         return false;
     }
     write_sig_trampoline(s->tramp_phys);
-    s->pd_phys = mm_create_user_pd((uint32_t)s->mem, s->tramp_phys);
+    s->pd_phys = mm_create_user_pd(s->tramp_phys);
     if (!s->pd_phys) {
         mm_free_page((void*)s->tramp_phys);
-        mm_free_pages(s->mem, s->mem_pages);
         kfree(s);
         return false;
     }
     s->refs = 1;
     p->space = s;
-    p->mem = s->mem;
-    p->mem_pages = s->mem_pages;
+    p->mem = NULL;
+    p->mem_pages = 0;
     p->pd_phys = s->pd_phys;
     return true;
 }
@@ -78,8 +77,8 @@ bool_t proc_space_cow(proc_t* child, proc_t* parent) {
     proc_space_t* s = kmalloc(sizeof(*s));
     if (!s) return false;
     memset(s, 0, sizeof(*s));
-    s->mem = parent->mem;
-    s->mem_pages = parent->mem_pages;
+    s->mem = NULL;
+    s->mem_pages = 0;
     s->tramp_phys = (uint32_t)mm_alloc_page();
     if (!s->tramp_phys) { kfree(s); return false; }
     uint8_t* t = (uint8_t*)s->tramp_phys;
@@ -103,8 +102,8 @@ bool_t proc_space_cow(proc_t* child, proc_t* parent) {
 
     s->refs = 1;
     child->space = s;
-    child->mem = s->mem;
-    child->mem_pages = s->mem_pages;
+    child->mem = NULL;
+    child->mem_pages = 0;
     child->pd_phys = s->pd_phys;
     return true;
 }
@@ -120,8 +119,8 @@ bool_t proc_space_share(proc_t* child, proc_t* parent) {
     if (!child || !parent || !parent->space) return false;
     child->space = parent->space;
     parent->space->refs++;
-    child->mem = parent->mem;
-    child->mem_pages = parent->mem_pages;
+    child->mem = NULL;
+    child->mem_pages = 0;
     child->pd_phys = parent->pd_phys;
     return true;
 }
@@ -222,7 +221,7 @@ proc_t* proc_alloc(const char* name, uint32_t ppid) {
         procs[i].tgid = procs[i].pid;
         procs[i].state = PROC_READY;
         procs[i].start_ticks = pit_get_ticks();
-        procs[i].mem_pages = USER_SIZE / PAGE_SIZE;
+        procs[i].mem_pages = 0;
         procs[i].fs_sel = 0x23;
         procs[i].gs_sel = 0x23;
         strncpy(procs[i].name, name ? name : "app", PROC_NAME_MAX - 1);
@@ -609,15 +608,24 @@ bool_t proc_sigreturn(registers_t* regs) {
 static uint8_t* proc_user_ptr(proc_t* p, uint32_t uptr) {
     if (!p || uptr < USER_BASE || uptr >= USER_END) return NULL;
     if (p->pd_phys) {
-        /* Wakeup writers go through the target process's page table so a
-         * COW page is privatized before the kernel writes into it. */
-        mm_user_make_writable(p->pd_phys, uptr);
+        /* Wakeup writers go through the target process's page table: this
+         * also demand-faults a not-yet-touched page and privatizes COW pages
+         * before the kernel writes into it. */
+        if (!mm_user_fault(p->pd_phys, uptr, true)) return NULL;
         uint32_t phys = mm_user_translate(p->pd_phys, uptr);
         if (!phys) return NULL;
         return (uint8_t*)phys;
     }
     if (!p->mem) return NULL;
     return (uint8_t*)((uint32_t)p->mem + (uptr - USER_BASE));
+}
+
+/* Discard the live user image (execve): shared COW pages are just unref'd. */
+bool_t proc_reset_current(void) {
+    proc_t* p = proc_current();
+    if (!p || !p->pd_phys) return false;
+    mm_user_reset_pages(p->pd_phys);
+    return true;
 }
 
 /* Evaluate a blocked poller's fd array through its saved fd table and

@@ -18,10 +18,10 @@
 - `src/syscall.c` 已定义 **120+ 个 Linux i386 系统调用号**,覆盖进程/stdio、信号、文件与目录(`*at`)、管道、poll/select、mmap(匿名+文件)、stat/statfs、时间/RTC、rlimit、chown/chmod、nanosleep。
 - 真实 Alpine 静态 i386 BusyBox 1.36.1(musl)可运行:`ls/cat/ps/free/df/dd/mkdir/touch/cp/mv/rm/chown/sleep/ulimit/sh` 与 shell 管道实测通过。
 - 验证用例:`run`(内嵌 ELF)、`run pie`(ET_DYN/PIE)、`run dyn`(PT_INTERP + 共享库 libmu.so)、`run tls`(静态 TLS:initial-exec + global-dynamic)、`run net`(RTL8139 + ICMP/UDP socket ABI)、`run tcp`(双连接回显 + 真实 getsockname/getpeername + listen/accept 自连接)、`part/fatls/fatcat/fatwrite/ext2ls/ext2cat/ext2write`(MBR/GPT FAT32 与 ext2 读写)、`run vfs`(/fat、/ext2 挂载的 open/read/write/stat/getdents64,`tools/test_fs_read.py`)、`exec hello.elf`、`run fork/pipefork/execbin/sched`、`run sig`(信号)、`run thread`(CLONE_VM 线程)、`run blkpoll`(阻塞 poll)、`run at/mmapfile/poll/extra/p1`、`run ata` + `run ataread`(两次启动验证磁盘持久化)。ISO 路径额外用 QMP `screendump` 验证 VBE 文本渲染。
-- 进程模型:每进程页目录 + 独立 8MB 物理块、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
+- 进程模型:每进程页目录 + **按需分页用户窗口**(首次访问分配零页,无预分配物理块)、Ring3 抢占式轮转调度、`clone` 线程(共享地址空间/fd 表)、信号投递(pending/blocked、handler + sigreturn trampoline、默认动作)、阻塞 `wait4/waitid/poll/read`。
 - 内核为 **higher-half**(链接 0xC0100000,物理装载 0x100000,引导期自举页表 + 全 RAM 0xC0000000 别名)。
 - 持久化:ATA 块设备 `/dev/hda` + **MuFS**(超级块/元数据表/64KB 数据槽,写穿 + 开机挂载),`tools/test_ata.py` 两次启动验证文件与裸扇区数据都保留。
-- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持,仍未用真实 glibc/musl `.so` 端到端验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列与对端窗口,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB,挂载面删除/重命名/目录创建尚未提供;ext2 支持创建/覆盖写入(位图分配、目录项插入、单级间接),但无删除/多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;无按需分页;UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
+- 仍有限制:动态链接器是自研 `ld-mu.so`(SysV/GNU hash、COPY、IRELATIVE、静态 TLS 与 `.gnu.version` 已支持,仍未用真实 glibc/musl `.so` 端到端验证);网络是 RTL8139 + ARP/ICMP/UDP/DHCP + TCP(8 段发送队列/RTO 退避/慢开始+拥塞避免、接收端 4 段乱序队列与对端窗口,用户态 client/server 并发仍受内核态轮询不可抢占限制);FAT32/ext2 已以 `/fat`、`/ext2` 挂载进 VFS(open/read/write/stat/getdents,O_CREAT/O_TRUNC),写路径为整文件回写且单文件上限 64KB,挂载面删除/重命名/目录创建尚未提供;ext2 支持创建/覆盖写入(位图分配、目录项插入、单级间接),但无删除/多级间接;MuFS 有元数据写前日志但无块分配位图/碎片整理;无页面换出;UEFI/USB/音频/SMP 未实现;帧缓冲仅在 ISO 引导路径可用(`-kernel` 仍是 VGA 文本模式),`pixel` 是像素窗口管理器。
 
 ## 后续计划(建议顺序)
 
@@ -33,9 +33,10 @@
 - [x] `poll` 的真正阻塞等待(`PROC_WAIT_POLL` + 唤醒方按保存的 fd 表填充 `revents`,PIT 到期唤醒;无其他可运行进程时退回 `sti; hlt` 有界等待)
 
 ### P2 进程模型升级(结构性)
-- [x] 每进程页目录 + 用户块(CR3 切换);**fork 页级 COW**(物理帧引用计数,父/子页表只读,写故障复制单页并重载 CR3),exec 前强制私有化
-- [x] 可配置沙箱:`build.ps1 -SandboxMB`(默认 8,>=8 且 4MB 倍数),`USER_SIZE` 由宏派生,保留物理窗口按沙箱尺寸取整
-- [ ] 按需分页/页面换出(当前用户块仍一次性分配全部物理页)
+- [x] 每进程页目录 + 按需分页用户窗口(CR3 切换);**fork 页级 COW**(物理帧引用计数,父/子页表只读,写故障复制单页并重载 CR3),exec 前释放全部用户页再重新缺页装入
+- [x] 可配置沙箱:`build.ps1 -SandboxMB`(默认 8,>=8 且 4MB 倍数),`USER_SIZE` 由宏派生,窗口边界按沙箱尺寸取整(仅虚拟地址,物理页按需分配)
+- [x] 按需分页(用户页首次访问由缺页处理分配零页;页目录初始只映射 trampoline)
+- [ ] 页面换出/swap(按需分页已具备缺页路径,但无磁盘交换区)
 - [x] higher-half 内核:链接 0xC0100000,`AT()` 指定物理装载 0x100000;boot.s 自举页目录(identity 0..8MB + 0xC0000000),mm_init 把全部 RAM 再别名到 0xC0000000(上限 1GB = 256 个 PDE)
 - [x] 抢占调度:Ring3 进程 100Hz 轮转,`waitpid` 阻塞让出 CPU(内核 shell 不参与调度)
 - [x] `clone` 线程(`CLONE_VM/CLONE_FS/CLONE_FILES/CLONE_THREAD/CLONE_SETTLS`)、每线程内核栈与 TLS
@@ -82,11 +83,11 @@
 - [x] TSS(仅 ESP0/SS0,单 CPU 不需要任务门);GDT 中加载
 - [x] 系统调用入口桩:`cli → int 0x80 → 切换内核栈(从 TSS)→ 保存用户寄存器`
 - [x] Ring3 进入/退出:`iret` 到用户代码段 0x1B/数据段 0x23,时钟中断可从 Ring3 正常返回
-- [x] `fork`:复制 8MB 物理块 + fd/cwd/brk 快照,子进程立即 READY,由抢占调度并发运行
+- [x] `fork`:页级 COW 共享父进程物理页 + fd/cwd/brk 快照,子进程立即 READY,由抢占调度并发运行
 - [x] 抢占调度:IRQ0 每 tick 在 Ring3 进程间轮转,阻塞的 `wait4/waitid/poll/read` 让出 CPU
 - 验收:`run sched` 两个 Ring3 子进程输出交错、`run thread` 两个线程共享全局变量
 
-**2026-10 进展**:首个 Ring3 C 程序(`user/hello.c`)已跑通 —— 用户窗口固定为 0x08048000 起 8MB,但**每个进程有自己的 8MB 物理块与页目录**,CR3 切换而不是搬移快照;`run fork` 父 fork → 子 execve → 子 exit 42 → 父 waitpid 收尸;`run sched` 两个子进程被 100Hz tick 抢占交错执行,`run thread` 验证 `clone(CLONE_VM)` 线程共享地址空间。higher-half 仍是剩余项。
+**2026-10 进展**:首个 Ring3 C 程序(`user/hello.c`)已跑通 —— 用户窗口固定为 0x08048000 起 8MB **虚拟**窗口,每个进程有私有页目录与按需分页的用户页,CR3 切换而不是搬移快照;`run fork` 父 fork → 子 execve → 子 exit 42 → 父 waitpid 收尸;`run sched` 两个子进程被 100Hz tick 抢占交错执行,`run thread` 验证 `clone(CLONE_VM)` 线程共享地址空间。
 
 ## 阶段 2:系统调用框架(基础调用已跑通)
 
@@ -108,7 +109,7 @@
 - [x] ELF32 头解析:program headers、p_type=LOAD 段载入沙箱、bss 清零;支持 ET_EXEC 与 ET_DYN(PIE,带 load bias 与动态重定位)
 - [x] 初始栈:argc/argv 按 System V i386 布局压栈,`_start` 进入 `main`
 - [x] ELF 来源:内核内嵌 blob + RAM FS 文件 + Multiboot `-initrd` 模块(`execmod`)
-- [x] `execve` 系统调用:预校验 ELF → 清空沙箱 → 重载段/栈,保留 fd/cwd/brk,同一 pid 原地替换
+- [x] `execve` 系统调用:预校验 ELF → 释放全部用户页(按需分页)→ 重载段/栈,保留 fd/cwd/brk,同一 pid 原地替换
 - [x] 命令行参数传入(argv 数组/字符串从用户空间拷贝);stdin/stdout/stderr 由 fd 表预开
 - [x] waitpid/exit 收尸:`PROC_ZOMBIE` + exit status 编码;父进程 `wait4` 运行子进程并回收
 - [x] shell 改造:虚拟 `/bin/<applet>` → busybox 模块 + PATH 查找 + fork+execve;`sh -c 'ls'`、`echo hi | cat` 通过
@@ -128,7 +129,7 @@
 - [x] 验收:`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a` 与 20+ applet(含 `ls -l`、`wc`、`grep`、`sed`、`od`、`cp/rm/mv/touch`)全部通过;`ENOENT`/`ENOTDIR`/`EBADF` 路径也符合 Linux 行为
 - [x] 设备与虚拟文件:`/dev/null` `/dev/zero` `/dev/console` 内核态字符设备;`/proc/{meminfo,uptime,version,cpuinfo,mounts}`、`/etc/mtab` 只读快照
 - [x] `statfs/fstatfs(99/100)`、`statfs64/fstatfs64(268/269)`、`sysinfo(116)`;统一 0..10 fd 表后 `dup/dup2` 支持 stdio 重定向,`free/df/dd/stat -f` 实测通过
-- [x] 进程 ABI:`fork(2)`、`waitpid(7)/wait4(114)`、`execve(11)`(每进程独立 8MB 物理块 + 页目录,抢占并发)
+- [x] 进程 ABI:`fork(2)`、`waitpid(7)/wait4(114)`、`execve(11)`(每进程独立页目录 + 按需分页用户页,抢占并发)
 - [x] 管道 ABI:`pipe(42)/pipe2(331)`、fd 表 PIPE_READ/WRITE、shell 管道 `echo hi | cat`
 - [x] 真正并发:`clone` 线程(CLONE_VM/FILES/THREAD/SETTLS)、信号投递、抢占调度、每进程页目录
 - [x] 目录层级:`mkdir/rmdir`、子目录路径解析、直接子项枚举、跨目录文件 `rename`;`mkdir -p`/`cp`/`mv` 实测通过

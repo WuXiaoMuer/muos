@@ -127,6 +127,8 @@ bool_t   proc_space_share(proc_t* child, proc_t* parent);
 bool_t   proc_space_cow(proc_t* child, proc_t* parent);
 /* Make the current process's user pages private (execve rewrites them). */
 bool_t   proc_detach_current(void);
+/* Release all user pages of the current process before loading a new image. */
+bool_t   proc_reset_current(void);
 void     proc_snapshot_free(proc_t* p);
 
 /* fd table helpers */

@@ -620,12 +620,9 @@ int user_exec_image(const void* img, uint32_t img_size, int argc,
                     uint32_t* entry_out, uint32_t* sp_out) {
     if (!img || img_size == 0) return -1;
 
-    /* execve rewrites the whole window: privatize COW pages first so a
-     * forked child cannot scribble over the parent's still-shared pages. */
-    proc_detach_current();
-
-    /* The top page is the read-only sigreturn trampoline. */
-    memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);
+    /* execve rewrites the whole window: dropping every user page also
+     * releases COW references, so a forked child cannot see stale data. */
+    proc_reset_current();
 
     elf32_load_info_t li;
     uint32_t entry = 0, interp_base = 0;
@@ -735,9 +732,8 @@ int user_run_image_argv(const void* img, uint32_t img_size,
     uint32_t prev_pd = mm_get_current_pd();
     proc_switch_space(self);
 
-    /* Fresh process image every run (top page: read-only trampoline). */
-    memset((void*)USER_BASE, 0, USER_SIZE - PAGE_SIZE);
-
+    /* Fresh process image every run (top page: read-only trampoline).
+     * Demand paging starts with an empty directory, so no bulk clearing. */
     elf32_load_info_t li;
     uint32_t entry = 0, interp_base = 0;
     int rc = user_load_for_exec(img, img_size, &li, &entry, &interp_base);
