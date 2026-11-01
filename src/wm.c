@@ -50,6 +50,14 @@
 #define LIST_ROW_H 18
 #define LIST_SB   8
 #define LIST_COUNT 10
+#define MENU_X    242
+#define MENU_Y    8
+#define MENU_W    126
+#define MENU_H    20
+#define MENU_POP_Y 32
+#define MENU_POP_H (24 + MENU_COUNT * MENU_ITEM_H)
+#define MENU_ITEM_H 18
+#define MENU_COUNT 3
 
 typedef struct {
     int      x, y;
@@ -62,6 +70,7 @@ typedef struct {
     int      ilen;
     int      list_sel;      /* list control selection */
     int      list_scroll;   /* first visible list row */
+    bool_t   menu_open;     /* dropdown menu expanded */
 } wm_window_t;
 
 /* Clipping stack: every buf_rect/buf_text call is limited to the current
@@ -105,6 +114,7 @@ static void clip_pop(void) {
 static uint32_t* scr;                 /* full-screen back buffer */
 static uint32_t* wbuf[WIN_COUNT];     /* per-window body buffers */
 static int       SW, SH;
+static void body_render(int i);
 static int       order[WIN_COUNT];    /* z-order, last = top */
 static wm_window_t wins[WIN_COUNT];
 static uint16_t  saved_text[80 * 25];
@@ -126,6 +136,34 @@ static void buf_rect(uint32_t* b, int w, int h, int x, int y,
             int px = x + xx;
             if (px < 0 || px >= w || px < clip_x0 || px >= clip_x1) continue;
             b[py * w + px] = c;
+        }
+    }
+}
+
+/* 8x8 glyph scaled by `scale`; used for the larger menu heading. */
+static void buf_text_s(uint32_t* b, int w, int h, int x, int y,
+                       const char* s, uint32_t fg, uint32_t bg, int scale) {
+    if (scale < 1) scale = 1;
+    for (; *s; s++, x += 8 * scale) {
+        unsigned char ch = (unsigned char)*s;
+        const unsigned char* glyph =
+            (ch >= 0x20 && ch < 0x7F) ? font8x8_basic[ch - 0x20]
+                                      : font8x8_basic[0];
+        for (int gy = 0; gy < 8; gy++) {
+            uint32_t bits = glyph[gy];
+            for (int sy = 0; sy < scale; sy++) {
+                int py = y + gy * scale + sy;
+                if (py < 0 || py >= h || py < clip_y0 || py >= clip_y1) continue;
+                for (int gx = 0; gx < 8; gx++) {
+                    int px0 = x + gx * scale;
+                    for (int sx = 0; sx < scale; sx++) {
+                        int px = px0 + sx;
+                        if (px < 0 || px >= w || px < clip_x0 || px >= clip_x1)
+                            continue;
+                        b[py * w + px] = (bits & (1u << gx)) ? fg : bg;
+                    }
+                }
+            }
         }
     }
 }
@@ -236,6 +274,60 @@ static const char* list_items[LIST_COUNT] = {
     "Foxtrot", "Golf", "Hotel", "India", "Juliet"
 };
 
+static const char* menu_items[MENU_COUNT] = {
+    "Say Hello", "Clear Log", "About"
+};
+
+static int menu_item_at(int bx, int by) {
+    if (bx < MENU_X || bx >= MENU_X + MENU_W) return -1;
+    int y = by - (MENU_POP_Y + 24);
+    if (y < 0 || y >= MENU_COUNT * MENU_ITEM_H) return -1;
+    return y / MENU_ITEM_H;
+}
+
+static void draw_menu(wm_window_t* win, uint32_t* b) {
+    buf_rect(b, BODY_W, BODY_H, MENU_X, MENU_Y, MENU_W, MENU_H,
+             rgb(42, 111, 219));
+    buf_rect(b, BODY_W, BODY_H, MENU_X, MENU_Y, MENU_W, 2,
+             rgb(96, 160, 240));
+    buf_text(b, BODY_W, BODY_H, MENU_X + 8, MENU_Y + 2, "Menu",
+             rgb(245, 248, 255), rgb(42, 111, 219));
+    if (!win->menu_open) return;
+
+    clip_push(MENU_X, MENU_POP_Y, MENU_W, MENU_POP_H);
+    buf_rect(b, BODY_W, BODY_H, MENU_X, MENU_POP_Y, MENU_W, MENU_POP_H,
+             rgb(84, 94, 112));
+    buf_rect(b, BODY_W, BODY_H, MENU_X + 1, MENU_POP_Y + 1, MENU_W - 2,
+             MENU_POP_H - 2, rgb(28, 32, 42));
+    buf_text_s(b, BODY_W, BODY_H, MENU_X + 8, MENU_POP_Y + 4, "Menu",
+               rgb(232, 242, 255), rgb(28, 32, 42), 2);
+    for (int r = 0; r < MENU_COUNT; r++) {
+        int y = MENU_POP_Y + 24 + r * MENU_ITEM_H;
+        buf_rect(b, BODY_W, BODY_H, MENU_X + 1, y, MENU_W - 2,
+                 MENU_ITEM_H - 1, rgb(38, 44, 58));
+        buf_text(b, BODY_W, BODY_H, MENU_X + 8, y + 2, menu_items[r],
+                 rgb(220, 228, 240), rgb(38, 44, 58));
+    }
+    clip_pop();
+}
+
+static void menu_choose(wm_window_t* win, int mi) {
+    if (mi == 0) {
+        log_append(&wins[0], "Hello from menu!\n");
+        wins[0].scroll = TEXT_MAX;
+        body_render(0);
+    } else if (mi == 1) {
+        wins[0].tlen = 0;
+        wins[0].scroll = 0;
+        body_render(0);
+    } else {
+        log_append(&wins[0], "Menu: font scale + dropdown\n");
+        wins[0].scroll = TEXT_MAX;
+        body_render(0);
+    }
+    win->menu_open = false;
+}
+
 static int list_max_scroll(wm_window_t* win) {
     (void)win;
     return LIST_COUNT > LIST_ROWS ? LIST_COUNT - LIST_ROWS : 0;
@@ -340,6 +432,7 @@ static void body_render_widgets(int i) {
     }
 
     draw_list(win, b);
+    draw_menu(win, b);
 }
 
 static void body_render(int i) {
@@ -585,7 +678,14 @@ void wm_run(void) {
                     int bx = mx - (win->x + 1);
                     int by = my - (win->y + TITLE_H + 1);
                     int btn = widget_button_at(bx, by);
-                    if (btn == 1) {
+                    if (bx >= MENU_X && bx < MENU_X + MENU_W &&
+                        by >= MENU_Y && by < MENU_Y + MENU_H) {
+                        win->menu_open = !win->menu_open;
+                    } else if (win->menu_open) {
+                        int mi = menu_item_at(bx, by);
+                        if (mi >= 0) menu_choose(win, mi);
+                        else win->menu_open = false;
+                    } else if (btn == 1) {
                         log_append(&wins[0], "Hello from Widgets!\n");
                         wins[0].scroll = TEXT_MAX;      /* follow tail */
                         body_render(0);
@@ -608,6 +708,7 @@ void wm_run(void) {
                         }
                         body_render(i);
                     }
+                    body_render(i);
                 } else if (mx >= win->x + WIN_W - 12 &&
                            my >= win->y + TITLE_H + 1 &&
                            my < win->y + TITLE_H + 1 + BODY_H) {

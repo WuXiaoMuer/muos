@@ -61,8 +61,8 @@
 - [x] socket ABI:i386 `socket(359)/bind(361)/connect(362)/listen(363)/accept4(364)/sendto(369)/recvfrom(371)/shutdown(373)/getsockname(367)/getpeername(368)` + `socketcall(102)`;fd 16–23 映射到 8 个 socket 槽
 - [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;8 段发送队列 + 队列头 RTO 指数退避(最多 5 次)、ACK 逐段退休、慢开始/拥塞避免窗口;接收端 4 段乱序队列(按 `rcv_nxt` 连续推进)、对端窗口跟踪与 **WS 窗口缩放协商**(SYN/SYN-ACK 带 shift=4,按对端 shift 放大 `snd_wnd`);**快速重传**:连续 3 个重复 ACK 立即重传队头、`ssthresh=cwnd/2`、`cwnd=ssthresh+3*MSS` 进入快速恢复,完整 ACK 后退出并回落到 `ssthresh`;`accept` 在无待完成连接时阻塞(由握手完成事件唤醒,`run baccept` 实测);启动自检 `TCP-REORDER-OK`/`TCP-WSCALE-OK`/`TCP-FASTRETX-OK`;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名与 `listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)
 - [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
-- [x] 像素窗口管理器(`pixel`,ISO/VBE):4 个窗口(Terminal/System/Editor/Widgets),每窗口 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`);鼠标拖动标题栏/关闭/聚焦置顶,文本窗口可拖动滚动条,Widgets 提供按钮(Say Hello/Clear Log)、单行输入框(回车发送到 Terminal)与可点击选择/滚动的列表控件;绘制使用 8 级裁剪栈(列表视口、任务栏文本均受限);键盘输入到焦点窗口,任务栏与 8×16 文字(8×8 字模纵向 2 倍);ESC 返回文本 shell;`tools/test_wm.py` 用 QMP 相对鼠标点击列表行并校验高亮像素
-- [ ] 更多字体尺寸、菜单控件;其他网卡
+- [x] 像素窗口管理器(`pixel`,ISO/VBE):4 个窗口(Terminal/System/Editor/Widgets),每窗口 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`);鼠标拖动标题栏/关闭/聚焦置顶,文本窗口可拖动滚动条,Widgets 提供按钮(Say Hello/Clear Log)、单行输入框(回车发送到 Terminal)、可点击选择/滚动的列表控件与 Menu 下拉菜单(2 倍字号标题);绘制使用 8 级裁剪栈(列表视口、菜单弹层、任务栏文本均受限);键盘输入到焦点窗口,任务栏与 8×16 文字(8×8 字模纵向 2 倍);ESC 返回文本 shell;`tools/test_wm.py` 用 QMP 相对鼠标点击列表行并校验高亮像素,再打开菜单并选择菜单项校验弹层像素
+- [ ] 更多字体尺寸、其他网卡
 
 ## 阶段 0:地基(已完成,2026-09)
 

@@ -271,9 +271,9 @@ USER_SIGTRAMP = 0x08847000
 - `pixel` 命令进入 `wm_run()`:运行时用 `mm_alloc_pages` 分配全屏 32-bit 后备缓冲(屏幕尺寸×4)与每个窗口的 body 后备缓冲(378×237×4);窗口结构保存位置/标题/文本/开关/滚动行/输入框/列表选中与列表滚动,`order[]` 是 z-order;共 4 个窗口(Terminal/System/Editor/Widgets)。
 - 合成:先把渐变桌面写入屏幕缓冲,再按 z-order 画窗口阴影/边框/标题栏(焦点窗口蓝色)/关闭按钮,逐像素拷入该窗口 body 缓冲;底部任务栏显示操作提示;最后画 10×14 鼠标箭头并 `fb_blit32` 一次性提交(16/24/32bpp 都支持)。
 - 裁剪栈:8 级 `clip_stack`,每次 `body_render`/`compose` 从满幅开始,`clip_push` 与当前矩形求交,`buf_rect`/`buf_text` 的每个像素都再受当前裁剪矩形约束;窗口 body 合成、列表视口、任务栏文本分别 push/pop,保证控件内容不会越界绘制。
-- 文本:`buf_text` 用 `font8x8_basic`,每个字模行重复两次得到 8×16;`body_render_text` 按窗口宽度预留右侧 10px 滚动条后换行,只绘制从 `scroll` 起的可见行并画绿色光标;`win_total_lines` 统计换行后的总行数,滚动条 thumb 高度按可视/总行数比例,点击或拖动轨道用 `scroll_drag` 反算起始行。
-- 控件:Widgets 窗口的 `body_render_widgets` 绘制两个按钮(Say Hello / Clear Log)、单行输入框(含光标)与列表控件;点击按钮通过 `widget_button_at` 命中后把消息写入 Terminal 日志或清空日志;列表 `draw_list` 在 6 行视口内绘制 10 项(选中行蓝底),`list_clamp` 保证选中项可见,点击行设置 `list_sel`、点击/拖动右侧滚动条用 `list_scroll_drag` 设置起始行,状态行显示 `sel: <item>`;Widgets 获得焦点时键盘写入输入框(退格/字符,回车同时接受 `\r` 与 `\n` 并把内容发送到 Terminal),其他窗口继续直接编辑文本。
-- 事件循环:每 10ms(PIT)读 `mouse_get_pixels`(640×400 缩放到屏幕)与按键;按下时按 z-order 命中窗口:关闭按钮关闭、标题栏开始拖动(下一次移动按偏移挪动并夹在屏内)、文本窗口右侧滚动条进入拖动、Widgets 按钮/列表行/列表滚动条立即处理、内容区聚焦并置顶;ESC 退出。
+- 文本:`buf_text` 用 `font8x8_basic`,每个字模行重复两次得到 8×16;`buf_text_s` 按整数倍缩放字模(菜单标题用 2 倍 16×16);`body_render_text` 按窗口宽度预留右侧 10px 滚动条后换行,只绘制从 `scroll` 起的可见行并画绿色光标;`win_total_lines` 统计换行后的总行数,滚动条 thumb 高度按可视/总行数比例,点击或拖动轨道用 `scroll_drag` 反算起始行。
+- 控件:Widgets 窗口的 `body_render_widgets` 绘制两个按钮(Say Hello / Clear Log)、单行输入框(含光标)、列表控件与 Menu 下拉菜单;点击按钮通过 `widget_button_at` 命中后把消息写入 Terminal 日志或清空日志;列表 `draw_list` 在 6 行视口内绘制 10 项(选中行蓝底),`list_clamp` 保证选中项可见,点击行设置 `list_sel`、点击/拖动右侧滚动条用 `list_scroll_drag` 设置起始行,状态行显示 `sel: <item>`;`draw_menu` 在按钮下方弹出 3 项菜单(2 倍字号标题),`menu_item_at` 命中后 `menu_choose` 执行 Say Hello/Clear Log/About 并关闭弹层;Widgets 获得焦点时键盘写入输入框(退格/字符,回车同时接受 `\r` 与 `\n` 并把内容发送到 Terminal),其他窗口继续直接编辑文本。
+- 事件循环:每 10ms(PIT)读 `mouse_get_pixels`(640×400 缩放到屏幕)与按键;按下时按 z-order 命中窗口:关闭按钮关闭、标题栏开始拖动(下一次移动按偏移挪动并夹在屏内)、文本窗口右侧滚动条进入拖动、Widgets 菜单/按钮/列表行/列表滚动条立即处理、内容区聚焦并置顶;ESC 退出。
 - 退出时保存的 80×25 文本单元经 `vga_put_cell` 恢复后 `vga_repaint()`。`-kernel`(无 VBE)下提示需要 ISO。
 
 ### 7.11 分区表与 FAT32 / ext2 读写(part.c / fat.c / ext2.c)
@@ -369,7 +369,7 @@ USER_SIGTRAMP = 0x08847000
 5. 内核堆不可增长、不可重入(IRQ 上下文需手工加锁)
 6. 有 16 目录槽但路径/名称上限 64 字符;无盘时文件系统重启即失(有盘时 MuFS 持久化);write 截断不告警;`/dev`、`/proc`、`/etc`、`/bin` 为只读虚拟层
 7. 键盘仅 US QWERTY;PS/2 鼠标在文本桌面按 8×16 单元粗粒度移动,在 `pixel` 中映射到像素坐标;无滚轮/右键菜单/双击标题栏最大化
-8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 是合成器窗口管理器(每窗口后备缓冲 + 拖动/关闭/聚焦 + 滚动条 + 按钮/输入框/列表 + 8 级裁剪栈),但尚无更多字体尺寸与菜单控件
+8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 是合成器窗口管理器(每窗口后备缓冲 + 拖动/关闭/聚焦 + 滚动条 + 按钮/输入框/列表/下拉菜单 + 8 级裁剪栈),但尚无更多字体尺寸与工具栏控件
 9. 单处理器(PIC,非 APIC);用户进程由 IRQ0 抢占,内核 shell 本身仍在启动栈上协作运行
 10. 无内核栈溢出保护(16KB 栈,GUI 深调用链靠它撑着;用户态入口另有 8KB TSS 栈)
 11. 无 guard page / 无 KASLR / panic 信息只有寄存器 dump(有 -g,可 addr2line)

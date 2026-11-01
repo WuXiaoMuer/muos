@@ -13,7 +13,7 @@
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **MuOS v1.3 桌面(`desktop`/`gui`)**:文本模式 Win7 风格 GUI(任务栏、开始菜单、窗口 z-order、Calculator),启动 logo 为立体 ASCII 字标
-- **像素窗口管理器(`pixel`,ISO/VBE)**:每个窗口独立 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`),鼠标拖动标题栏/点击关闭/聚焦置顶、键盘输入到焦点窗口;文本窗口带可拖动滚动条,`Widgets` 窗口提供按钮(Say Hello/Clear Log)、单行输入框(回车发送到 Terminal)与可选择/滚动的列表控件;绘制走 8 级裁剪栈(控件视口与任务栏文本均受限);文字用 8×8 字模纵向 2 倍渲染成 8×16;ESC 返回文本 shell
+- **像素窗口管理器(`pixel`,ISO/VBE)**:每个窗口独立 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`),鼠标拖动标题栏/点击关闭/聚焦置顶、键盘输入到焦点窗口;文本窗口带可拖动滚动条,`Widgets` 窗口提供按钮(Say Hello/Clear Log)、单行输入框(回车发送到 Terminal)、可选择/滚动的列表控件与 **Menu 下拉菜单**;绘制走 8 级裁剪栈(控件视口与任务栏文本均受限);文字用 8×8 字模纵向 2 倍渲染成 8×16,菜单标题使用 2 倍字号(16×16);ESC 返回文本 shell
 - **安全与电源**:SMEP(CPUID 可用时置 CR4 bit20)、弱 ASLR(栈顶 0..7 页随机 + `AT_RANDOM` 驱动库加载基址随机)、**uid/gid 凭据与文件权限**(MuFS 元数据保存 owner/mode,open/access 按 rwx 位检查、root 绕过读写)、ACPI FADT 定位与 S5 关机(`poweroff`) / 8042 复位(`reboot`);`run perm` 实测非 root 子进程读 0600 被拒、读 0644 成功
 - **88 项内核自检**(启动时自动运行,或 Shell 中输入 `test`)
 
@@ -142,7 +142,7 @@ python tools\test_realso.py
 python tools\verify_release.py
 # 启动 ISO、打开 pixel 桌面并抓屏(输出 build\pixel.ppm)
 python tools\screendump.py
-# 打开 pixel、点击 Widgets 列表并校验选中高亮(需要 muos.iso)
+# 打开 pixel、点击 Widgets 列表/菜单并校验像素(需要 muos.iso)
 python tools\test_wm.py
 ```
 
@@ -199,7 +199,7 @@ muos> run tls             # 静态 TLS:initial-exec(TPOFF)+ global-dynamic(__tls
 muos> run perm            # uid/gid 与文件权限:非 root 读 0600 被拒、读 0644 成功
 muos> run net             # 网卡:raw ICMP echo + UDP DNS 查询(QEMU -nic user,model=rtl8139)
 muos> run tcp             # TCP:双连接回显 + getsockname/getpeername + listen/accept 自连接
-muos> pixel               # 像素窗口管理器(仅 ISO/VBE):拖动/聚焦/关闭、滚动条、按钮/输入框/列表、双缓冲合成
+muos> pixel               # 像素窗口管理器(仅 ISO/VBE):拖动/聚焦/关闭、滚动条、按钮/输入框/列表/下拉菜单、双缓冲合成
 muos> run fsata           # MuFS 持久文件:创建/写/fsync/回读(重启后 run fsread)
 muos> run ata             # /dev/hda 写入并回读 PERSIST-DATA
 muos> disk                # ATA 型号、扇区数与 MuFS generation
@@ -218,7 +218,7 @@ muos> poweroff            # ACPI S5 关机(无 FADT 时用 QEMU 0x604/0xB004 端
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```
 
-hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用,`run p1` 验证目录改名、打开后 unlink、pipe HUP、超时等待与 `waitid`。`run sig/thread/blkpoll` 覆盖 P2 的进程模型,`run pie` 覆盖 P3 的 ET_DYN 装载,`run dyn` 覆盖 P3 的动态链接(PT_INTERP → ld-mu.so → libmu.so),`run tls` 覆盖静态 TLS(主程序 local-exec、库 initial-exec 与 global-dynamic `__tls_get_addr`),`run ata` 覆盖 P4 的 ATA 块设备(配合 `build/test_ata.py` 做两次启动的持久化验证),`run net` 覆盖 P4 的网卡与 socket ABI(ICMP ping + UDP DNS),`run tcp` 覆盖 TCP 握手/双连接回显/真实 socket 名/accept 自连接,`run baccept` 覆盖阻塞 accept(子进程延迟连接时父进程让出 CPU,由握手事件唤醒),`pixel` 启动像素窗口管理器(仅 ISO 路径;四个窗口、拖动/关闭/聚焦、滚动条、按钮/输入框/列表控件、裁剪栈、任务栏与鼠标箭头)。
+hello 演示:CS 寄存器(确认 0x1B)、argc/argv、C 计算、brk 堆、`uname`、RAM FS 打开/读取/创建/写入/回读、匿名 `mmap`、键盘 `read`、正常 `exit`;`run at` 另外验证以目录 fd 为基准的 `*at` 路径解析,`run mmapfile` 验证文件映射与截断/同步/限额调用,`run poll` 验证 pipe/stdio 的读写就绪位,`run extra` 验证睡眠、资源统计与所有权调用,`run p1` 验证目录改名、打开后 unlink、pipe HUP、超时等待与 `waitid`。`run sig/thread/blkpoll` 覆盖 P2 的进程模型,`run pie` 覆盖 P3 的 ET_DYN 装载,`run dyn` 覆盖 P3 的动态链接(PT_INTERP → ld-mu.so → libmu.so),`run tls` 覆盖静态 TLS(主程序 local-exec、库 initial-exec 与 global-dynamic `__tls_get_addr`),`run ata` 覆盖 P4 的 ATA 块设备(配合 `build/test_ata.py` 做两次启动的持久化验证),`run net` 覆盖 P4 的网卡与 socket ABI(ICMP ping + UDP DNS),`run tcp` 覆盖 TCP 握手/双连接回显/真实 socket 名/accept 自连接,`run baccept` 覆盖阻塞 accept(子进程延迟连接时父进程让出 CPU,由握手事件唤醒),`pixel` 启动像素窗口管理器(仅 ISO 路径;四个窗口、拖动/关闭/聚焦、滚动条、按钮/输入框/列表/下拉菜单、裁剪栈、任务栏与鼠标箭头)。
 
 - 用户地址空间固定为 `0x08048000` 起 8MB 的**虚拟**窗口(经典 Linux i386 ET_EXEC 地址),每个进程拥有**私有页目录**,但**不再预分配 8MB 物理块**:页目录初始只映射只读 sigreturn trampoline,其余页在首次访问时由缺页处理分配零页(按需分页);调度器切换 CR3 即可切换进程。fork 用页级 COW 共享已有物理页,exec 前释放全部用户页再按新镜像重新缺页装入。
 - 进入 Ring3 使用 TSS.esp0 切换内核栈;`int 0x80`(DPL3 门)按 Linux i386 ABI 分发(eax=号,ebx/ecx/edx 传参);Ring3 进程可被 IRQ0 抢占,`wait4/waitid/poll/read` 阻塞时让出 CPU;退出/故障时若无其他可运行进程则恢复 `user_enter` 保存的内核上下文返回 Shell。
@@ -368,7 +368,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 
 ## 版本
 
-当前 **v1.3**(2026-10-31):在 v1.2 的 Ring3/TSS/`int 0x80`/ELF32 加载器与 RAM FS 基础上,已加入 **higher-half 内核(0xC0100000)**、每进程页目录 + 抢占调度、**页级 COW fork** 与可配置沙箱(`-SandboxMB`)、**用户页按需分页**、信号与 `clone` 线程、**ATA PIO + MuFS 持久化(元数据日志)**、MBR/GPT + **FAT32 读写(含长名创建)** 与 **ext2 读写(创建/覆盖/删除)**、**PT_INTERP 动态链接 + 静态 TLS + 符号版本化**、RTL8139 + ARP/ICMP/UDP/DHCP + **TCP(8 段发送队列/退避/拥塞窗口/接收乱序重排/窗口缩放/快速重传/阻塞 accept)**、**uid/gid 与文件权限检查**、SMEP + 弱 ASLR、**ACPI 关机/重启**、**VBE 帧缓冲 + 8×16 字体 + 合成器窗口管理器(`pixel`,含裁剪栈与列表控件)**。v1.3 同时把 Shell 帮助重写为分组命令表(`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示),启动/`logo` 界面升级为带边框、渐变与投影的立体 MuOS 字标,桌面命令统一为 `desktop`(保留 `gui` 别名),ext2 增加创建/覆盖/删除写入(块与 inode 位图分配、目录项插入与合并),FAT32/ext2 以 `/fat`、`/ext2` 挂载接入 VFS(open/read/write/stat/getdents/unlink/rename/mkdir/rmdir,文件与目录均可改名,O_CREAT/O_TRUNC,写为整文件回写),并提供批处理启动模式与 `release.bat` 打包。
+当前 **v1.3**(2026-10-31):在 v1.2 的 Ring3/TSS/`int 0x80`/ELF32 加载器与 RAM FS 基础上,已加入 **higher-half 内核(0xC0100000)**、每进程页目录 + 抢占调度、**页级 COW fork** 与可配置沙箱(`-SandboxMB`)、**用户页按需分页**、信号与 `clone` 线程、**ATA PIO + MuFS 持久化(元数据日志)**、MBR/GPT + **FAT32 读写(含长名创建)** 与 **ext2 读写(创建/覆盖/删除)**、**PT_INTERP 动态链接 + 静态 TLS + 符号版本化**、RTL8139 + ARP/ICMP/UDP/DHCP + **TCP(8 段发送队列/退避/拥塞窗口/接收乱序重排/窗口缩放/快速重传/阻塞 accept)**、**uid/gid 与文件权限检查**、SMEP + 弱 ASLR、**ACPI 关机/重启**、**VBE 帧缓冲 + 8×16 字体 + 合成器窗口管理器(`pixel`,含裁剪栈、列表与下拉菜单)**。v1.3 同时把 Shell 帮助重写为分组命令表(`help <cmd>` 详情、Tab 补全命令与 `run` 模式、未知命令提示),启动/`logo` 界面升级为带边框、渐变与投影的立体 MuOS 字标,桌面命令统一为 `desktop`(保留 `gui` 别名),ext2 增加创建/覆盖/删除写入(块与 inode 位图分配、目录项插入与合并),FAT32/ext2 以 `/fat`、`/ext2` 挂载接入 VFS(open/read/write/stat/getdents/unlink/rename/mkdir/rmdir,文件与目录均可改名,O_CREAT/O_TRUNC,写为整文件回写),并提供批处理启动模式与 `release.bat` 打包。
 
 **v1.2 发布后主线进展**:Multiboot `-initrd` 外部 ELF → `mods`/`execmod` → i386 TLS/uid32/ioctl/dup2 → 真实静态 i386 BusyBox 跑通 `echo` → 扁平 VFS(根目录 fd、`getdents(64)`、`stat(64)`/`statx`、`writev`、`sendfile`、`unlink`/`rename`、可关闭的 stdio)→ 20+ applet 实测通过 → **虚拟 `/dev`+`/proc`+`/etc`、统一 0..10 fd 表、`statfs`/`sysinfo`**,`free`/`df`/`dd`/`uptime` 通过 → **CMOS RTC→epoch 与 RAM FS atime/mtime/ctime**,`date`/`ls -l`/`stat`/`touch` 显示真实时间 → **fork/execve/waitpid 进程模型 + `/proc/<pid>`**,`run fork` 完成父 fork → 子 execve `/hello.elf` → 子 exit 42 → 父 waitpid 收尸,`ps` 显示 kernel/busybox → **虚拟 `/bin/*`、`pipe/pipe2`、shell 管道、`/proc` loadavg/stat/maps**,`sh -c 'echo hi | cat'` 与 `ls | wc -l` 通过 → **多级 RAM FS(`mkdir/rmdir/mkdir -p`、跨目录 `cp/mv`、子目录枚举)** → **`*at` 族(dirfd 相对路径、`AT_EMPTY_PATH`、`AT_REMOVEDIR`)** → **文件 mmap、truncate/chmod/fsync、getrlimit/prlimit64** → **poll/select 非阻塞就绪语义** → **nanosleep/times/getrusage/chown 族/readlink** → **P1 收尾** → **每进程页目录 + 抢占调度** → **信号投递(pending/blocked + sigreturn trampoline)、`clone` 线程、阻塞 poll/read** → **ET_DYN/PIE 装载与重定位 + auxv** → **ATA PIO 块设备与跨启动持久化** → **higher-half 内核(0xC0100000,自举页表 + 全 RAM 别名)** → **MuFS 持久化文件系统(ATA 写穿 + 开机挂载)** → **动态链接:`PT_INTERP` + 用户态 `ld-mu.so`(`DT_NEEDED`/SysV hash 符号解析/共享库映射)** → **RTL8139 + ARP/IPv4/ICMP/UDP 与 socket ABI** → **VBE 线性帧缓冲文本控制台(ISO 引导 800×600×32)** → **DHCP 自动配置 + 最小 TCP(SOCK_STREAM)与回环** → **`.gnu.hash`/`R_386_COPY` 支持 + 像素桌面原型(`pixel`)**。
 

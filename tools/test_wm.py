@@ -15,6 +15,7 @@ LOG = os.path.join(BUILD, "wmtest.log")
 
 SEL = (42, 111, 219)      # selected row background
 BG = (26, 32, 42)         # normal row background
+CLOSED_BG = (16, 20, 24)  # Widgets body background where the popup appears
 
 
 def read_ppm(path):
@@ -40,6 +41,8 @@ def main():
 
     before = os.path.join(BUILD, "wmtest_before.ppm")
     after = os.path.join(BUILD, "wmtest_after.ppm")
+    menu_open = os.path.join(BUILD, "wmtest_menu_open.ppm")
+    menu_done = os.path.join(BUILD, "wmtest_menu_done.ppm")
     args = [qemu_path(), "-cdrom", ISO, "-m", "256M",
             "-nic", "user,model=rtl8139",
             "-display", "none", "-serial", f"file:{LOG}",
@@ -65,20 +68,49 @@ def main():
         ev([{"type": "btn", "data": {"down": False, "button": "left"}}])
         time.sleep(0.5)
         sh._cmd({"execute": "screendump", "arguments": {"filename": after}})
+        # Pointer is at list row 4 (300,462). Move to the Menu button
+        # (300,340), open it, then choose the first item at (340,390).
+        ev([{"type": "rel", "data": {"axis": "x", "value": 0}},
+            {"type": "rel", "data": {"axis": "y", "value": -41}}])
+        time.sleep(0.4)
+        ev([{"type": "btn", "data": {"down": True, "button": "left"}}])
+        time.sleep(0.2)
+        ev([{"type": "btn", "data": {"down": False, "button": "left"}}])
+        time.sleep(0.4)
+        sh._cmd({"execute": "screendump", "arguments": {"filename": menu_open}})
+        ev([{"type": "rel", "data": {"axis": "x", "value": 16}},
+            {"type": "rel", "data": {"axis": "y", "value": 17}}])
+        time.sleep(0.4)
+        ev([{"type": "btn", "data": {"down": True, "button": "left"}}])
+        time.sleep(0.2)
+        ev([{"type": "btn", "data": {"down": False, "button": "left"}}])
+        time.sleep(0.4)
+        sh._cmd({"execute": "screendump", "arguments": {"filename": menu_done}})
     finally:
         sh.close()
 
     w1, h1, pb = read_ppm(before)
     w2, h2, pa = read_ppm(after)
+    w3, h3, pm = read_ppm(menu_open)
+    w4, h4, pc = read_ppm(menu_done)
     row0_b, row4_b = pb(300, 388), pb(300, 460)
     row0_a, row4_a = pa(300, 388), pa(300, 460)
+    menu_closed_b = pb(390, 365)
+    menu_open_px = pm(390, 365)
+    menu_closed_a = pc(390, 365)
 
     checks = {
-        "screen size 800x600": (w1, h1) == (800, 600) and (w2, h2) == (800, 600),
+        "screen size 800x600": ((w1, h1) == (800, 600) and
+                                (w2, h2) == (800, 600) and
+                                (w3, h3) == (800, 600) and
+                                (w4, h4) == (800, 600)),
         "row0 selected before": close(row0_b, SEL),
         "row4 not selected before": close(row4_b, BG),
         "row0 cleared after": close(row0_a, BG),
         "row4 selected after": close(row4_a, SEL),
+        "menu closed before": close(menu_closed_b, CLOSED_BG),
+        "menu popup opens": not close(menu_open_px, CLOSED_BG),
+        "menu closes after select": close(menu_closed_a, CLOSED_BG),
     }
     for k, v in checks.items():
         print(f"{k}: {v}")
