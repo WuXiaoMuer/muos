@@ -29,7 +29,8 @@ typedef enum {
     PROC_WAIT_SIGSUSP,   /* blocked until a signal is delivered */
     PROC_WAIT_READ,      /* blocked in read() on a pipe/console */
     PROC_WAIT_ACCEPT,    /* blocked in accept() on a listening TCP socket */
-    PROC_WAIT_FUTEX      /* blocked in futex(WAIT) on a user address */
+    PROC_WAIT_FUTEX,     /* blocked in futex(WAIT) on a user address */
+    PROC_WAIT_UNIXWRITE  /* blocked send() into a full AF_UNIX ring */
 } proc_wait_t;
 
 /* Refcounted address space: a thread group shares one block + page
@@ -155,6 +156,9 @@ bool_t   proc_block_current_ext(registers_t* regs, proc_wait_t kind,
 /* Wake up to `count` processes blocked in futex(WAIT) on `uaddr` inside the
  * address space `pd_phys`. Returns the number woken. */
 int      proc_futex_wake(uint32_t uaddr, int32_t count, uint32_t pd_phys);
+/* Complete blocked AF_UNIX sends whose peer ring now has space. Returns the
+ * number of senders woken (their eax is set to the sent byte count). */
+int      proc_unix_writers_try(void);
 void     proc_exit_current(registers_t* regs, int code, bool_t faulted);
 bool_t   proc_frame_switched(void);
 void     proc_clear_frame_switched(void);

@@ -1612,6 +1612,20 @@ bool_t net_socket_nonblock(int id) {
     return net_socket_ok(id) ? socks[id].nonblock : false;
 }
 
+bool_t net_unix_writable(int id) {
+    if (!net_socket_ok(id) || !net_socket_is_unix(id)) return false;
+    net_sock_t* s = &socks[id];
+    if (s->shut_wr || s->unix_peer_closed) return false;
+    if (s->unix_peer < 0 || !net_socket_ok(s->unix_peer)) return false;
+    return !socks[s->unix_peer].shut_rd;
+}
+
+bool_t net_unix_has_space(int id, uint32_t len) {
+    if (!net_unix_writable(id)) return false;
+    net_sock_t* peer = &socks[socks[id].unix_peer];
+    return len <= UNIX_BUF_SIZE - peer->unix_len;
+}
+
 /* Allocate a bare AF_UNIX endpoint (no NIC needed). */
 static net_sock_t* unix_alloc(int type) {
     for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {

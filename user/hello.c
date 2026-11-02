@@ -64,6 +64,16 @@ static volatile int futex_wake_ret = -1;
 /* AF_UNIX 8KB ring check uses two 2KB buffers outside the 8KB stack. */
 static unsigned char unix_big[2048];
 static unsigned char unix_big2[2048];
+static unsigned char unix_fill[8192];
+static unsigned char unix_drainbuf[4096];
+static unsigned char unix_small[512];
+
+static void unix_drainer(void* arg) {
+    unsigned ts[2] = { 0, 20000000 };       /* 20ms */
+    muos_nanosleep(ts, 0);
+    muos_recv((int)arg, unix_drainbuf, sizeof(unix_drainbuf), 0);
+    muos_exit(0);
+}
 
 static void futex_waker(void* arg) {
     (void)arg;
@@ -645,6 +655,36 @@ int main(int argc, char** argv) {
                 muos_puts("/"); muos_putdec(nbr);
                 muos_puts(nb_ok ? " nonblock-ok\n" : " nonblock-bad\n");
                 ok = ok && nb_ok;
+                muos_fcntl(sv[1], MUOS_F_SETFL, 0);   /* back to blocking */
+
+                /* Fill the 8KB ring, then a 512-byte send blocks until a
+                 * thread drains 4KB; the kernel completes the pending send. */
+                for (unsigned i = 0; i < sizeof(unix_fill); i++)
+                    unix_fill[i] = (unsigned char)(i & 0xFF);
+                for (unsigned i = 0; i < sizeof(unix_small); i++)
+                    unix_small[i] = (unsigned char)('A' + (i % 26));
+                int fill_rc = muos_send(sv[0], unix_fill,
+                                        sizeof(unix_fill), 0);
+                int th = muos_thread_start(unix_drainer, (void*)sv[1],
+                                           &thread_stacks[0][0] + 4096);
+                int small_rc = muos_send(sv[0], unix_small,
+                                         sizeof(unix_small), 0);
+                int wst = 0;
+                int wth = muos_waitpid(th, &wst, 0);
+                int block_ok = (fill_rc == (int)sizeof(unix_fill) &&
+                                small_rc == (int)sizeof(unix_small) &&
+                                wth == th);
+                muos_puts("tcp: unix-fill="); muos_putdec(fill_rc);
+                muos_puts(" blocked-send="); muos_putdec(small_rc);
+                muos_puts(block_ok ? " block-ok\n" : " block-bad\n");
+                ok = ok && block_ok;
+
+                /* Drain what is left so the shutdown EOF test starts empty. */
+                int dr;
+                do {
+                    dr = muos_recv(sv[1], unix_drainbuf,
+                                   sizeof(unix_drainbuf), 0);
+                } while (dr > 0);
 
                 /* shutdown(SHUT_WR) on one end: the partner drains what is
                  * buffered (already read above), then recv reports EOF. */

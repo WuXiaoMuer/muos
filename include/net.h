@@ -48,6 +48,9 @@ bool_t net_socket_is_unix(int id);
 /* Per-socket O_NONBLOCK: recv/accept return -EAGAIN instead of polling. */
 void   net_socket_set_nonblock(int id, bool_t on);
 bool_t net_socket_nonblock(int id);
+/* AF_UNIX stream send side: writable (peer alive, not shut) and space. */
+bool_t net_unix_writable(int id);
+bool_t net_unix_has_space(int id, uint32_t len);
 int net_bind(int id, uint32_t ip, uint16_t port);
 int net_connect(int id, uint32_t ip, uint16_t port);
 int net_listen(int id);

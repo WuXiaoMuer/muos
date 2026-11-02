@@ -315,6 +315,7 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define ERR_EAFNOSUPPORT 97
 #define ERR_ENOTCONN 107
 #define ERR_ETIMEDOUT 110
+#define ERR_EPIPE 32
 
 /* ---- socket ABI ---- */
 #define SYS_socketcall  102
@@ -1572,8 +1573,9 @@ static uint32_t do_connect(uint32_t fd, uint32_t addr, uint32_t alen) {
     return 0;
 }
 
-static uint32_t do_sendto(uint32_t fd, uint32_t buf, uint32_t len,
-                          uint32_t flags, uint32_t addr, uint32_t alen) {
+static uint32_t do_sendto(registers_t* regs, uint32_t fd, uint32_t buf,
+                          uint32_t len, uint32_t flags, uint32_t addr,
+                          uint32_t alen) {
     (void)flags;
     int id = sock_id(fd);
     if (id < 0) return err(ERR_EBADF);
@@ -1589,7 +1591,21 @@ static uint32_t do_sendto(uint32_t fd, uint32_t buf, uint32_t len,
         if (!read_sockaddr(addr, alen, &ip, &port)) return err(ERR_EINVAL);
     }
     int n = net_sendto(id, (const void*)buf, len, ip, port);
-    if (n < 0) return err(ERR_EAGAIN);
+    if (n < 0) {
+        /* A full AF_UNIX stream blocks the sender; the kernel completes the
+         * send from proc_unix_writers_try() once the peer drains. */
+        if (regs && net_socket_is_unix(id) &&
+            net_socket_kind(id) == NET_SOCK_STREAM &&
+            !net_socket_nonblock(id)) {
+            if (!net_unix_writable(id)) return err(ERR_EPIPE);
+            proc_t* p = proc_current();
+            if (p && p->pid != 1 &&
+                proc_block_current_ext(regs, PROC_WAIT_UNIXWRITE, buf,
+                                       (int32_t)len, 0, false, id))
+                return 0;               /* frame switched; eax set on wake */
+        }
+        return err(ERR_EAGAIN);
+    }
     return (uint32_t)n;
 }
 
@@ -1602,6 +1618,7 @@ static uint32_t do_recvfrom(uint32_t fd, uint32_t buf, uint32_t len,
     uint32_t ip = 0;
     uint16_t port = 0;
     int n = net_recvfrom(id, (void*)buf, len, &ip, &port);
+    if (n > 0) proc_unix_writers_try();   /* room freed in the peer ring */
     if (n == NET_EAGAIN) return err(ERR_EAGAIN);
     if (n < 0) return err(ERR_EBADF);
     if (addr) write_sockaddr(addr, alenp, ip, port);
@@ -1795,9 +1812,9 @@ static uint32_t do_socketcall(uint32_t call, uint32_t args) {
         }
         case 6:  return do_getsockname(a[0], a[1], a[2]);
         case 7:  return do_getpeername(a[0], a[1], a[2]);
-        case 9:  return do_sendto(a[0], a[1], a[2], a[3], 0, 0);
+        case 9:  return do_sendto(NULL, a[0], a[1], a[2], a[3], 0, 0);
         case 10: return do_recvfrom(a[0], a[1], a[2], a[3], 0, 0);
-        case 11: return do_sendto(a[0], a[1], a[2], a[3], a[4], a[5]);
+        case 11: return do_sendto(NULL, a[0], a[1], a[2], a[3], a[4], a[5]);
         case 12: return do_recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]);
         case 8:  return do_socketpair(a[0], a[1], a[2], a[3]);
         case 13: return do_shutdown(a[0], a[1]);
@@ -4363,7 +4380,7 @@ void syscall_handler(registers_t* regs) {
             ret = do_connect(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_sendto:
-            ret = do_sendto(regs->ebx, regs->ecx, regs->edx,
+            ret = do_sendto(regs, regs->ebx, regs->ecx, regs->edx,
                             regs->esi, regs->edi, regs->ebp);
             break;
         case SYS_recvfrom:

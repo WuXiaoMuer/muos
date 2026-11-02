@@ -718,6 +718,60 @@ int proc_futex_wake(uint32_t uaddr, int32_t count, uint32_t pd_phys) {
     return woken;
 }
 
+/* Copy a user buffer from a blocked process page by page: its page
+ * directory is not active, so each page is translated separately. */
+static uint32_t proc_copy_user(proc_t* p, uint32_t uptr, void* dst,
+                               uint32_t len) {
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t off = (uptr + done) & (PAGE_SIZE - 1u);
+        uint32_t chunk = PAGE_SIZE - off;
+        if (chunk > len - done) chunk = len - done;
+        uint8_t* src = proc_user_ptr(p, uptr + done);
+        if (!src) break;
+        memcpy((uint8_t*)dst + done, src, chunk);
+        done += chunk;
+    }
+    return done;
+}
+
+/* A blocked AF_UNIX send resumes here once the peer ring has room: the
+ * kernel copies the pending bytes and completes the original send(2). */
+#define UNIX_WRITE_TMP 8192u
+int proc_unix_writers_try(void) {
+    static uint8_t tmp[UNIX_WRITE_TMP];
+    int woken = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        proc_t* p = &procs[i];
+        if (!p->used || p->pid == 1) continue;
+        if (p->state != PROC_BLOCKED ||
+            p->wait_kind != PROC_WAIT_UNIXWRITE) continue;
+
+        int sid = p->blk_fd;
+        uint32_t n = (uint32_t)p->blk_len;
+        if (n > UNIX_WRITE_TMP) n = UNIX_WRITE_TMP;
+
+        if (!net_socket_ok(sid)) {
+            p->eax = (uint32_t)-9;                   /* -EBADF */
+        } else if (!net_unix_writable(sid)) {
+            p->eax = (uint32_t)-32;                  /* -EPIPE */
+        } else if (!net_unix_has_space(sid, n)) {
+            continue;                                /* still full */
+        } else if (proc_copy_user(p, p->blk_ptr, tmp, n) != n) {
+            p->eax = (uint32_t)-14;                  /* -EFAULT */
+        } else {
+            int rc = net_sendto(sid, tmp, n, 0, 0);
+            if (rc < 0) continue;                    /* lost a race */
+            p->eax = (uint32_t)rc;
+        }
+        p->wait_kind = PROC_WAIT_NONE;
+        p->blk_has_deadline = false;
+        p->state = PROC_READY;
+        woken++;
+    }
+    return woken;
+}
+
 /* ---- page replacement ---- */
 
 #define SWAP_SCAN_PAGES ((USER_SIGTRAMP - USER_BASE) / PAGE_SIZE)
