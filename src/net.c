@@ -1566,6 +1566,8 @@ static int tcp_send_data(net_sock_t* s, const void* data, uint32_t len) {
         if (window > TXQ_MAX * TCP_MSS) window = TXQ_MAX * TCP_MSS;
 
         if (inflight >= window) {
+            /* Non-blocking sockets report a full window instead of waiting. */
+            if (s->nonblock) return sent ? (int)sent : -1;
             /* Congestion window is full: wait for ACKs (poll also runs
              * the RTO timer and may abort the connection). */
             net_poll();
@@ -1624,6 +1626,53 @@ bool_t net_unix_has_space(int id, uint32_t len) {
     if (!net_unix_writable(id)) return false;
     net_sock_t* peer = &socks[socks[id].unix_peer];
     return len <= UNIX_BUF_SIZE - peer->unix_len;
+}
+
+bool_t net_poll_readable(int id) {
+    if (!net_socket_ok(id)) return false;
+    net_sock_t* s = &socks[id];
+    if (s->unix_peer >= 0 || s->unix_peer_closed) {
+        if (s->type == NET_SOCK_DGRAM) return s->has;
+        if (s->unix_len) return true;
+        return s->unix_peer_closed || !net_socket_ok(s->unix_peer);
+    }
+    if (s->tcp_state == TCP_LISTEN) return net_accept_now(id) != NET_EAGAIN;
+    if (s->type == NET_SOCK_STREAM) {
+        for (int i = 0; i < TCP_RXQ_MAX; i++) {
+            if (s->rxq[i].used && s->rxq[i].len &&
+                s->rxq[i].seq == s->rx_delivered)
+                return true;
+        }
+        return s->tcp_state == TCP_CLOSE_WAIT &&
+               s->rcv_nxt == s->rx_delivered;
+    }
+    return s->has;
+}
+
+bool_t net_poll_writable(int id) {
+    if (!net_socket_ok(id)) return false;
+    net_sock_t* s = &socks[id];
+    if (s->unix_peer >= 0 || s->unix_peer_closed)
+        return net_unix_writable(id) && net_unix_has_space(id, 1);
+    if (s->type == NET_SOCK_STREAM) {
+        if (s->tcp_state != TCP_ESTAB && s->tcp_state != TCP_CLOSE_WAIT)
+            return false;
+        uint32_t window = s->cwnd ? s->cwnd : TCP_MSS;
+        if (s->snd_wnd < window) window = s->snd_wnd;
+        return (s->snd_nxt - s->snd_una) < window;
+    }
+    return true;
+}
+
+bool_t net_poll_hup(int id) {
+    if (!net_socket_ok(id)) return false;
+    net_sock_t* s = &socks[id];
+    if (s->unix_peer >= 0 || s->unix_peer_closed) {
+        if (s->type == NET_SOCK_DGRAM) return false;
+        return s->unix_peer_closed || !net_socket_ok(s->unix_peer);
+    }
+    return s->tcp_state == TCP_CLOSE_WAIT &&
+           s->rcv_nxt == s->rx_delivered;
 }
 
 /* Allocate a bare AF_UNIX endpoint (no NIC needed). */

@@ -38,7 +38,7 @@ uint32_t net_get_gateway(void);
  * syscall layer adds NET_FD_BASE. Return >=0 on success, negative error. */
 int net_socket(int type, int proto);
 /* Create a connected AF_UNIX pair (socketpair(2)); no NIC required.
- * Returns 0 with ids in *a/*b, -1 when slots are exhausted, -2 for a
+ * Returns 0 with ids in a / b, -1 when slots are exhausted, -2 for a
  * supported-type mismatch. */
 int net_socketpair(int type, int* a, int* b);
 /* SOCK_STREAM/SOCK_DGRAM/SOCK_RAW of a live socket, 0 when invalid. */
@@ -51,6 +51,10 @@ bool_t net_socket_nonblock(int id);
 /* AF_UNIX stream send side: writable (peer alive, not shut) and space. */
 bool_t net_unix_writable(int id);
 bool_t net_unix_has_space(int id, uint32_t len);
+/* poll/select readiness for socket fds (no side effects). */
+bool_t net_poll_readable(int id);
+bool_t net_poll_writable(int id);
+bool_t net_poll_hup(int id);
 int net_bind(int id, uint32_t ip, uint16_t port);
 int net_connect(int id, uint32_t ip, uint16_t port);
 int net_listen(int id);

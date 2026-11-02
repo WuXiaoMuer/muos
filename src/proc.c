@@ -22,6 +22,7 @@ static uint32_t kernel_stack_pages(void) {
 /* ---- refcounted address space ---- */
 
 static uint8_t* proc_user_ptr(proc_t* p, uint32_t uptr);
+static void proc_wake_pollers(void);
 
 static void proc_space_unref(proc_space_t* s) {
     if (!s) return;
@@ -695,6 +696,9 @@ void proc_tick_all(void) {
             p->state = PROC_READY;
         }
     }
+    /* Socket readiness can change from NIC input, so rescan blocked pollers
+     * every tick as well as on pipe/keyboard events. */
+    proc_wake_pollers();
 }
 
 /* futex(WAIT) blocking is per address space: only processes sharing the

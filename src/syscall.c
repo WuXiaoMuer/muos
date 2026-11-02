@@ -2959,6 +2959,10 @@ static uint32_t do_dup(uint32_t fd) {
  * (waiting would block the whole single-address-space machine). */
 
 static bool_t fd_read_ready(int fd) {
+    if (fd >= NET_FD_BASE && fd < NET_FD_MAX) {
+        int sid = fd - NET_FD_BASE;
+        return net_socket_ok(sid) && net_poll_readable(sid);
+    }
     switch (user_fd_kind(fd)) {
         case USER_FD_STDIN:
         case USER_FD_DEV_CONSOLE:
@@ -2983,6 +2987,10 @@ static bool_t fd_read_ready(int fd) {
 }
 
 static bool_t fd_write_ready(int fd) {
+    if (fd >= NET_FD_BASE && fd < NET_FD_MAX) {
+        int sid = fd - NET_FD_BASE;
+        return net_socket_ok(sid) && net_poll_writable(sid);
+    }
     switch (user_fd_kind(fd)) {
         case USER_FD_FILE:
         case USER_FD_STDOUT:
@@ -3017,7 +3025,17 @@ static uint32_t poll_scan(uint32_t fds_ptr, uint32_t nfds) {
         int16_t rev = 0;
         if (p.fd >= 0) {
             if (user_fd_kind(p.fd) < 0) {
-                rev = POLLNVAL;
+                int sid = p.fd - NET_FD_BASE;
+                if (p.fd >= NET_FD_BASE && p.fd < NET_FD_MAX &&
+                    net_socket_ok(sid)) {
+                    if ((p.events & POLLIN) && net_poll_readable(sid))
+                        rev |= POLLIN;
+                    if ((p.events & POLLOUT) && net_poll_writable(sid))
+                        rev |= POLLOUT;
+                    if (net_poll_hup(sid)) rev |= POLLHUP;
+                } else {
+                    rev = POLLNVAL;
+                }
             } else {
                 if ((p.events & POLLIN) && fd_read_ready(p.fd)) rev |= POLLIN;
                 if ((p.events & POLLOUT) && fd_write_ready(p.fd)) rev |= POLLOUT;
@@ -3114,6 +3132,8 @@ static uint32_t do_select(uint32_t nfds, uint32_t rp, uint32_t wp,
         if (!r && !w && !e) continue;
 
         bool_t valid = user_fd_kind((int)fd) >= 0;
+        if (!valid && fd >= NET_FD_BASE && fd < NET_FD_MAX)
+            valid = net_socket_ok((int)fd - NET_FD_BASE);
         bool_t rr = r && valid && fd_read_ready((int)fd);
         bool_t ww = w && valid && fd_write_ready((int)fd);
 

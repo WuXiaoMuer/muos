@@ -657,6 +657,22 @@ int main(int argc, char** argv) {
                 ok = ok && nb_ok;
                 muos_fcntl(sv[1], MUOS_F_SETFL, 0);   /* back to blocking */
 
+                /* poll(2) on a socket fd: empty = 0, data = POLLIN. */
+                muos_pollfd_t pfd;
+                pfd.fd = sv[1]; pfd.events = MUOS_POLLIN; pfd.revents = 0;
+                int pr0 = muos_poll(&pfd, 1, 0);
+                int ps = muos_send(sv[0], "POLLTST", 7, 0);
+                pfd.revents = 0;
+                int pr1 = muos_poll(&pfd, 1, 0);
+                int prd = muos_recv(sv[1], unix_big2, 7, 0);
+                int poll_ok = (pr0 == 0 && ps == 7 && pr1 == 1 &&
+                               (pfd.revents & MUOS_POLLIN) && prd == 7);
+                muos_puts("tcp: sock-poll="); muos_putdec(pr0);
+                muos_puts("/"); muos_putdec(pr1);
+                muos_puts("/"); muos_putdec(pfd.revents);
+                muos_puts(poll_ok ? " poll-ok\n" : " poll-bad\n");
+                ok = ok && poll_ok;
+
                 /* Fill the 8KB ring, then a 512-byte send blocks until a
                  * thread drains 4KB; the kernel completes the pending send. */
                 for (unsigned i = 0; i < sizeof(unix_fill); i++)
@@ -696,6 +712,16 @@ int main(int argc, char** argv) {
                 muos_puts(" peer-recv="); muos_putdec(eof);
                 muos_puts(shut_ok ? " shutdown-ok\n" : " shutdown-bad\n");
                 ok = ok && shut_ok;
+
+                /* EOF also shows up as POLLIN|POLLHUP on the socket. */
+                pfd.fd = sv[1]; pfd.events = MUOS_POLLIN; pfd.revents = 0;
+                int peof = muos_poll(&pfd, 1, 0);
+                int eof_poll = (peof == 1 && (pfd.revents & MUOS_POLLIN) &&
+                                (pfd.revents & MUOS_POLLHUP));
+                muos_puts("tcp: eof-poll="); muos_putdec(peof);
+                muos_puts("/"); muos_putdec(pfd.revents);
+                muos_puts(eof_poll ? " eof-poll-ok\n" : " eof-poll-bad\n");
+                ok = ok && eof_poll;
 
                 muos_close(sv[0]);
                 muos_close(sv[1]);

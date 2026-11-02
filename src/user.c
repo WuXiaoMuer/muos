@@ -12,6 +12,7 @@
 #include "keyboard.h"
 #include "pit.h"
 #include "module.h"
+#include "net.h"
 
 /* Embedded user image: built by build.ps1 into build/hello.elf and linked
  * into the kernel as a raw binary blob (see the objcopy step). */
@@ -350,7 +351,19 @@ void user_fd_state_release(void* state) {
 /* Readiness of one fd in a saved snapshot (cross-process poll wakeups). */
 int user_fd_state_events(void* state, int fd, int events) {
     const user_fd_t* s = (const user_fd_t*)state;
-    if (!s || fd < 0 || fd >= USER_FD_MAX) return USER_POLLNVAL;
+    if (!s) return USER_POLLNVAL;
+    if (fd >= NET_FD_BASE && fd < NET_FD_MAX) {
+        int sid = fd - NET_FD_BASE;
+        if (!net_socket_ok(sid)) return USER_POLLNVAL;
+        int rev = 0;
+        if ((events & USER_POLLIN) && net_poll_readable(sid))
+            rev |= USER_POLLIN;
+        if ((events & USER_POLLOUT) && net_poll_writable(sid))
+            rev |= USER_POLLOUT;
+        if (net_poll_hup(sid)) rev |= USER_POLLHUP;
+        return rev;
+    }
+    if (fd < 0 || fd >= USER_FD_MAX) return USER_POLLNVAL;
     const user_fd_t* e = &s[fd];
     if (e->kind == USER_FD_FREE) return USER_POLLNVAL;
 
