@@ -140,6 +140,7 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define SYS_getcwd   183
 #define SYS_sendfile 187
 #define SYS_clock_gettime 265
+#define SYS_getrandom     355
 #define SYS_utimes   271
 #define SYS_futimesat 299
 #define SYS_utimensat 320
@@ -372,6 +373,32 @@ static uint32_t err(uint32_t code) {
     return (uint32_t)(-(int32_t)code);
 }
 
+/* Kernel entropy source for getrandom(2) and /dev/urandom. xorshift32 is
+ * seeded once from the RTC epoch mixed with PIT ticks; the state then
+ * evolves on every 32-bit word handed out. */
+static uint32_t rng_state = 0;
+static uint32_t rng_word = 0;
+
+static uint32_t rng_next(void) {
+    if (!rng_state) {
+        rng_state = rtc_now() ^ (pit_get_ticks() * 2654435761u);
+        if (!rng_state) rng_state = 0x9E3779B9u;
+    }
+    uint32_t x = rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    rng_state = x;
+    return x;
+}
+
+static void rng_fill(uint8_t* dst, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        if ((i & 3) == 0) rng_word = rng_next();
+        dst[i] = (uint8_t)(rng_word >> ((i & 3) * 8));
+    }
+}
+
 static uint32_t read_keyboard_char(uint32_t buf) {
     /* keyboard_getchar spins with interrupts enabled internally, which
      * is required here: int 0x80 also runs with IF=0. */
@@ -403,6 +430,7 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
         }
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
+        case USER_FD_DEV_URANDOM:
             return count;              /* writes are discarded */
         case USER_FD_STDOUT:
         case USER_FD_STDERR:
@@ -501,6 +529,9 @@ static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
             return 0;
         case USER_FD_DEV_ZERO:
             memset((void*)buf, 0, count);
+            return count;
+        case USER_FD_DEV_URANDOM:
+            rng_fill((uint8_t*)buf, count);
             return count;
         case USER_FD_STDIN:
         case USER_FD_DEV_CONSOLE:
@@ -608,7 +639,8 @@ static bool_t copy_user_string(uint32_t ptr, char* dst, uint32_t max) {
 #define VFS_DEV_NULL    1
 #define VFS_DEV_ZERO    2
 #define VFS_DEV_CONSOLE 3
-#define VFS_DEV_ATA     4
+#define VFS_DEV_URANDOM 4
+#define VFS_DEV_ATA     5
 
 #define VFS_VF_MEMINFO 1
 #define VFS_VF_UPTIME  2
@@ -816,6 +848,7 @@ static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
         if (strcmp(n, "null") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_NULL; return 0; }
         if (strcmp(n, "zero") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_ZERO; return 0; }
         if (strcmp(n, "console") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_CONSOLE; return 0; }
+        if (strcmp(n, "urandom") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_URANDOM; return 0; }
         if (strcmp(n, "hda") == 0) {
             if (!ata_present()) return err(ERR_ENODEV);
             e->type = VFS_T_DEV;
@@ -1206,12 +1239,12 @@ static bool_t vfs_dir_entry(const char* path, uint32_t idx, char* name,
     }
 
     if (dir == VFS_DIR_DEV) {
-        const char* devs[4] = { "null", "zero", "console", "hda" };
-        if (idx < 4) {
-            if (idx == 3 && !ata_present()) return false;
+        const char* devs[5] = { "null", "zero", "console", "urandom", "hda" };
+        if (idx < 5) {
+            if (idx == 4 && !ata_present()) return false;
             strncpy(name, devs[idx], USER_FD_PATH_MAX);
             *ino = 200 + idx;
-            *type = (idx == 3) ? 6 : 2;     /* DT_BLK : DT_CHR */
+            *type = (idx == 4) ? 6 : 2;     /* DT_BLK : DT_CHR */
             return true;
         }
         return false;
@@ -1383,6 +1416,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
             int kind = USER_FD_DEV_NULL;
             if (e.id == VFS_DEV_ZERO) kind = USER_FD_DEV_ZERO;
             else if (e.id == VFS_DEV_CONSOLE) kind = USER_FD_DEV_CONSOLE;
+            else if (e.id == VFS_DEV_URANDOM) kind = USER_FD_DEV_URANDOM;
             else if (e.id == VFS_DEV_ATA) kind = USER_FD_DEV_ATA;
             int fd = fd_open_flags(user_fd_alloc_dev(kind), flags);
             if (fd < 0) return err(ERR_EMFILE);
@@ -1950,6 +1984,7 @@ static bool_t vfs_fd_fields(int fd, uint32_t* ino, uint32_t* mode,
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
         case USER_FD_DEV_CONSOLE:
+        case USER_FD_DEV_URANDOM:
             *ino = 200 + (uint32_t)(kind - USER_FD_DEV_NULL);
             *mode = S_IFCHR | 0666;
             *nlink = 1;
@@ -2171,6 +2206,7 @@ static int kbuf_write(uint32_t fd, const char* data, uint32_t count) {
         }
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
+        case USER_FD_DEV_URANDOM:
             return (int)count;
         case USER_FD_STDOUT:
         case USER_FD_STDERR:
@@ -2890,6 +2926,7 @@ static bool_t fd_read_ready(int fd) {
         case USER_FD_DIR:
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
+        case USER_FD_DEV_URANDOM:
         case USER_FD_DEV_ATA:
             return true;
         case USER_FD_PIPE_READ: {
@@ -2911,6 +2948,7 @@ static bool_t fd_write_ready(int fd) {
         case USER_FD_DEV_CONSOLE:
         case USER_FD_DEV_NULL:
         case USER_FD_DEV_ZERO:
+        case USER_FD_DEV_URANDOM:
         case USER_FD_DEV_ATA:
             return true;
         case USER_FD_PIPE_WRITE: {
@@ -3694,6 +3732,17 @@ static uint32_t do_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg) {
     }
 }
 
+/* getrandom(2): fill up to one page of user memory from the kernel RNG.
+ * GRND_NONBLOCK/RANDOM/INSECURE are accepted; unknown flags are EINVAL. */
+static uint32_t do_getrandom(uint32_t buf, uint32_t len, uint32_t flags) {
+    if (flags & ~(0x1u | 0x2u | 0x4u)) return err(ERR_EINVAL);
+    if (len == 0) return 0;
+    if (len > PAGE_SIZE) len = PAGE_SIZE;
+    if (!user_ptr_ok(buf, len)) return err(ERR_EFAULT);
+    rng_fill((uint8_t*)buf, len);
+    return len;
+}
+
 static uint32_t do_uname(uint32_t ptr) {
     if (!user_ptr_ok(ptr, UTS_SIZE)) return err(ERR_EFAULT);
 
@@ -4291,6 +4340,9 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_gettimeofday:
             ret = do_gettimeofday(regs->ebx, regs->ecx);
+            break;
+        case SYS_getrandom:
+            ret = do_getrandom(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_clock_gettime:
             ret = do_clock_gettime(regs->ebx, regs->ecx, 8);

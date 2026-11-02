@@ -32,6 +32,7 @@
 - [x] `/proc/stat` 全量字段(`cpu/cpu0/intr/ctxt/btime/processes/procs_running/blocked`),BusyBox `top -b -n 1` 实测通过
 - [x] `poll` 的真正阻塞等待(`PROC_WAIT_POLL` + 唤醒方按保存的 fd 表填充 `revents`,PIT 到期唤醒;无其他可运行进程时退回 `sti; hlt` 有界等待)
 - [x] fd 打开标志:`O_APPEND` 每次写从 EOF 开始,RAM FS 与 `/fat`、`/ext2` 均支持;`fcntl(F_GETFL/F_SETFL)` 读写/切换该标志;`FILE/EXT` 按 `O_ACCMODE` 拒绝越权读写(O_RDONLY 写、O_WRONLY 读返回 EBADF),`run append` 实测 `APPEND-OK`
+- [x] 熵源:`getrandom(355)` 用 xorshift32(RTC/PIT 种子,单次上限一页,接受 GRND_NONBLOCK/RANDOM/INSECURE);`/dev/urandom` 读随机字节/写丢弃,`run rand` 实测 `RAND-OK`
 
 ### P2 进程模型升级(结构性)
 - [x] 每进程页目录 + 按需分页用户窗口(CR3 切换);**fork 页级 COW**(物理帧引用计数,父/子页表只读,写故障复制单页并重载 CR3),exec 前释放全部用户页再重新缺页装入

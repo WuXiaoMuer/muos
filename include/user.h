@@ -65,6 +65,7 @@ typedef enum {
     USER_FD_DEV_NULL,
     USER_FD_DEV_ZERO,
     USER_FD_DEV_CONSOLE,
+    USER_FD_DEV_URANDOM,    /* /dev/urandom: kernel RNG bytes */
     USER_FD_DEV_ATA,        /* /dev/hda: raw ATA sectors */
     USER_FD_VFILE,
     USER_FD_EXT,            /* file on a mounted FAT32/ext2 volume */

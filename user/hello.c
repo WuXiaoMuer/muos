@@ -747,6 +747,46 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "rand")) {
+        /* getrandom(2) and /dev/urandom must return non-trivial, distinct
+         * byte streams; unknown flags are rejected with EINVAL. */
+        unsigned char a[64], b[64], c[32];
+        int r1 = muos_getrandom(a, sizeof(a), 0);
+        int r2 = muos_getrandom(b, sizeof(b), 0);
+        int diff = 0, nz = 0;
+        for (unsigned i = 0; i < sizeof(a); i++) {
+            if (a[i] != b[i]) diff++;
+            if (a[i]) nz++;
+        }
+
+        int bad_flags = muos_getrandom(a, 4, 0x8);
+        int zero_len = muos_getrandom(a, 0, 0);
+
+        int fd = muos_open("/dev/urandom", 0);
+        int rn = fd >= 0 ? muos_read(fd, c, sizeof(c)) : -1;
+        int c_diff = 0, c_nz = 0;
+        for (unsigned i = 0; i < sizeof(c); i++) {
+            if (c[i] != a[i % sizeof(a)]) c_diff++;
+            if (c[i]) c_nz++;
+        }
+        if (fd >= 0) muos_close(fd);
+
+        int ok = (r1 == 64 && r2 == 64 && diff >= 48 && nz >= 24 &&
+                  bad_flags == -22 && zero_len == 0 &&
+                  rn == 32 && c_diff >= 24 && c_nz >= 12);
+        muos_puts("rand: getrandom="); muos_putdec(r1);
+        muos_puts("/"); muos_putdec(r2);
+        muos_puts(" diff="); muos_putdec(diff);
+        muos_puts(" nonzero="); muos_putdec(nz); muos_puts("\n");
+        muos_puts("rand: bad-flags="); muos_putdec(bad_flags);
+        muos_puts(" zero-len="); muos_putdec(zero_len);
+        muos_puts(" urandom="); muos_putdec(rn);
+        muos_puts(" diff="); muos_putdec(c_diff);
+        muos_puts(" nonzero="); muos_putdec(c_nz); muos_puts("\n");
+        muos_puts(ok ? "RAND-OK\n" : "RAND-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "pie")) {
         /* Runs from the ET_DYN image: the kernel loaded the lowest
          * segment at USER_BASE and applied its RELATIVE relocations. */

@@ -134,6 +134,10 @@ int muos_uname(char* out) {
     return syscall1(122, (int)out);
 }
 
+int muos_getrandom(void* buf, unsigned len, int flags) {
+    return syscall3(355, (int)buf, (int)len, flags);
+}
+
 unsigned muos_mmap(unsigned len) {
     /* old_mmap(90): pointer to {addr,len,prot,flags,fd,offset} */
     unsigned args[6];
