@@ -102,6 +102,7 @@ def main():
                                        "VFS-RMDIR-NONEMPTY-OK" in tf,
         "vfs ext2 open/read": "VFS-EXT2-OK" in te and "VFS-OK" in te,
         "vfs ext2 big file": "EXT2-BIG-OK" in te,
+        "vfs ext2 big write": "VFS-BIGWRITE-OK" in te,
         "vfs ext2 write": "VFS-WRITE-OK" in te,
         "vfs ext2 persist": "VFS-WRITE-OK" in tew,
         "vfs ext2 getdents": "VFS-LIST-OK" in te,

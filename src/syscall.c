@@ -24,11 +24,13 @@
 #define VFS_VOL_FAT  1
 #define VFS_VOL_EXT2 2
 
-/* One 64KB staging buffer for writable mounted-volume files. Writes are
- * read-modify-rewrite (FAT/ext2 drivers take whole-file images), and
- * syscalls are not preempted, so a single buffer is safe and avoids per-fd
- * heap ownership across fork/dup. */
-static uint8_t vfs_ext_wbuf[FS_MAX_SIZE];
+/* One 256KB staging buffer for writable mounted-volume files. Writes are
+ * read-modify-rewrite (FAT/ext2 drivers take whole-file images), and syscalls
+ * are not preempted, so a single buffer is safe and avoids per-fd heap
+ * ownership across fork/dup. ext2's single-indirect limit is 268 blocks, so
+ * 256KB fits without a second-level indirect write path. */
+#define VFS_EXT_MAX 262144u
+static uint8_t vfs_ext_wbuf[VFS_EXT_MAX];
 
 static int vfs_vol_write(int vol, const char* path, const void* data,
                          uint32_t len) {
@@ -475,9 +477,9 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
             uint32_t old = 0;
             if (!vfs_mount_stat(vol, ep, &is_dir, &old) || is_dir)
                 return err(ERR_EBADF);
-            if (old > FS_MAX_SIZE) return err(ERR_EFBIG);
+            if (old > VFS_EXT_MAX) return err(ERR_EFBIG);
             uint32_t off = (fflags & O_APPEND) ? old : user_fd_offset((int)fd);
-            if (off >= FS_MAX_SIZE || count > FS_MAX_SIZE - off)
+            if (off >= VFS_EXT_MAX || count > VFS_EXT_MAX - off)
                 return err(ERR_EFBIG);
 
             memset(vfs_ext_wbuf, 0, sizeof(vfs_ext_wbuf));

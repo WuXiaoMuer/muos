@@ -67,6 +67,7 @@ static unsigned char unix_big2[2048];
 static unsigned char unix_fill[8192];
 static unsigned char unix_drainbuf[4096];
 static unsigned char unix_small[512];
+static unsigned char vfs_big[131072];       /* 128KB mounted-volume write test */
 
 static void unix_drainer(void* arg) {
     unsigned ts[2] = { 0, 20000000 };       /* 20ms */
@@ -154,6 +155,35 @@ int main(int argc, char** argv) {
             muos_puts("vfs: big="); muos_putdec(big_ok); muos_puts("\n");
             if (big_ok) muos_puts("EXT2-BIG-OK\n");
             ok = ok && big_ok;
+
+            /* >64KB VFS write: 128KB through the mounted ext2 volume, then
+             * read the tail marker back to prove the whole file landed. */
+            for (unsigned i = 0; i < sizeof(vfs_big); i++)
+                vfs_big[i] = (unsigned char)('a' + (i % 26));
+            const char bwmsg[] = "VFS-BIG-OK\n";
+            for (unsigned i = 0; i < sizeof(bwmsg) - 1; i++)
+                vfs_big[sizeof(vfs_big) - sizeof(bwmsg) + 1 + i] = bwmsg[i];
+            int bwfd = muos_open("/ext2/bigwrite.bin",
+                                 MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+            int bw = bwfd >= 0 ? muos_write(bwfd, vfs_big, sizeof(vfs_big)) : -1;
+            if (bwfd >= 0) muos_close(bwfd);
+
+            int bw_ok = 0;
+            if (bw == (int)sizeof(vfs_big)) {
+                int brfd = muos_open("/ext2/bigwrite.bin", 0);
+                if (brfd >= 0) {
+                    muos_lseek(brfd, sizeof(vfs_big) - sizeof(bwmsg) + 1, 0);
+                    char bt[16];
+                    int bn = muos_read(brfd, bt, sizeof(bwmsg) - 1);
+                    bt[bn > 0 ? bn : 0] = '\0';
+                    bw_ok = (bn == (int)sizeof(bwmsg) - 1 && arg_is(bt, bwmsg));
+                    muos_close(brfd);
+                }
+            }
+            muos_puts("vfs: big-write="); muos_putdec(bw);
+            muos_puts(bw_ok ? " big-write-ok\n" : " big-write-bad\n");
+            if (bw_ok) muos_puts("VFS-BIGWRITE-OK\n");
+            ok = ok && bw_ok;
         }
 
         int rc = muos_fstatat64(MUOS_AT_FDCWD, path, st.raw, 0);

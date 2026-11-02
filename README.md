@@ -219,7 +219,7 @@ muos> ext2write /NEW.TXT OK # 创建/覆盖 ext2 文件(位图分配 + 目录项
 muos> ls /fat             # 挂载的 FAT32 卷(读写)
 muos> cat /fat/HELLO.TXT  # 通过 VFS 路径读取分区文件
 muos> ls /ext2            # 挂载的 ext2 卷(读写)
-muos> run vfs             # 挂载卷 open/read/write/stat/getdents 验证(含 ext2 300KB 双间接文件)
+muos> run vfs             # 挂载卷 open/read/write/stat/getdents 验证(含 ext2 300KB 双间接读、128KB 大文件写)
 muos> poweroff            # ACPI S5 关机(无 FADT 时用 QEMU 0x604/0xB004 端口)
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```
