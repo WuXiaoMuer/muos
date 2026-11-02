@@ -687,7 +687,35 @@ void proc_tick_all(void) {
             p->blk_has_deadline && (int32_t)(now - p->blk_deadline) >= 0) {
             proc_poll_expire(p);                     /* timeout: 0 ready */
         }
+        if (p->state == PROC_BLOCKED && p->wait_kind == PROC_WAIT_FUTEX &&
+            p->blk_has_deadline && (int32_t)(now - p->blk_deadline) >= 0) {
+            p->eax = (uint32_t)-110;                 /* -ETIMEDOUT */
+            p->wait_kind = PROC_WAIT_NONE;
+            p->blk_has_deadline = false;
+            p->state = PROC_READY;
+        }
     }
+}
+
+/* futex(WAIT) blocking is per address space: only processes sharing the
+ * same page directory and the same user word may be woken. */
+int proc_futex_wake(uint32_t uaddr, int32_t count, uint32_t pd_phys) {
+    int woken = 0;
+    if (count <= 0) return 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        proc_t* p = &procs[i];
+        if (!p->used || p->pid == 1) continue;
+        if (p->state != PROC_BLOCKED || p->wait_kind != PROC_WAIT_FUTEX)
+            continue;
+        if (p->pd_phys != pd_phys || p->blk_ptr != uaddr) continue;
+        p->wait_kind = PROC_WAIT_NONE;
+        p->blk_has_deadline = false;
+        p->eax = 0;                                  /* FUTEX_WAIT returns 0 */
+        p->state = PROC_READY;
+        woken++;
+        if (woken >= count) break;
+    }
+    return woken;
 }
 
 /* ---- page replacement ---- */

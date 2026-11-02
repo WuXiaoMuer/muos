@@ -28,7 +28,8 @@ typedef enum {
     PROC_WAIT_POLL,      /* blocked in poll() with a deadline */
     PROC_WAIT_SIGSUSP,   /* blocked until a signal is delivered */
     PROC_WAIT_READ,      /* blocked in read() on a pipe/console */
-    PROC_WAIT_ACCEPT     /* blocked in accept() on a listening TCP socket */
+    PROC_WAIT_ACCEPT,    /* blocked in accept() on a listening TCP socket */
+    PROC_WAIT_FUTEX      /* blocked in futex(WAIT) on a user address */
 } proc_wait_t;
 
 /* Refcounted address space: a thread group shares one block + page
@@ -151,6 +152,9 @@ bool_t   proc_block_current_ext(registers_t* regs, proc_wait_t kind,
                                 uint32_t ptr, int32_t len,
                                 uint32_t deadline, bool_t has_deadline,
                                 int32_t fd);
+/* Wake up to `count` processes blocked in futex(WAIT) on `uaddr` inside the
+ * address space `pd_phys`. Returns the number woken. */
+int      proc_futex_wake(uint32_t uaddr, int32_t count, uint32_t pd_phys);
 void     proc_exit_current(registers_t* regs, int code, bool_t faulted);
 bool_t   proc_frame_switched(void);
 void     proc_clear_frame_switched(void);

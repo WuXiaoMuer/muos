@@ -130,6 +130,43 @@ int muos_fcntl(int fd, int cmd, int arg) {
     return syscall3(55, fd, cmd, arg);
 }
 
+int muos_futex(void* uaddr, int op, int val, void* timeout) {
+    return syscall4(240, (int)uaddr, op, val, (int)timeout);
+}
+
+int muos_prctl(int opt, unsigned a2, unsigned a3, unsigned a4, unsigned a5) {
+    return syscall5(172, opt, (int)a2, (int)a3, (int)a4, (int)a5);
+}
+
+int muos_madvise(unsigned addr, unsigned len, int advice) {
+    return syscall3(219, (int)addr, (int)len, advice);
+}
+
+int muos_fadvise64(int fd, unsigned off_lo, unsigned off_hi,
+                   unsigned len, int advice) {
+    return syscall5(250, fd, (int)off_lo, (int)off_hi, (int)len, advice);
+}
+
+int muos_sched_setaffinity(int pid, unsigned len, unsigned* mask) {
+    return syscall3(241, pid, (int)len, (int)mask);
+}
+
+int muos_sched_getaffinity(int pid, unsigned len, unsigned* mask) {
+    return syscall3(242, pid, (int)len, (int)mask);
+}
+
+int muos_tkill(int tid, int sig) {
+    return syscall2(238, tid, sig);
+}
+
+int muos_tgkill(int tgid, int tid, int sig) {
+    return syscall3(270, tgid, tid, sig);
+}
+
+int muos_sched_yield(void) {
+    return syscall0(158);
+}
+
 int muos_uname(char* out) {
     return syscall1(122, (int)out);
 }

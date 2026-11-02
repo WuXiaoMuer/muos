@@ -162,6 +162,17 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define SYS_exit_group      252
 #define SYS_set_tid_address 258
 #define SYS_gettid          224
+#define SYS_sched_yield     158
+#define SYS_futex           240
+#define SYS_set_robust_list 311
+#define SYS_get_robust_list 312
+#define SYS_prctl           172
+#define SYS_madvise         219
+#define SYS_tkill           238
+#define SYS_sched_setaffinity 241
+#define SYS_sched_getaffinity 242
+#define SYS_fadvise64       250
+#define SYS_tgkill          270
 
 /* Signals (Linux i386 numbers and struct layouts). */
 #define SYS_alarm           27
@@ -299,6 +310,7 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define ERR_ENOPROTOOPT 92
 #define ERR_EAFNOSUPPORT 97
 #define ERR_ENOTCONN 107
+#define ERR_ETIMEDOUT 110
 
 /* ---- socket ABI ---- */
 #define SYS_socketcall  102
@@ -3743,6 +3755,149 @@ static uint32_t do_getrandom(uint32_t buf, uint32_t len, uint32_t flags) {
     return len;
 }
 
+/* futex(2) timeout is an i386 timespec. FUTEX_WAIT (relative) and
+ * FUTEX_WAIT_BITSET (absolute in Linux) are both treated as a relative
+ * duration here; the tick path then returns -ETIMEDOUT. */
+static bool_t futex_timeout(uint32_t ptr, uint32_t* deadline, bool_t* has) {
+    *has = false;
+    if (!ptr) return true;
+    if (!user_ptr_ok(ptr, 8)) return false;
+    uint32_t sec, nsec;
+    memcpy(&sec, (const void*)ptr, 4);
+    memcpy(&nsec, (const void*)(ptr + 4), 4);
+    if (nsec >= 1000000000u) return false;
+    uint32_t ticks = (sec > 0x7FFFFFu)
+                     ? 0x7FFFFFFFu : sec * 100u + nsec / 10000000u;
+    *deadline = pit_get_ticks() + ticks;
+    *has = true;
+    return true;
+}
+
+/* futex(2): FUTEX_WAIT (0) / FUTEX_WAIT_BITSET (9) block on a user word;
+ * FUTEX_WAKE (1) / FUTEX_WAKE_BITSET (10) wake waiters in the same address
+ * space. The PRIVATE flag is accepted and ignored. Other ops are ENOSYS. */
+static uint32_t do_futex(registers_t* regs, uint32_t uaddr, uint32_t op,
+                         uint32_t val, uint32_t timeout_ptr) {
+    if (uaddr & 3u) return err(ERR_EINVAL);
+    uint32_t cmd = op & 0x7Fu;          /* strip FUTEX_PRIVATE/CLOCK flags */
+
+    if (cmd == 0 || cmd == 9) {         /* WAIT / WAIT_BITSET */
+        if (!user_ptr_ok(uaddr, 4)) return err(ERR_EFAULT);
+        uint32_t curval = *(volatile uint32_t*)uaddr;
+        if (curval != val) return err(ERR_EAGAIN);
+
+        uint32_t deadline = 0;
+        bool_t has_deadline = false;
+        if (!futex_timeout(timeout_ptr, &deadline, &has_deadline))
+            return err(ERR_EINVAL);
+
+        proc_t* cur = proc_current();
+        if (cur && cur->pid != 1 &&
+            proc_block_current_ext(regs, PROC_WAIT_FUTEX, uaddr, (int32_t)val,
+                                   deadline, has_deadline, -1))
+            return 0;                   /* frame switched; waker sets eax */
+        return err(ERR_EAGAIN);         /* nobody could ever wake us */
+    }
+
+    if (cmd == 1 || cmd == 10) {        /* WAKE / WAKE_BITSET */
+        proc_t* cur = proc_current();
+        if (!cur) return 0;
+        return (uint32_t)proc_futex_wake(uaddr, (int32_t)val, cur->pd_phys);
+    }
+    return err(ERR_ENOSYS);
+}
+
+static uint32_t do_set_robust_list(uint32_t head, uint32_t len) {
+    /* i386 struct robust_list_head is 12 bytes. Accepted but not tracked;
+     * exiting a thread does not walk the robust list yet. */
+    if (!head || len != 12) return err(ERR_EINVAL);
+    if (!user_ptr_ok(head, len)) return err(ERR_EFAULT);
+    return 0;
+}
+
+static uint32_t do_get_robust_list(uint32_t pid, uint32_t head_ptr,
+                                   uint32_t len_ptr) {
+    (void)pid;
+    if (!head_ptr || !len_ptr) return err(ERR_EFAULT);
+    if (!user_ptr_ok(head_ptr, 4) || !user_ptr_ok(len_ptr, 4))
+        return err(ERR_EFAULT);
+    *(uint32_t*)head_ptr = 0;
+    *(uint32_t*)len_ptr = 0;
+    return 0;
+}
+
+/* prctl(2): the thread-name and dumpable options real libcs use. */
+static uint32_t do_prctl(uint32_t opt, uint32_t a2, uint32_t a3,
+                         uint32_t a4, uint32_t a5) {
+    (void)a3; (void)a4; (void)a5;
+    proc_t* p = proc_current();
+    switch (opt) {
+        case 15: {                      /* PR_SET_NAME */
+            char n[16];
+            if (!copy_user_string(a2, n, sizeof(n))) return err(ERR_EFAULT);
+            if (p) {
+                strncpy(p->name, n, PROC_NAME_MAX - 1);
+                p->name[PROC_NAME_MAX - 1] = '\0';
+            }
+            return 0;
+        }
+        case 16:                        /* PR_GET_NAME */
+            if (!a2 || !user_ptr_ok(a2, 16)) return err(ERR_EFAULT);
+            memset((void*)a2, 0, 16);
+            if (p) strncpy((char*)a2, p->name, 15);
+            return 0;
+        case 3:  return 1;              /* PR_GET_DUMPABLE */
+        case 4:  return 0;              /* PR_SET_DUMPABLE */
+        case 7:  return 0;              /* PR_GET_KEEPCAPS */
+        case 8:  return 0;              /* PR_SET_KEEPCAPS */
+        default: return 0;              /* tolerant of other options */
+    }
+}
+
+/* madvise(2): advice is accepted; the sandbox has no VMA backing to split. */
+static uint32_t do_madvise(uint32_t addr, uint32_t len, uint32_t advice) {
+    (void)advice;
+    if (len == 0) return 0;
+    if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+    if (!user_ptr_ok(addr, len)) return err(ERR_EFAULT);
+    return 0;
+}
+
+/* fadvise64(2): advisory only, so validate the fd and report success. */
+static uint32_t do_fadvise64(uint32_t fd, uint32_t off_lo, uint32_t off_hi,
+                             uint32_t len, uint32_t advice) {
+    (void)off_lo; (void)off_hi; (void)len; (void)advice;
+    if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
+    return 0;
+}
+
+/* Single-CPU affinities: always report CPU 0. */
+static uint32_t do_sched_setaffinity(uint32_t pid, uint32_t len,
+                                     uint32_t mask) {
+    (void)pid;
+    if (len < 4 || !mask || !user_ptr_ok(mask, 4)) return err(ERR_EINVAL);
+    return 0;
+}
+
+static uint32_t do_sched_getaffinity(uint32_t pid, uint32_t len,
+                                     uint32_t mask) {
+    (void)pid;
+    if (len < 4 || !mask || !user_ptr_ok(mask, 4)) return err(ERR_EINVAL);
+    *(uint32_t*)mask = 1;               /* CPU0 */
+    return 0;
+}
+
+/* tkill/tgkill: thread-directed signals; tgkill also checks the group id. */
+static uint32_t do_tkill(uint32_t tid, uint32_t sig) {
+    return do_kill(tid, sig);
+}
+
+static uint32_t do_tgkill(uint32_t tgid, uint32_t tid, uint32_t sig) {
+    proc_t* p = proc_find(tid);
+    if (!p || p->tgid != tgid) return err(ERR_ESRCH);
+    return do_kill(tid, sig);
+}
+
 static uint32_t do_uname(uint32_t ptr) {
     if (!user_ptr_ok(ptr, UTS_SIZE)) return err(ERR_EFAULT);
 
@@ -4476,6 +4631,41 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_set_tid_address:
             ret = 1;
+            break;
+        case SYS_sched_yield:
+            ret = 0;            /* single CPU round-robin: no-op is valid */
+            break;
+        case SYS_futex:
+            ret = do_futex(regs, regs->ebx, regs->ecx, regs->edx, regs->esi);
+            break;
+        case SYS_set_robust_list:
+            ret = do_set_robust_list(regs->ebx, regs->ecx);
+            break;
+        case SYS_get_robust_list:
+            ret = do_get_robust_list(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_prctl:
+            ret = do_prctl(regs->ebx, regs->ecx, regs->edx,
+                           regs->esi, regs->edi);
+            break;
+        case SYS_madvise:
+            ret = do_madvise(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_fadvise64:
+            ret = do_fadvise64(regs->ebx, regs->ecx, regs->edx,
+                               regs->esi, regs->edi);
+            break;
+        case SYS_sched_setaffinity:
+            ret = do_sched_setaffinity(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_sched_getaffinity:
+            ret = do_sched_getaffinity(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_tkill:
+            ret = do_tkill(regs->ebx, regs->ecx);
+            break;
+        case SYS_tgkill:
+            ret = do_tgkill(regs->ebx, regs->ecx, regs->edx);
             break;
         default:
             report_unknown(regs->eax);

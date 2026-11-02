@@ -57,6 +57,26 @@ static void thread_body(void* arg) {
     muos_exit(30 + id);
 }
 
+/* ---- futex test state (shared by CLONE_VM threads) ---- */
+static volatile unsigned futex_word;
+static volatile int futex_wake_ret = -1;
+
+static void futex_waker(void* arg) {
+    (void)arg;
+    unsigned ts[2] = { 0, 20000000 };       /* 20ms */
+    muos_nanosleep(ts, 0);
+    futex_word = 1;
+    futex_wake_ret = muos_futex((void*)&futex_word, MUOS_FUTEX_WAKE, 1, 0);
+    muos_exit(0);
+}
+
+static void futex_sleeper(void* arg) {
+    (void)arg;
+    unsigned ts[2] = { 0, 100000000 };      /* 100ms */
+    muos_nanosleep(ts, 0);
+    muos_exit(0);
+}
+
 static void spin_child(void) {
     for (;;) {
         volatile unsigned x = 1;
@@ -933,6 +953,91 @@ int main(int argc, char** argv) {
         ok = ok && thread_marks[0] == 100 && thread_marks[1] == 101;
 
         muos_puts(ok ? "THREAD-OK\n" : "THREAD-BAD\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "futex")) {
+        /* FUTEX_WAIT/WAKE across two CLONE_VM threads, plus the
+         * value-mismatch (EAGAIN) and timed-wait (ETIMEDOUT) paths. */
+        int ok = 1;
+        int st = 0;
+
+        futex_word = 5;
+        int eagain = muos_futex((void*)&futex_word, MUOS_FUTEX_WAIT, 4, 0);
+        ok = ok && eagain == -11;
+
+        futex_word = 0;
+        futex_wake_ret = -1;
+        int tw = muos_thread_start(futex_waker, 0,
+                                   &thread_stacks[0][0] + 4096);
+        int rc = muos_futex((void*)&futex_word, MUOS_FUTEX_WAIT, 0, 0);
+        int ww = muos_waitpid(tw, &st, 0);
+        int woke = (rc == 0 && ww == tw && ((st >> 8) & 0xFF) == 0 &&
+                    futex_word == 1 && futex_wake_ret == 1);
+
+        futex_word = 0;
+        int tsleep = muos_thread_start(futex_sleeper, 0,
+                                       &thread_stacks[0][0] + 4096);
+        unsigned ts[2] = { 0, 30000000 };       /* 30ms */
+        int trc = muos_futex((void*)&futex_word, MUOS_FUTEX_WAIT, 0, ts);
+        int ws = muos_waitpid(tsleep, &st, 0);
+        int timed = (trc == -110 && ws == tsleep);
+
+        ok = ok && woke && timed;
+        muos_puts("futex: eagain="); muos_putdec(eagain);
+        muos_puts(" wait="); muos_putdec(rc);
+        muos_puts(" wake="); muos_putdec(futex_wake_ret);
+        muos_puts(" timeout="); muos_putdec(trc);
+        muos_puts("\n");
+        muos_puts(ok ? "FUTEX-OK\n" : "FUTEX-BAD\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "abi")) {
+        /* Small libc-startup ABI batch: prctl names, madvise/fadvise64,
+         * single-CPU affinity, tkill/tgkill and sched_yield. */
+        int ok = 1;
+        char nm[16];
+        nm[0] = 0;
+        int ps = muos_prctl(15, (unsigned)"muabi", 0, 0, 0);
+        int pg = muos_prctl(16, (unsigned)nm, 0, 0, 0);
+        int name_ok = (ps == 0 && pg == 0 && nm[0] == 'm' && nm[1] == 'u' &&
+                       nm[2] == 'a' && nm[3] == 'b' && nm[4] == 'i');
+
+        unsigned char* mp = (unsigned char*)muos_mmap(4096);
+        int ma = mp ? muos_madvise((unsigned)mp, 4096, 0) : -1;
+        if (mp) muos_munmap((unsigned)mp, 4096);
+
+        int fd = muos_open("abi.txt",
+                           MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        int fa = -1;
+        if (fd >= 0) {
+            muos_write(fd, "x", 1);
+            fa = muos_fadvise64(fd, 0, 0, 4096, 0);
+            muos_close(fd);
+        }
+
+        unsigned m1 = 1, m2 = 0;
+        int as = muos_sched_setaffinity(0, 4, &m1);
+        int ag = muos_sched_getaffinity(0, 4, &m2);
+        int tk = muos_tkill(muos_getpid(), 0);
+        int tg = muos_tgkill(muos_getpid(), muos_gettid(), 0);
+        int sy = muos_sched_yield();
+
+        ok = ok && name_ok && ma == 0 && fa == 0 && as == 0 && ag == 0 &&
+             m2 == 1 && tk == 0 && tg == 0 && sy == 0;
+        muos_puts("abi: prctl="); muos_putdec(ps);
+        muos_puts("/"); muos_putdec(pg);
+        muos_puts(" name="); muos_puts(nm);
+        muos_puts("\nabi: madvise="); muos_putdec(ma);
+        muos_puts(" fadvise="); muos_putdec(fa);
+        muos_puts(" affinity="); muos_putdec(as);
+        muos_puts("/"); muos_putdec(ag);
+        muos_puts(" mask="); muos_putdec((int)m2);
+        muos_puts(" tkill="); muos_putdec(tk);
+        muos_puts(" tgkill="); muos_putdec(tg);
+        muos_puts(" yield="); muos_putdec(sy); muos_puts("\n");
+        muos_puts(ok ? "ABI-OK\n" : "ABI-BAD\n");
         return 0;
     }
 

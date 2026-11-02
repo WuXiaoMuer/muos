@@ -132,6 +132,20 @@ int  muos_gettid(void);
 /* clone a thread: fn(arg) runs on stack_top (16-byte aligned by the
  * helper); returns the thread id to the caller and 0 inside the thread. */
 int  muos_thread_start(void (*fn)(void*), void* arg, void* stack_top);
+#define MUOS_FUTEX_WAIT        0
+#define MUOS_FUTEX_WAKE        1
+#define MUOS_FUTEX_WAIT_BITSET 9
+#define MUOS_FUTEX_WAKE_BITSET 10
+int  muos_futex(void* uaddr, int op, int val, void* timeout);
+int  muos_prctl(int opt, unsigned a2, unsigned a3, unsigned a4, unsigned a5);
+int  muos_madvise(unsigned addr, unsigned len, int advice);
+int  muos_fadvise64(int fd, unsigned off_lo, unsigned off_hi,
+                    unsigned len, int advice);
+int  muos_sched_setaffinity(int pid, unsigned len, unsigned* mask);
+int  muos_sched_getaffinity(int pid, unsigned len, unsigned* mask);
+int  muos_tkill(int tid, int sig);
+int  muos_tgkill(int tgid, int tid, int sig);
+int  muos_sched_yield(void);
 
 /* ---- sockets (IPv4 only; values mirror Linux i386) ---- */
 #define MUOS_AF_INET      2

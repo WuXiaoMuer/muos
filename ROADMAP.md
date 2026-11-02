@@ -44,6 +44,8 @@
 - [x] `clone` 线程(`CLONE_VM/CLONE_FS/CLONE_FILES/CLONE_THREAD/CLONE_SETTLS`)、每线程内核栈与 TLS
 - [x] 信号投递:pending/blocked 掩码、`signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline(或 libc restorer)、默认终止动作(SIGKILL/SIGTERM 等)、`alarm`
 - [x] 阻塞 `read`(pipe/console)与阻塞 `poll`,均由写端/键盘 IRQ/PIT 唤醒
+- [x] 线程同步:`futex(240)` 的 WAIT/WAKE 与 WAIT_BITSET/WAKE_BITSET(仅同一地址空间内按用户字唤醒,值不匹配返回 EAGAIN,超时返回 ETIMEDOUT),`sched_yield(158)`、`set/get_robust_list(311/312)`;`run futex` 实测 `FUTEX-OK`
+- [x] libc 启动小项:`prctl(172)` 的线程名/DUMPABLE/KEEPCAPS、`sched_set/getaffinity(241/242)`(单 CPU 掩码)、`madvise(219)`、`fadvise64(250)`、`tkill/tgkill(238/270)`;`run abi` 实测 `ABI-OK`
 
 ### P3 动态链接与更大程序
 - [x] `ET_DYN`/静态 PIE 加载:load bias、`PT_DYNAMIC`、`R_386_RELATIVE/GLOB_DAT/JMP_SLOT/32` 重定位

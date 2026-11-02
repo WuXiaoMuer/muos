@@ -167,6 +167,7 @@ USER_SIGTRAMP = 0x08847000
 - 已实现(按用途分组):
   - 进程/stdio:`exit(1) exit_group(252) read(3) write(4) readv(145) writev(146) getpid(20) getppid(64) gettid(224) getuid/getgid/geteuid/getegid(24/47/49/50) 及其 32 位变体(199-202) getgroups(80/205)`;`fork(2)/vfork(190)/clone(120)`(支持 CLONE_VM/FILES/SIGHAND/THREAD/SETTLS/PTID/CTID)、`wait4(114)/waitid(284)`、`execve(11)`;`pipe(42)/pipe2(331)`、`poll(168)/ppoll(309)`(真阻塞)、`select(82)/_newselect(142)/pselect6(308)`;`kill(37)` 真实投递;`modify_ldt(123)` 返回 ENOSYS(由 set_thread_area 取代)
   - 信号:`signal(48)`、`sigaction(67)`、`rt_sigaction(174)`、`sigprocmask(126)`、`rt_sigprocmask(175)`、`sigsuspend(130)/rt_sigsuspend(179)`、`sigreturn(119)/rt_sigreturn(173)`、`alarm(27)`
+  - 同步/杂项:`futex(240) sched_yield(158) set/get_robust_list(311/312) prctl(172) sched_set/getaffinity(241/242) madvise(219) fadvise64(250) tkill/tgkill(238/270)`(prctl 支持线程名/DUMPABLE,affinity 固定 CPU0,madvise/fadvise 为建议性成功)
   - 文件:`open(5) close(6) lseek(19) llseek(140) dup(41) dup2(63,含 stdio 重定向) fcntl(55/221) access(33) getcwd(183) chdir(12) unlink(10) rename(38) sendfile(187/239) chmod(15) fchmod(94) chown(16)/lchown(182)/chown32(212)/lchown32(198) fchown(95/207) fchownat(298) readlink(85) truncate(92/193) ftruncate(93/194) fsync(118) fdatasync(144) sync(36)`;`*at` 族:`openat(295) mkdirat(296) fstatat64(300) unlinkat(301) renameat(302) readlinkat(305) fchmodat(306) faccessat(307)`
   - 目录/元数据:`getdents(141) getdents64(220) stat/lstat/fstat(106-108) stat64/lstat64/fstat64(195-197) statx(383) statfs/fstatfs(99/100) statfs64/fstatfs64(268/269) utimes(271) futimesat(299) utimensat(320)`
   - 内存/其他:`brk(45) old_mmap(90) mmap2(192) munmap(91) mprotect(125) getrandom(355) uname(122) sysinfo(116) set/get_thread_area(243/244) getrlimit(76)/ugetrlimit(191)/setrlimit(75)/prlimit64(340) nanosleep(162) times(43) getrusage(77) time(13) gettimeofday(78) clock_gettime(265/403)`
@@ -238,6 +239,7 @@ USER_SIGTRAMP = 0x08847000
 - 虚拟 `/bin`、`/usr/bin`、`/sbin` 下的任意名字(以及 `/bin/busybox`)映射到 Multiboot module 0;`execve` 支持 `VFS_T_MODULE`,BusyBox shell 因此能按 PATH 重新执行自身 applet。
 - `pipe(42)/pipe2(331)`:8 个 4KB 环形缓冲 pipe.c;fd 表新增 `PIPE_READ/PIPE_WRITE` 类型,`read/write/dup/dup2/close/fstat` 均支持;shell 的 `echo hi | cat`、`ls | wc -l` 已跑通。
 - `clone(120)` 支持 `CLONE_VM` 线程与自定义栈,非 CLONE_VM 时等价 fork;`vfork(190)` 等同 fork;`kill(37)` 真实投递信号,SIGTERM/SIGKILL 默认终止进程;进程组调用暂时返回自身 pid(无 pgid 表)。
+- 线程同步:`futex(240)` 新增 `PROC_WAIT_FUTEX`,`blk_ptr` 记录用户地址、`blk_deadline` 记录超时;WAIT 先比较用户字,不等返回 EAGAIN,相等则阻塞;WAKE 按 `pd_phys + 地址` 在同一地址空间内唤醒至多 val 个进程并置 `eax=0`;PIT tick 把超时等待唤醒为 `-ETIMEDOUT`;`set/get_robust_list` 接受(不做 robust 清理),`sched_yield` 单核轮转下返回 0。`run futex` 覆盖 WAIT/WAKE、EAGAIN 与 ETIMEDOUT。
 
 ### 7.8 网络与 socket ABI(pci.c / net.c)
 
