@@ -171,6 +171,10 @@ int muos_clock_nanosleep(int clockid, int flags, void* req, void* rem) {
     return syscall4(267, clockid, flags, (int)req, (int)rem);
 }
 
+int muos_clock_getres(int clockid, unsigned* ts) {
+    return syscall2(266, clockid, (int)ts);
+}
+
 int muos_mincore(unsigned addr, unsigned len, unsigned char* vec) {
     return syscall3(218, (int)addr, (int)len, (int)vec);
 }

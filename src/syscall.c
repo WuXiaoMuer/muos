@@ -140,6 +140,7 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define SYS_getcwd   183
 #define SYS_sendfile 187
 #define SYS_clock_gettime 265
+#define SYS_clock_getres  266
 #define SYS_getrandom     355
 #define SYS_utimes   271
 #define SYS_futimesat 299
@@ -316,6 +317,7 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define ERR_ENOTCONN 107
 #define ERR_ETIMEDOUT 110
 #define ERR_EPIPE 32
+#define ERR_EINPROGRESS 115
 
 /* ---- socket ABI ---- */
 #define SYS_socketcall  102
@@ -1569,7 +1571,9 @@ static uint32_t do_connect(uint32_t fd, uint32_t addr, uint32_t alen) {
     uint32_t ip = 0;
     uint16_t port = 0;
     if (!read_sockaddr(addr, alen, &ip, &port)) return err(ERR_EINVAL);
-    if (net_connect(id, ip, port) < 0) return err(ERR_ENOTCONN);
+    int rc = net_connect(id, ip, port);
+    if (rc == NET_INPROGRESS) return err(ERR_EINPROGRESS);
+    if (rc < 0) return err(ERR_ENOTCONN);
     return 0;
 }
 
@@ -3222,6 +3226,16 @@ static uint32_t do_nanosleep(uint32_t req_ptr, uint32_t rem_ptr) {
     return 0;
 }
 
+/* clock_getres(266): one PIT tick is the clock resolution. */
+static uint32_t do_clock_getres(uint32_t clockid, uint32_t ts) {
+    (void)clockid;
+    if (!ts) return 0;
+    if (!user_ptr_ok(ts, 8)) return err(ERR_EFAULT);
+    *(uint32_t*)ts = 0;
+    *(uint32_t*)(ts + 4) = 10000000u;    /* 10ms */
+    return 0;
+}
+
 /* clock_nanosleep(267): TIMER_ABSTIME is honored for CLOCK_MONOTONIC
  * (boot ticks) and CLOCK_REALTIME (epoch delta); other clocks sleep
  * relative. Remaining time is not reported (rem_ptr ignored, as on success). */
@@ -4544,6 +4558,9 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_clock_nanosleep:
             ret = do_clock_nanosleep(regs->ebx, regs->ecx, regs->edx, regs->esi);
+            break;
+        case SYS_clock_getres:
+            ret = do_clock_getres(regs->ebx, regs->ecx);
             break;
         case SYS_truncate:
             ret = do_truncate(regs->ebx, regs->ecx);

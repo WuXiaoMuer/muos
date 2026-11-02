@@ -593,6 +593,39 @@ int main(int argc, char** argv) {
         muos_close(cli);
         muos_close(lfd);
 
+        /* Nonblocking connect: SYN goes out, connect returns EINPROGRESS, and
+         * poll(POLLOUT) turns ready once the handshake completes. */
+        {
+            int nc = muos_socket(MUOS_AF_INET, MUOS_SOCK_STREAM, 0);
+            muos_sockaddr_in_t nsa;
+            nsa.sin_family = MUOS_AF_INET;
+            nsa.sin_port = htons16(7);
+            nsa.sin_addr = IP4(127,0,0,1);
+            nsa.pad[0] = nsa.pad[1] = 0;
+            muos_fcntl(nc, MUOS_F_SETFL, MUOS_O_NONBLOCK);
+            int crc = nc >= 0 ? muos_connect(nc, &nsa, 16) : -1;
+
+            muos_pollfd_t cp;
+            cp.fd = nc; cp.events = MUOS_POLLOUT; cp.revents = 0;
+            int praw = muos_poll(&cp, 1, 500);
+            int wrev = cp.revents;
+
+            char nb[] = "NB"; char rbuf[4];
+            int sn = muos_send(nc, nb, 2, 0);
+            cp.events = MUOS_POLLIN; cp.revents = 0;
+            int prin = muos_poll(&cp, 1, 500);
+            int rn = prin == 1 ? muos_recv(nc, rbuf, 4, 0) : -1;
+            int nbok = (crc == -115 && praw == 1 && (wrev & MUOS_POLLOUT) &&
+                        sn == 2 && rn == 2 && rbuf[0] == 'N' && rbuf[1] == 'B');
+            muos_puts("tcp: nb-connect="); muos_putdec(crc);
+            muos_puts(" ready="); muos_putdec(praw);
+            muos_puts("/"); muos_putdec(wrev);
+            muos_puts(" reply="); muos_putdec(rn);
+            muos_puts(nbok ? " nb-ok\n" : " nb-bad\n");
+            ok = ok && nbok;
+            if (nc >= 0) muos_close(nc);
+        }
+
         /* AF_UNIX socketpair + getsockopt(SO_TYPE) + sendmsg/recvmsg. */
         {
             int sv[2];
@@ -1183,11 +1216,15 @@ int main(int argc, char** argv) {
         unsigned cpu = 9, node = 9;
         int gc = muos_getcpu(&cpu, &node);
 
+        unsigned cres[2] = { 0, 0 };
+        int cr = muos_clock_getres(1, cres);
+
         ok = ok && name_ok && ma == 0 && fa == 0 && as == 0 && ag == 0 &&
              m2 == 1 && tk == 0 && tg == 0 && sy == 0 &&
              fdset == 0 && fdget == 1 && nbset == 0 && nbrd == -11 &&
              cn == 0 && minc == 0 && (mcvec[0] & 1) &&
-             remap_ok && gc == 0 && cpu == 0 && node == 0;
+             remap_ok && gc == 0 && cpu == 0 && node == 0 &&
+             cr == 0 && cres[0] == 0 && cres[1] == 10000000;
         muos_puts("abi: prctl="); muos_putdec(ps);
         muos_puts("/"); muos_putdec(pg);
         muos_puts(" name="); muos_puts(nm);
@@ -1209,7 +1246,9 @@ int main(int argc, char** argv) {
         muos_puts(" mremap="); muos_putdec(remap_ok);
         muos_puts(" getcpu="); muos_putdec(gc);
         muos_puts("/"); muos_putdec((int)cpu);
-        muos_puts("/"); muos_putdec((int)node); muos_puts("\n");
+        muos_puts("/"); muos_putdec((int)node);
+        muos_puts(" getres="); muos_putdec(cr);
+        muos_puts("/"); muos_putdec((int)cres[1]); muos_puts("\n");
         muos_puts(ok ? "ABI-OK\n" : "ABI-BAD\n");
         return 0;
     }

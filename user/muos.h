@@ -151,6 +151,7 @@ int  muos_tkill(int tid, int sig);
 int  muos_tgkill(int tgid, int tid, int sig);
 int  muos_sched_yield(void);
 int  muos_clock_nanosleep(int clockid, int flags, void* req, void* rem);
+int  muos_clock_getres(int clockid, unsigned* ts /* 2 words */);
 int  muos_mincore(unsigned addr, unsigned len, unsigned char* vec);
 int  muos_getcpu(unsigned* cpu, unsigned* node);
 unsigned muos_mremap(unsigned old_addr, unsigned old_size, unsigned new_size,

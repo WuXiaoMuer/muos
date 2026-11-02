@@ -26,6 +26,7 @@
 #define NET_SOCK_RAW    3
 
 #define NET_EAGAIN (-11)
+#define NET_INPROGRESS (-115)
 
 bool_t   net_init(void);
 bool_t   net_present(void);

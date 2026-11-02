@@ -1772,6 +1772,7 @@ int net_connect(int id, uint32_t ip, uint16_t port) {
     s->q_head = 0;
     s->q_count = 0;
     tcp_send_seg(s, seq, 0, TCP_F_SYN, NULL, 0);
+    if (s->nonblock) return NET_INPROGRESS;
     /* SYN retransmission is handled by tcp_timers (up to TCP_RETRIES). */
     for (uint32_t loops = 0; loops < 1000; loops++) {
         if (s->tcp_state == TCP_ESTAB && s->used) return 0;
@@ -1960,6 +1961,11 @@ int net_getsockname(int id, uint32_t* ip, uint16_t* port) {
 int net_getpeername(int id, uint32_t* ip, uint16_t* port) {
     if (!net_socket_ok(id)) return -1;
     net_sock_t* s = &socks[id];
+    if (s->unix_peer >= 0 || s->unix_peer_closed) {
+        if (ip)   *ip   = 0;
+        if (port) *port = 0;
+        return 0;                       /* AF_UNIX has no address tuple */
+    }
     if (!s->connected) return -1;
     if (ip)   *ip   = s->rip;
     if (port) *port = s->rport;
