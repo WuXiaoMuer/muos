@@ -9,7 +9,10 @@
 #define MUOS_O_WRONLY 0x1
 #define MUOS_O_CREAT  0x40
 #define MUOS_O_TRUNC  0x200
+#define MUOS_O_APPEND 0x400
 #define MUOS_O_DIRECTORY 0x10000
+#define MUOS_F_GETFL  3
+#define MUOS_F_SETFL  4
 
 /* mmap(2) prot/flags and rlimit resources */
 #define MUOS_PROT_NONE  0x0
@@ -54,6 +57,7 @@ int  muos_read(int fd, void* buf, unsigned len);
 int  muos_open(const char* path, int flags);
 int  muos_close(int fd);
 int  muos_lseek(int fd, int offset, int whence);
+int  muos_fcntl(int fd, int cmd, int arg);
 int  muos_openat(int dirfd, const char* path, int flags);
 int  muos_mkdirat(int dirfd, const char* path, int mode);
 int  muos_fstatat64(int dirfd, const char* path, char* st, int flags);

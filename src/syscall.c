@@ -341,6 +341,7 @@ typedef struct {
 #define O_ACCMODE   0x03
 #define O_CREAT     0x40
 #define O_TRUNC     0x200
+#define O_APPEND    0x400
 #define O_DIRECTORY 0x10000
 
 /* i386 struct stat64 (96 bytes) and legacy struct stat (64 bytes). */
@@ -391,7 +392,10 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
         case USER_FD_FILE: {
             int slot = user_fd_slot((int)fd);
             if (slot < 0) return err(ERR_EBADF);
-            uint32_t off = user_fd_offset((int)fd);
+            uint32_t fflags = user_fd_flags((int)fd);
+            if ((fflags & O_ACCMODE) == 0) return err(ERR_EBADF);
+            uint32_t off = (fflags & O_APPEND) ? fs_fd_size(slot)
+                                               : user_fd_offset((int)fd);
             int n = fs_write_at(slot, off, (const char*)buf, count);
             if (n < 0) return err(ERR_EBADF);
             user_fd_set_offset((int)fd, off + (uint32_t)n);
@@ -417,14 +421,16 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
             int vol = 0;
             const char* ep = NULL;
             if (!user_fd_ext((int)fd, &vol, &ep)) return err(ERR_EBADF);
-            uint32_t off = user_fd_offset((int)fd);
-            if (off >= FS_MAX_SIZE || count > FS_MAX_SIZE - off)
-                return err(ERR_EFBIG);
+            uint32_t fflags = user_fd_flags((int)fd);
+            if ((fflags & O_ACCMODE) == 0) return err(ERR_EBADF);
             bool_t is_dir = false;
             uint32_t old = 0;
             if (!vfs_mount_stat(vol, ep, &is_dir, &old) || is_dir)
                 return err(ERR_EBADF);
             if (old > FS_MAX_SIZE) return err(ERR_EFBIG);
+            uint32_t off = (fflags & O_APPEND) ? old : user_fd_offset((int)fd);
+            if (off >= FS_MAX_SIZE || count > FS_MAX_SIZE - off)
+                return err(ERR_EFBIG);
 
             memset(vfs_ext_wbuf, 0, sizeof(vfs_ext_wbuf));
             if (old) {
@@ -472,6 +478,8 @@ static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
         case USER_FD_FILE: {
             int slot = user_fd_slot((int)fd);
             if (slot < 0) return err(ERR_EBADF);
+            if ((user_fd_flags((int)fd) & O_ACCMODE) == O_WRONLY)
+                return err(ERR_EBADF);
             uint32_t off = user_fd_offset((int)fd);
             int n = fs_read_at(slot, off, (char*)buf, count);
             if (n < 0) return err(ERR_EBADF);
@@ -544,6 +552,8 @@ static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
             int vol = 0;
             const char* ep = NULL;
             if (!user_fd_ext((int)fd, &vol, &ep)) return err(ERR_EBADF);
+            if ((user_fd_flags((int)fd) & O_ACCMODE) == O_WRONLY)
+                return err(ERR_EBADF);
             uint32_t off = user_fd_offset((int)fd);
             int n = vol == VFS_VOL_FAT
                     ? fat_read_at(ep, off, (void*)buf, count)
@@ -1322,6 +1332,13 @@ static bool_t path_perm_ok(const char* path, uint32_t need) {
     return perm_ok(uid, gid, mode, need);
 }
 
+/* Remember the access mode and append bit so read/write and fcntl(F_GETFL)
+ * can honor them later. */
+static int fd_open_flags(int fd, uint32_t flags) {
+    if (fd >= 0) user_fd_set_flags(fd, flags & (O_ACCMODE | O_APPEND));
+    return fd;
+}
+
 static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
     (void)mode;
     vfs_ent_t e;
@@ -1337,7 +1354,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
             if (flags & O_DIRECTORY) return err(ERR_ENOTDIR);
             uint8_t empty = 0;
             if (vfs_vol_write(mvol, msub, &empty, 0)) return err(ERR_EIO);
-            int fd = user_fd_alloc_ext(mvol, msub);
+            int fd = fd_open_flags(user_fd_alloc_ext(mvol, msub), flags);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
@@ -1350,7 +1367,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
         if (!parent_perm_ok(name, 3)) return err(ERR_EACCES);
         int slot = fs_create(name);
         if (slot < 0) return err(ERR_ENOSPC);
-        int fd = user_fd_alloc(slot);
+        int fd = fd_open_flags(user_fd_alloc(slot), flags);
         if (fd < 0) return err(ERR_EMFILE);
         return (uint32_t)fd;
     }
@@ -1358,7 +1375,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
     switch (e.type) {
         case VFS_T_DIR: {
             if (flags & (O_CREAT | O_TRUNC)) return err(ERR_EISDIR);
-            int fd = user_fd_alloc_dir(e.path);
+            int fd = fd_open_flags(user_fd_alloc_dir(e.path), flags);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
@@ -1367,7 +1384,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
             if (e.id == VFS_DEV_ZERO) kind = USER_FD_DEV_ZERO;
             else if (e.id == VFS_DEV_CONSOLE) kind = USER_FD_DEV_CONSOLE;
             else if (e.id == VFS_DEV_ATA) kind = USER_FD_DEV_ATA;
-            int fd = user_fd_alloc_dev(kind);
+            int fd = fd_open_flags(user_fd_alloc_dev(kind), flags);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
@@ -1375,7 +1392,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
             if ((flags & O_ACCMODE) != 0) return err(ERR_EACCES);
             char tmp[USER_FD_VBUF_MAX];
             uint32_t len = vfs_vfile_text(e.id, e.pid, tmp, sizeof(tmp));
-            int fd = user_fd_alloc_vfile(tmp, len);
+            int fd = fd_open_flags(user_fd_alloc_vfile(tmp, len), flags);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
@@ -1384,7 +1401,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
             if ((flags & O_ACCMODE) != 0) return err(ERR_EACCES);
             uint32_t s = 0, en = 0;
             if (!modules_get(e.id, &s, &en)) return err(ERR_ENOENT);
-            int fd = user_fd_alloc_module((int)e.id);
+            int fd = fd_open_flags(user_fd_alloc_module((int)e.id), flags);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
@@ -1397,7 +1414,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
                 uint8_t empty = 0;
                 if (vfs_vol_write(vol, sub, &empty, 0)) return err(ERR_EIO);
             }
-            int fd = user_fd_alloc_ext(vol, sub);
+            int fd = fd_open_flags(user_fd_alloc_ext(vol, sub), flags);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
@@ -1407,7 +1424,7 @@ static uint32_t do_open_buf(const char* buf, uint32_t flags, uint32_t mode) {
                             ((flags & O_ACCMODE) == O_WRONLY) ? 2 : 4;
             if (!path_perm_ok(buf, need)) return err(ERR_EACCES);
             if (flags & O_TRUNC) fs_fd_truncate(e.slot);
-            int fd = user_fd_alloc(e.slot);
+            int fd = fd_open_flags(user_fd_alloc(e.slot), flags);
             if (fd < 0) return err(ERR_EMFILE);
             return (uint32_t)fd;
         }
@@ -2143,7 +2160,10 @@ static int kbuf_write(uint32_t fd, const char* data, uint32_t count) {
         case USER_FD_FILE: {
             int slot = user_fd_slot((int)fd);
             if (slot < 0) return -ERR_EBADF;
-            uint32_t off = user_fd_offset((int)fd);
+            uint32_t fflags = user_fd_flags((int)fd);
+            if ((fflags & O_ACCMODE) == 0) return -ERR_EBADF;
+            uint32_t off = (fflags & O_APPEND) ? fs_fd_size(slot)
+                                               : user_fd_offset((int)fd);
             int n = fs_write_at(slot, off, data, count);
             if (n < 0) return -ERR_EBADF;
             user_fd_set_offset((int)fd, off + (uint32_t)n);
@@ -3654,7 +3674,7 @@ static uint32_t do_clock_gettime(uint32_t clockid, uint32_t ts,
     return 0;
 }
 
-static uint32_t do_fcntl(uint32_t fd, uint32_t cmd) {
+static uint32_t do_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg) {
     if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
     switch (cmd) {
         case 0:              /* F_DUPFD */
@@ -3662,8 +3682,13 @@ static uint32_t do_fcntl(uint32_t fd, uint32_t cmd) {
             return do_dup(fd);
         case 1: return 0;    /* F_GETFD */
         case 2: return 0;    /* F_SETFD */
-        case 3: return 0;    /* F_GETFL: O_RDONLY */
-        case 4: return 0;    /* F_SETFL */
+        case 3:              /* F_GETFL */
+            return user_fd_flags((int)fd);
+        case 4: {            /* F_SETFL: only O_APPEND is meaningful here */
+            uint32_t nf = (user_fd_flags((int)fd) & O_ACCMODE) |
+                          (arg & O_APPEND);
+            return user_fd_set_flags((int)fd, nf) ? 0 : err(ERR_EBADF);
+        }
         case 8: case 9: return 0;   /* F_SETOWN / F_GETOWN */
         default: return err(ERR_EINVAL);
     }
@@ -4199,7 +4224,7 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_fcntl:
         case SYS_fcntl64:
-            ret = do_fcntl(regs->ebx, regs->ecx);
+            ret = do_fcntl(regs->ebx, regs->ecx, regs->edx);
             break;
         case SYS_statfs:
             ret = do_statfs_path(regs->ebx, regs->ecx, false);

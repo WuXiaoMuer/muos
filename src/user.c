@@ -51,6 +51,7 @@ typedef struct {
     int      kind;      /* user_fd_kind_t; FREE = slot unused */
     int      fs_slot;   /* RAM FS slot for FILE */
     uint32_t offset;
+    uint32_t flags;     /* O_ACCMODE/O_APPEND remembered from open/fcntl */
     int      pipe_id;
     int      ext_vol;   /* USER_FD_EXT: 1 = FAT32, 2 = ext2 */
     char     path[USER_FD_PATH_MAX];   /* DIR: absolute directory; EXT: file path */
@@ -113,6 +114,8 @@ void user_fds_reset(void) {
     user_fds[0].kind = USER_FD_STDIN;
     user_fds[1].kind = USER_FD_STDOUT;
     user_fds[2].kind = USER_FD_STDERR;
+    user_fds[1].flags = 1;   /* O_WRONLY */
+    user_fds[2].flags = 1;
     strncpy(cwd_path, "/", USER_FD_PATH_MAX - 1);
     cwd_path[USER_FD_PATH_MAX - 1] = '\0';
 }
@@ -263,6 +266,19 @@ bool_t user_fd_set_offset(int fd, uint32_t offset) {
     int i = fd_index(fd);
     if (i < 0 || user_fds[i].kind == USER_FD_FREE) return false;
     user_fds[i].offset = offset;
+    return true;
+}
+
+uint32_t user_fd_flags(int fd) {
+    int i = fd_index(fd);
+    if (i < 0) return 0;
+    return user_fds[i].flags;
+}
+
+bool_t user_fd_set_flags(int fd, uint32_t flags) {
+    int i = fd_index(fd);
+    if (i < 0 || user_fds[i].kind == USER_FD_FREE) return false;
+    user_fds[i].flags = flags;
     return true;
 }
 

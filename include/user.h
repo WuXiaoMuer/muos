@@ -93,6 +93,10 @@ bool_t   user_fd_dup2(int oldfd, int newfd);
 int      user_fd_slot(int fd);
 uint32_t user_fd_offset(int fd);
 bool_t   user_fd_set_offset(int fd, uint32_t offset);
+/* Open flags (O_ACCMODE/O_APPEND) remembered per descriptor; fcntl(F_GETFL)
+ * returns them and F_SETFL toggles O_APPEND. */
+uint32_t user_fd_flags(int fd);
+bool_t   user_fd_set_flags(int fd, uint32_t flags);
 void     user_fd_close(int fd);
 
 /* poll events (mirror of the Linux i386 values) */

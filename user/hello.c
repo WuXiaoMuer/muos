@@ -689,6 +689,64 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (argc > 1 && arg_is(argv[1], "append")) {
+        /* O_APPEND: reopening without O_TRUNC and writing must extend the
+         * file; fcntl(F_SETFL) toggles the same behavior at runtime, and a
+         * read-only descriptor rejects write(2) with EBADF. */
+        int ok = 1;
+        int fd = muos_open("append.txt",
+                           MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        int w1 = fd >= 0 ? muos_write(fd, "AB", 2) : -1;
+        if (fd >= 0) muos_close(fd);
+
+        int fa = muos_open("append.txt", MUOS_O_WRONLY | MUOS_O_APPEND);
+        int w2 = fa >= 0 ? muos_write(fa, "CD", 2) : -1;
+        int fl = fa >= 0 ? muos_fcntl(fa, MUOS_F_GETFL, 0) : -1;
+        if (fa >= 0) muos_close(fa);
+
+        char rb[16];
+        int rf = muos_open("append.txt", 0);
+        int rn = rf >= 0 ? muos_read(rf, rb, sizeof(rb)) : -1;
+        if (rf >= 0) muos_close(rf);
+        int appended = (w1 == 2 && w2 == 2 && fl >= 0 &&
+                        (fl & MUOS_O_APPEND) && rn == 4 &&
+                        rb[0] == 'A' && rb[1] == 'B' &&
+                        rb[2] == 'C' && rb[3] == 'D');
+
+        int fd2 = muos_open("append.txt", MUOS_O_WRONLY);
+        int fset = -1, fget = -1, w3 = -1;
+        if (fd2 >= 0) {
+            muos_lseek(fd2, 0, 0);
+            fset = muos_fcntl(fd2, MUOS_F_SETFL, MUOS_O_APPEND);
+            fget = muos_fcntl(fd2, MUOS_F_GETFL, 0);
+            w3 = muos_write(fd2, "EF", 2);
+            muos_close(fd2);
+        }
+        char rb2[16];
+        int rf2 = muos_open("append.txt", 0);
+        int rn2 = rf2 >= 0 ? muos_read(rf2, rb2, sizeof(rb2)) : -1;
+        if (rf2 >= 0) muos_close(rf2);
+        int toggled = (fset == 0 && fget >= 0 && (fget & MUOS_O_APPEND) &&
+                       w3 == 2 && rn2 == 6 &&
+                       rb2[4] == 'E' && rb2[5] == 'F');
+
+        int ro = muos_open("append.txt", 0);
+        int ro_w = ro >= 0 ? muos_write(ro, "XX", 2) : 0;
+        if (ro >= 0) muos_close(ro);
+
+        ok = ok && appended && toggled && ro_w == -9;
+        muos_puts("append: write="); muos_putdec(w1);
+        muos_puts("/"); muos_putdec(w2);
+        muos_puts(" read="); muos_putdec(rn);
+        muos_puts(" getfl="); muos_putdec(fl); muos_puts("\n");
+        muos_puts("append: fcntl-set="); muos_putdec(fset);
+        muos_puts(" getfl="); muos_putdec(fget);
+        muos_puts(" read="); muos_putdec(rn2);
+        muos_puts(" ro-write="); muos_putdec(ro_w); muos_puts("\n");
+        muos_puts(ok ? "APPEND-OK\n" : "APPEND-BAD\n");
+        return 0;
+    }
+
     if (argc > 1 && arg_is(argv[1], "pie")) {
         /* Runs from the ET_DYN image: the kernel loaded the lowest
          * segment at USER_BASE and applied its RELATIVE relocations. */

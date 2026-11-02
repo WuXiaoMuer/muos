@@ -126,6 +126,10 @@ int muos_lseek(int fd, int offset, int whence) {
     return syscall3(19, fd, offset, whence);
 }
 
+int muos_fcntl(int fd, int cmd, int arg) {
+    return syscall3(55, fd, cmd, arg);
+}
+
 int muos_uname(char* out) {
     return syscall1(122, (int)out);
 }
