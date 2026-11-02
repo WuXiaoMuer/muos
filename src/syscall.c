@@ -166,6 +166,10 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define SYS_futex           240
 #define SYS_set_robust_list 311
 #define SYS_get_robust_list 312
+#define SYS_mremap          163
+#define SYS_mincore         218
+#define SYS_clock_nanosleep 267
+#define SYS_getcpu          318
 #define SYS_prctl           172
 #define SYS_madvise         219
 #define SYS_tkill           238
@@ -355,6 +359,7 @@ typedef struct {
 #define O_CREAT     0x40
 #define O_TRUNC     0x200
 #define O_APPEND    0x400
+#define O_NONBLOCK  0x800
 #define O_DIRECTORY 0x10000
 
 /* i386 struct stat64 (96 bytes) and legacy struct stat (64 bytes). */
@@ -491,7 +496,7 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
             int id = user_fd_pipe_id((int)fd);
             if (id < 0) return err(ERR_EBADF);
             int n = pipe_write(id, (const char*)buf, count);
-            return n < 0 ? err(ERR_EBADF) : (uint32_t)n;
+            return n < 0 ? err(ERR_EAGAIN) : (uint32_t)n;
         }
         case USER_FD_DEV_ATA: {
             uint32_t off = user_fd_offset((int)fd);
@@ -548,6 +553,7 @@ static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
         case USER_FD_STDIN:
         case USER_FD_DEV_CONSOLE:
             if (!keyboard_haschar()) {
+                if (user_fd_flags(fd) & O_NONBLOCK) return err(ERR_EAGAIN);
                 proc_t* p = proc_current();
                 if (p && p->pid != 1 &&
                     proc_block_current_ext(regs, PROC_WAIT_READ, buf,
@@ -561,6 +567,7 @@ static uint32_t do_read(registers_t* regs, uint32_t fd, uint32_t buf,
             if (id < 0) return err(ERR_EBADF);
             int n = pipe_read(id, (char*)buf, count);
             if (n == 0 && pipe_writers(id) > 0) {
+                if (user_fd_flags(fd) & O_NONBLOCK) return err(ERR_EAGAIN);
                 proc_t* p = proc_current();
                 if (p && p->pid != 1 &&
                     proc_block_current_ext(regs, PROC_WAIT_READ, buf,
@@ -861,6 +868,7 @@ static uint32_t vfs_lookup(const char* in, vfs_ent_t* e) {
         if (strcmp(n, "zero") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_ZERO; return 0; }
         if (strcmp(n, "console") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_CONSOLE; return 0; }
         if (strcmp(n, "urandom") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_URANDOM; return 0; }
+        if (strcmp(n, "random") == 0) { e->type = VFS_T_DEV; e->id = VFS_DEV_URANDOM; return 0; }
         if (strcmp(n, "hda") == 0) {
             if (!ata_present()) return err(ERR_ENODEV);
             e->type = VFS_T_DEV;
@@ -1380,7 +1388,8 @@ static bool_t path_perm_ok(const char* path, uint32_t need) {
 /* Remember the access mode and append bit so read/write and fcntl(F_GETFL)
  * can honor them later. */
 static int fd_open_flags(int fd, uint32_t flags) {
-    if (fd >= 0) user_fd_set_flags(fd, flags & (O_ACCMODE | O_APPEND));
+    if (fd >= 0)
+        user_fd_set_flags(fd, flags & (O_ACCMODE | O_APPEND | O_NONBLOCK));
     return fd;
 }
 
@@ -1569,7 +1578,11 @@ static uint32_t do_sendto(uint32_t fd, uint32_t buf, uint32_t len,
     int id = sock_id(fd);
     if (id < 0) return err(ERR_EBADF);
     if (len && !user_ptr_ok(buf, len)) return err(ERR_EFAULT);
-    if (len > 1400) len = 1400;
+    if (net_socket_is_unix(id)) {
+        if (len > 8192u) len = 8192u;
+    } else if (len > 1400) {
+        len = 1400;
+    }
     uint32_t ip = 0;
     uint16_t port = 0;
     if (addr) {
@@ -3139,6 +3152,21 @@ static uint32_t do_ppoll(registers_t* regs, uint32_t fds_ptr, uint32_t nfds,
 
 /* ---- sleep, resource stats, readlink and ownership ---- */
 
+/* Convert an i386 timespec into 100Hz PIT ticks (32-bit arithmetic only). */
+static uint32_t timespec_ticks(uint32_t sec, uint32_t nsec) {
+    if (sec > 0x7FFFFFFFu / 100u) return 0x7FFFFFFFu;
+    uint32_t ticks = sec * 100u;
+    uint32_t ns_ticks = (nsec + 9999999u) / 10000000u;
+    if (ticks > 0x7FFFFFFFu - ns_ticks) return 0x7FFFFFFFu;
+    return ticks + ns_ticks;
+}
+
+static void sleep_ticks(uint32_t ticks) {
+    uint32_t start = pit_get_ticks();
+    while ((uint32_t)(pit_get_ticks() - start) < ticks)
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+}
+
 /* There is no scheduler to put the process to sleep, so nanosleep parks the
  * CPU on `sti; hlt` until the PIT has ticked the requested 10ms units. */
 static uint32_t do_nanosleep(uint32_t req_ptr, uint32_t rem_ptr) {
@@ -3148,23 +3176,41 @@ static uint32_t do_nanosleep(uint32_t req_ptr, uint32_t rem_ptr) {
     memcpy(&nsec, (const void*)(req_ptr + 4), 4);
     if (nsec >= 1000000000u) return err(ERR_EINVAL);
 
-    /* 100Hz PIT ticks; keep all arithmetic 32-bit (no __udivdi3 in-kernel). */
-    uint32_t ticks;
-    if (sec > 0x7FFFFFFFu / 100u) {
-        ticks = 0x7FFFFFFFu;
-    } else {
-        ticks = sec * 100u;
-        uint32_t ns_ticks = (nsec + 9999999u) / 10000000u;
-        ticks = (ticks > 0x7FFFFFFFu - ns_ticks) ? 0x7FFFFFFFu : ticks + ns_ticks;
-    }
-    uint32_t start = pit_get_ticks();
-    while ((uint32_t)(pit_get_ticks() - start) < ticks)
-        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    sleep_ticks(timespec_ticks(sec, nsec));
 
     if (rem_ptr) {
         if (!user_ptr_ok(rem_ptr, 8)) return err(ERR_EFAULT);
         memset((void*)rem_ptr, 0, 8);
     }
+    return 0;
+}
+
+/* clock_nanosleep(267): TIMER_ABSTIME is honored for CLOCK_MONOTONIC
+ * (boot ticks) and CLOCK_REALTIME (epoch delta); other clocks sleep
+ * relative. Remaining time is not reported (rem_ptr ignored, as on success). */
+static uint32_t do_clock_nanosleep(uint32_t clockid, uint32_t flags,
+                                   uint32_t req_ptr, uint32_t rem_ptr) {
+    (void)rem_ptr;
+    if (!user_ptr_ok(req_ptr, 8)) return err(ERR_EFAULT);
+    uint32_t sec, nsec;
+    memcpy(&sec, (const void*)req_ptr, 4);
+    memcpy(&nsec, (const void*)(req_ptr + 4), 4);
+    if (nsec >= 1000000000u) return err(ERR_EINVAL);
+
+    if (flags & 1u) {                       /* TIMER_ABSTIME */
+        if (clockid == 1) {                 /* CLOCK_MONOTONIC */
+            uint32_t target = timespec_ticks(sec, nsec);
+            while ((int32_t)(pit_get_ticks() - target) < 0)
+                __asm__ volatile ("sti; hlt; cli" ::: "memory");
+            return 0;
+        }
+        uint32_t now = rtc_now();           /* CLOCK_REALTIME */
+        if (sec <= now) return 0;
+        sleep_ticks(timespec_ticks(sec - now, nsec));
+        return 0;
+    }
+
+    sleep_ticks(timespec_ticks(sec, nsec));
     return 0;
 }
 
@@ -3650,6 +3696,9 @@ static uint32_t do_execve(registers_t* regs, uint32_t path_ptr, uint32_t argv_pt
     regs->useresp = sp;
     regs->ebx = regs->ecx = regs->edx = 0;
     regs->esi = regs->edi = regs->ebp = 0;
+
+    /* Successful execve closes descriptors marked FD_CLOEXEC. */
+    user_fd_close_cloexec();
     return 0;
 }
 
@@ -3728,15 +3777,23 @@ static uint32_t do_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg) {
     if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
     switch (cmd) {
         case 0:              /* F_DUPFD */
-        case 1030:           /* F_DUPFD_CLOEXEC */
             return do_dup(fd);
-        case 1: return 0;    /* F_GETFD */
-        case 2: return 0;    /* F_SETFD */
+        case 1030: {         /* F_DUPFD_CLOEXEC */
+            uint32_t nfd = do_dup(fd);
+            if ((int32_t)nfd >= 0) user_fd_set_fdflags((int)nfd, USER_FD_CLOEXEC);
+            return nfd;
+        }
+        case 1:              /* F_GETFD */
+            return user_fd_fdflags((int)fd) & USER_FD_CLOEXEC;
+        case 2:              /* F_SETFD */
+            return user_fd_set_fdflags((int)fd,
+                                       arg & USER_FD_CLOEXEC)
+                   ? 0 : err(ERR_EBADF);
         case 3:              /* F_GETFL */
             return user_fd_flags((int)fd);
-        case 4: {            /* F_SETFL: only O_APPEND is meaningful here */
+        case 4: {            /* F_SETFL: O_APPEND and O_NONBLOCK are tracked */
             uint32_t nf = (user_fd_flags((int)fd) & O_ACCMODE) |
-                          (arg & O_APPEND);
+                          (arg & (O_APPEND | O_NONBLOCK));
             return user_fd_set_flags((int)fd, nf) ? 0 : err(ERR_EBADF);
         }
         case 8: case 9: return 0;   /* F_SETOWN / F_GETOWN */
@@ -3860,6 +3917,34 @@ static uint32_t do_madvise(uint32_t addr, uint32_t len, uint32_t advice) {
     if (len == 0) return 0;
     if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
     if (!user_ptr_ok(addr, len)) return err(ERR_EFAULT);
+    return 0;
+}
+
+/* mincore(2): report residency one byte per page (1 = translated frame). */
+static uint32_t do_mincore(uint32_t addr, uint32_t len, uint32_t vec) {
+    if (len == 0) return 0;
+    if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+    uint32_t pages = (len + PAGE_SIZE - 1u) / PAGE_SIZE;
+    if (pages > 4096) return err(ERR_EINVAL);
+    if (!vec || !user_ptr_ok(vec, pages)) return err(ERR_EFAULT);
+    proc_t* p = proc_current();
+    uint32_t pd = p ? p->pd_phys : 0;
+    uint8_t* out = (uint8_t*)vec;
+    for (uint32_t i = 0; i < pages; i++)
+        out[i] = mm_user_translate(pd, addr + i * PAGE_SIZE) ? 1 : 0;
+    return 0;
+}
+
+/* getcpu(318): single CPU, node 0. Both output pointers are optional. */
+static uint32_t do_getcpu(uint32_t cpu_ptr, uint32_t node_ptr) {
+    if (cpu_ptr) {
+        if (!user_ptr_ok(cpu_ptr, 4)) return err(ERR_EFAULT);
+        *(uint32_t*)cpu_ptr = 0;
+    }
+    if (node_ptr) {
+        if (!user_ptr_ok(node_ptr, 4)) return err(ERR_EFAULT);
+        *(uint32_t*)node_ptr = 0;
+    }
     return 0;
 }
 
@@ -4058,6 +4143,37 @@ static uint32_t do_old_mmap(uint32_t args_ptr) {
     return do_mmap(a[0], a[1], a[2], a[3], (int)a[4], a[5]);
 }
 
+/* mremap(163): shrink in place, or grow by moving to a fresh anonymous
+ * mapping and copying the old pages (MREMAP_MAYMOVE required). */
+static uint32_t do_mremap(uint32_t old_addr, uint32_t old_size,
+                          uint32_t new_size, uint32_t flags,
+                          uint32_t new_addr) {
+    if (old_addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+    uint32_t old_r = (old_size + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    uint32_t new_r = (new_size + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    if (new_r < new_size || new_r > USER_SIZE) return err(ERR_ENOMEM);
+    if (new_size <= old_size) return old_addr;      /* shrink keeps the range */
+    if (!(flags & 1u)) return err(ERR_ENOMEM);      /* MREMAP_MAYMOVE */
+
+    proc_t* p = proc_current();
+    if (!p || !p->pd_phys) return err(ERR_EINVAL);
+
+    uint32_t at;
+    if ((flags & 2u) && new_addr) {                 /* MREMAP_FIXED */
+        if (new_addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
+        at = do_mmap(new_addr, new_r, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    } else {
+        at = do_mmap(0, new_r, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    if ((int32_t)at < 0) return at;
+
+    if (old_r) memcpy((void*)at, (const void*)old_addr, old_r);
+    mm_user_unmap(p->pd_phys, old_addr, old_r);
+    return at;
+}
+
 /* Unmap a user range: dirty MAP_SHARED pages are flushed to their file
  * first, then the frames (or swap slots) are released. */
 static uint32_t do_munmap(uint32_t addr, uint32_t len) {
@@ -4252,7 +4368,7 @@ void syscall_handler(registers_t* regs) {
             int id = net_accept(sock_id(regs->ebx));
             if (id == NET_EAGAIN) {
                 proc_t* p = proc_current();
-                if (p && p->pid != 1 &&
+                if (!(regs->esi & 0x800u) && p && p->pid != 1 &&
                     proc_block_current_ext(regs, PROC_WAIT_ACCEPT, 0, 0,
                                            0, false, sock_id(regs->ebx))) {
                     ret = 0;        /* frame switched; waker sets eax */
@@ -4372,6 +4488,9 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_nanosleep:
             ret = do_nanosleep(regs->ebx, regs->ecx);
+            break;
+        case SYS_clock_nanosleep:
+            ret = do_clock_nanosleep(regs->ebx, regs->ecx, regs->edx, regs->esi);
             break;
         case SYS_truncate:
             ret = do_truncate(regs->ebx, regs->ecx);
@@ -4609,6 +4728,10 @@ void syscall_handler(registers_t* regs) {
         case SYS_munmap:
             ret = do_munmap(regs->ebx, regs->ecx);
             break;
+        case SYS_mremap:
+            ret = do_mremap(regs->ebx, regs->ecx, regs->edx,
+                            regs->esi, regs->edi);
+            break;
         case SYS_mprotect:
             ret = do_mprotect(regs->ebx, regs->ecx, regs->edx);
             break;
@@ -4650,6 +4773,12 @@ void syscall_handler(registers_t* regs) {
             break;
         case SYS_madvise:
             ret = do_madvise(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_mincore:
+            ret = do_mincore(regs->ebx, regs->ecx, regs->edx);
+            break;
+        case SYS_getcpu:
+            ret = do_getcpu(regs->ebx, regs->ecx);
             break;
         case SYS_fadvise64:
             ret = do_fadvise64(regs->ebx, regs->ecx, regs->edx,

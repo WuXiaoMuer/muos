@@ -227,7 +227,7 @@ def build_ext2(path):
     sb[58:60] = (1).to_bytes(2, "little")
     sb[76:80] = (0).to_bytes(4, "little")         # rev 0
     sb[88:90] = (128).to_bytes(2, "little")       # inode size
-    sb[120:136] = b"MUOS-EXT2      "
+    sb[120:136] = b"MUOS-EXT2".ljust(16, b" ")
     img[base + 1024:base + 1024 + block_size] = sb
 
     gd = bytearray(block_size)
@@ -244,7 +244,7 @@ def build_ext2(path):
     img[base + 3 * block_size:base + 4 * block_size] = bbm
 
     ibm = bytearray(block_size)
-    for i in range(0, 5):
+    for i in range(0, 7):
         ibm[i // 8] |= 1 << (i % 8)
     img[base + 4 * block_size:base + 5 * block_size] = ibm
 
@@ -253,10 +253,31 @@ def build_ext2(path):
     _ext2_inode(itable, 2 * 128, 0x81A4, 13, 10)
     _ext2_inode(itable, 3 * 128, 0x41ED, 1024, 11, links=2)
     _ext2_inode(itable, 4 * 128, 0x81A4, 13, 12)
+
+    # /big.bin: 300 data blocks, so logical blocks past 12+256 use the
+    # double-indirect path. Layout: 12 direct (13..24), single block 25
+    # (data 26..281), double block 282, second-level block 283, data 284..315.
+    big_blocks = 300
+    direct = list(range(13, 25))
+    single = 25
+    single_data = list(range(26, 26 + 256))
+    dind = 282
+    ind2 = 283
+    double_data = list(range(284, 284 + (big_blocks - 268)))
+    _ext2_inode(itable, 5 * 128, 0x81A4, big_blocks * block_size, direct[0])
+    base6 = 5 * 128
+    for j, b in enumerate(direct):
+        itable[base6 + 40 + j * 4:base6 + 44 + j * 4] = b.to_bytes(4, "little")
+    itable[base6 + 88:base6 + 92] = single.to_bytes(4, "little")
+    itable[base6 + 92:base6 + 96] = dind.to_bytes(4, "little")
+    itable[base6 + 96:base6 + 100] = (0).to_bytes(4, "little")
+    itable[base6 + 28:base6 + 32] = ((big_blocks + 3) * 2).to_bytes(4, "little")
+
     img[base + 5 * block_size:base + 9 * block_size] = itable
 
     root = bytearray(block_size)
-    _ext2_dir(root, [(2, "."), (2, ".."), (3, "hello.txt"), (4, "subdir")])
+    _ext2_dir(root, [(2, "."), (2, ".."), (3, "hello.txt"), (4, "subdir"),
+                     (6, "big.bin")])
     img[base + 9 * block_size:base + 10 * block_size] = root
 
     hello = b"EXT2-READ-OK\n"
@@ -268,6 +289,41 @@ def build_ext2(path):
 
     inner = b"EXT2-SUB-OK\n"
     img[base + 12 * block_size:base + 12 * block_size + len(inner)] = inner
+
+    # Single-indirect pointer block.
+    sind = bytearray(block_size)
+    for j, b in enumerate(single_data):
+        sind[j * 4:j * 4 + 4] = b.to_bytes(4, "little")
+    img[base + single * block_size:base + (single + 1) * block_size] = sind
+
+    # Double-indirect: one second-level block with the last 32 data blocks.
+    din = bytearray(block_size)
+    din[0:4] = ind2.to_bytes(4, "little")
+    img[base + dind * block_size:base + (dind + 1) * block_size] = din
+    ind2b = bytearray(block_size)
+    for j, b in enumerate(double_data):
+        ind2b[j * 4:j * 4 + 4] = b.to_bytes(4, "little")
+    img[base + ind2 * block_size:base + (ind2 + 1) * block_size] = ind2b
+
+    # Data blocks: a repeating printable pattern; the final block ends with
+    # EXT2-BIG-OK so the test can verify a double-indirect read at EOF.
+    all_data = single_data + double_data
+    marker = b"EXT2-BIG-OK\n"
+    for b in all_data:
+        blk = bytearray((bytes([0x41 + (b % 26)]) * block_size))
+        if b == all_data[-1]:
+            blk[-len(marker):] = marker
+        img[base + b * block_size:base + (b + 1) * block_size] = blk
+
+    # Mark blocks 13..315 used and fix the free counters.
+    bbm = bytearray(block_size)
+    for b in range(0, all_data[-1] + 1):
+        bbm[b // 8] |= 1 << (b % 8)
+    img[base + 3 * block_size:base + 4 * block_size] = bbm
+    sb[12:16] = (blocks - (all_data[-1] + 1)).to_bytes(4, "little")
+    gd[12:14] = (blocks - (all_data[-1] + 1)).to_bytes(2, "little")
+    img[base + 1024:base + 1024 + block_size] = sb
+    img[base + 2 * block_size:base + 3 * block_size] = gd
 
     with open(path, "wb") as f:
         f.write(img)

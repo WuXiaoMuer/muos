@@ -10,9 +10,13 @@
 #define MUOS_O_CREAT  0x40
 #define MUOS_O_TRUNC  0x200
 #define MUOS_O_APPEND 0x400
+#define MUOS_O_NONBLOCK 0x800
 #define MUOS_O_DIRECTORY 0x10000
+#define MUOS_F_GETFD  1
+#define MUOS_F_SETFD  2
 #define MUOS_F_GETFL  3
 #define MUOS_F_SETFL  4
+#define MUOS_FD_CLOEXEC 1
 
 /* mmap(2) prot/flags and rlimit resources */
 #define MUOS_PROT_NONE  0x0
@@ -146,6 +150,11 @@ int  muos_sched_getaffinity(int pid, unsigned len, unsigned* mask);
 int  muos_tkill(int tid, int sig);
 int  muos_tgkill(int tgid, int tid, int sig);
 int  muos_sched_yield(void);
+int  muos_clock_nanosleep(int clockid, int flags, void* req, void* rem);
+int  muos_mincore(unsigned addr, unsigned len, unsigned char* vec);
+int  muos_getcpu(unsigned* cpu, unsigned* node);
+unsigned muos_mremap(unsigned old_addr, unsigned old_size, unsigned new_size,
+                     int flags, unsigned new_addr);
 
 /* ---- sockets (IPv4 only; values mirror Linux i386) ---- */
 #define MUOS_AF_INET      2

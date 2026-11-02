@@ -73,7 +73,8 @@ static bool_t read_inode(uint32_t ino, uint8_t* out) {
     return rd(off, out, vol.inode_size);
 }
 
-/* Read one file block (logical index) from an inode. */
+/* Read one file block (logical index) from an inode: 12 direct pointers,
+ * then single, double and triple indirect blocks. */
 static bool_t inode_block(const uint8_t* inode, uint32_t logical, uint32_t* out) {
     uint32_t ptrs = vol.block_size / 4;
     if (logical < 12) {
@@ -81,13 +82,39 @@ static bool_t inode_block(const uint8_t* inode, uint32_t logical, uint32_t* out)
         return *out != 0;
     }
     logical -= 12;
-    if (logical >= ptrs) return false;          /* only single indirect */
-    uint32_t ind = le32(inode + 40 + 12 * 4);
-    if (!ind) return false;
     uint8_t indbuf[MAX_BLOCK];
-    if (!read_block(ind, indbuf)) return false;
-    *out = le32(indbuf + logical * 4);
-    return *out != 0;
+
+    if (logical < ptrs) {                       /* single indirect */
+        uint32_t ind = le32(inode + 40 + 12 * 4);
+        if (!ind || !read_block(ind, indbuf)) return false;
+        *out = le32(indbuf + logical * 4);
+        return *out != 0;
+    }
+    logical -= ptrs;
+
+    uint32_t per_dind = ptrs * ptrs;
+    if (logical < per_dind) {                   /* double indirect */
+        uint32_t dind = le32(inode + 40 + 13 * 4);
+        if (!dind || !read_block(dind, indbuf)) return false;
+        uint32_t ind = le32(indbuf + (logical / ptrs) * 4);
+        if (!ind || !read_block(ind, indbuf)) return false;
+        *out = le32(indbuf + (logical % ptrs) * 4);
+        return *out != 0;
+    }
+    logical -= per_dind;
+
+    uint32_t per_tind = per_dind * ptrs;
+    if (logical < per_tind) {                   /* triple indirect */
+        uint32_t tind = le32(inode + 40 + 14 * 4);
+        if (!tind || !read_block(tind, indbuf)) return false;
+        uint32_t dind = le32(indbuf + (logical / per_dind) * 4);
+        if (!dind || !read_block(dind, indbuf)) return false;
+        uint32_t ind = le32(indbuf + ((logical / ptrs) % ptrs) * 4);
+        if (!ind || !read_block(ind, indbuf)) return false;
+        *out = le32(indbuf + (logical % ptrs) * 4);
+        return *out != 0;
+    }
+    return false;                               /* beyond triple indirect */
 }
 
 typedef struct {

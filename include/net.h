@@ -43,6 +43,8 @@ int net_socket(int type, int proto);
 int net_socketpair(int type, int* a, int* b);
 /* SOCK_STREAM/SOCK_DGRAM/SOCK_RAW of a live socket, 0 when invalid. */
 int net_socket_kind(int id);
+/* True for an AF_UNIX endpoint (socketpair) with no NIC dependence. */
+bool_t net_socket_is_unix(int id);
 int net_bind(int id, uint32_t ip, uint16_t port);
 int net_connect(int id, uint32_t ip, uint16_t port);
 int net_listen(int id);

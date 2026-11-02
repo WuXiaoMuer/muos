@@ -51,7 +51,8 @@ typedef struct {
     int      kind;      /* user_fd_kind_t; FREE = slot unused */
     int      fs_slot;   /* RAM FS slot for FILE */
     uint32_t offset;
-    uint32_t flags;     /* O_ACCMODE/O_APPEND remembered from open/fcntl */
+    uint32_t flags;     /* O_ACCMODE/O_APPEND/O_NONBLOCK from open/fcntl */
+    uint32_t fdflags;   /* FD_CLOEXEC */
     int      pipe_id;
     int      ext_vol;   /* USER_FD_EXT: 1 = FAT32, 2 = ext2 */
     char     path[USER_FD_PATH_MAX];   /* DIR: absolute directory; EXT: file path */
@@ -281,6 +282,26 @@ bool_t user_fd_set_flags(int fd, uint32_t flags) {
     if (i < 0 || user_fds[i].kind == USER_FD_FREE) return false;
     user_fds[i].flags = flags;
     return true;
+}
+
+uint32_t user_fd_fdflags(int fd) {
+    int i = fd_index(fd);
+    if (i < 0) return 0;
+    return user_fds[i].fdflags;
+}
+
+bool_t user_fd_set_fdflags(int fd, uint32_t flags) {
+    int i = fd_index(fd);
+    if (i < 0 || user_fds[i].kind == USER_FD_FREE) return false;
+    user_fds[i].fdflags = flags;
+    return true;
+}
+
+void user_fd_close_cloexec(void) {
+    for (int i = 3; i < USER_FD_MAX; i++) {
+        if (user_fds[i].kind == USER_FD_FREE) continue;
+        if (user_fds[i].fdflags & USER_FD_CLOEXEC) user_fd_close(i);
+    }
 }
 
 void user_fd_close(int fd) {

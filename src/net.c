@@ -113,6 +113,8 @@ typedef struct {
     volatile uint16_t special;
 } __attribute__((packed)) e1000_tx_desc_t;
 
+#define UNIX_BUF_SIZE 8192u
+
 typedef struct {
     bool_t   used;
     int      type;
@@ -135,7 +137,7 @@ typedef struct {
     int      unix_peer;     /* AF_UNIX socketpair partner, -1 if none */
     uint32_t unix_head;     /* incoming stream bytes (ring) */
     uint32_t unix_len;
-    uint8_t  unix_buf[1024];
+    uint8_t  unix_buf[UNIX_BUF_SIZE];
     bool_t   unix_peer_closed; /* partner closed/shut its send side: recv EOF */
     bool_t   shut_rd;       /* shutdown(SHUT_RD): recv reports EOF */
     bool_t   shut_wr;       /* shutdown(SHUT_WR): sends fail, FIN already sent */
@@ -1008,6 +1010,18 @@ static void tcp_timers(void) {
         if (!s->used || s->type != NET_SOCK_STREAM || s->q_count == 0) continue;
         if ((int32_t)(now - s->q_deadline) < 0) continue;
 
+        if (s->snd_wnd == 0) {
+            /* Zero window: send a one-byte persist probe without shrinking
+             * the congestion window or ever giving up on the connection. */
+            int h = tcp_first_unsacked(s);
+            uint32_t ack = (s->txq[h].flags & TCP_F_SYN) ? 0 : s->rcv_nxt;
+            s->q_deadline = now + TCP_RTO_MAX;
+            tcp_emit(s, s->txq[h].seq, ack,
+                     s->txq[h].flags | TCP_F_ACK, s->txq[h].data,
+                     s->txq[h].len ? 1u : 0u);
+            continue;
+        }
+
         if (s->q_retries >= TCP_RETRIES) {
             s->q_count = 0;
             s->tcp_state = TCP_CLOSED;
@@ -1330,7 +1344,9 @@ static void tcp_input(uint32_t src, uint32_t dst,
         if (off > 20) tcp_process_sack(s, seg + 20, off - 20);
         tcp_ack(s, ack);
         uint16_t wnd = be16(seg + 14);
-        if (wnd) s->snd_wnd = (uint32_t)wnd << s->snd_shift;
+        if (wnd || s->tcp_state == TCP_ESTAB ||
+            s->tcp_state == TCP_CLOSE_WAIT)
+            s->snd_wnd = (uint32_t)wnd << s->snd_shift;
     }
 
     if (s->tcp_state == TCP_SYN_SENT && (flags & TCP_F_SYN) && (flags & TCP_F_ACK)) {
@@ -1541,7 +1557,9 @@ static int tcp_send_data(net_sock_t* s, const void* data, uint32_t len) {
     while (sent < len) {
         uint32_t inflight = s->snd_nxt - s->snd_una;
         uint32_t window = s->cwnd ? s->cwnd : TCP_MSS;
-        if (s->snd_wnd && s->snd_wnd < window) window = s->snd_wnd;
+        /* A zero advertised window means the peer is full, not "unknown":
+         * wait for a window update while tcp_timers sends persist probes. */
+        if (s->snd_wnd < window) window = s->snd_wnd;
         /* More in-flight bytes than the retransmission queue can hold would
          * be silently dropped, so cap the window by the queue capacity. */
         if (window > TXQ_MAX * TCP_MSS) window = TXQ_MAX * TCP_MSS;
@@ -1580,6 +1598,11 @@ int net_socket_kind(int id) {
     return net_socket_ok(id) ? socks[id].type : 0;
 }
 
+bool_t net_socket_is_unix(int id) {
+    if (!net_socket_ok(id)) return false;
+    return socks[id].unix_peer >= 0 || socks[id].unix_peer_closed;
+}
+
 /* Allocate a bare AF_UNIX endpoint (no NIC needed). */
 static net_sock_t* unix_alloc(int type) {
     for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
@@ -1611,10 +1634,11 @@ int net_socketpair(int type, int* a, int* b) {
 
 /* Append bytes to an endpoint's incoming stream buffer. */
 static bool_t unix_push(net_sock_t* dst, const void* data, uint32_t len) {
-    if (len > 1024 - dst->unix_len) return false;
+    if (len > UNIX_BUF_SIZE - dst->unix_len) return false;
     const uint8_t* d = (const uint8_t*)data;
     for (uint32_t i = 0; i < len; i++) {
-        dst->unix_buf[(dst->unix_head + dst->unix_len + i) & 1023u] = d[i];
+        dst->unix_buf[(dst->unix_head + dst->unix_len + i) &
+                      (UNIX_BUF_SIZE - 1u)] = d[i];
     }
     dst->unix_len += len;
     return true;
@@ -1746,8 +1770,8 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
                 if (n > maxlen) n = maxlen;
                 for (uint32_t i = 0; i < n; i++)
                     ((uint8_t*)buf)[i] =
-                        s->unix_buf[(s->unix_head + i) & 1023u];
-                s->unix_head = (s->unix_head + n) & 1023u;
+                        s->unix_buf[(s->unix_head + i) & (UNIX_BUF_SIZE - 1u)];
+                s->unix_head = (s->unix_head + n) & (UNIX_BUF_SIZE - 1u);
                 s->unix_len -= n;
                 return (int)n;
             }

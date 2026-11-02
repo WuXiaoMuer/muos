@@ -61,6 +61,10 @@ static void thread_body(void* arg) {
 static volatile unsigned futex_word;
 static volatile int futex_wake_ret = -1;
 
+/* AF_UNIX 8KB ring check uses two 2KB buffers outside the 8KB stack. */
+static unsigned char unix_big[2048];
+static unsigned char unix_big2[2048];
+
 static void futex_waker(void* arg) {
     (void)arg;
     unsigned ts[2] = { 0, 20000000 };       /* 20ms */
@@ -123,6 +127,24 @@ int main(int argc, char** argv) {
         else if (arg_is(buf, "EXT2-READ-OK\n"))  muos_puts("VFS-EXT2-OK\n");
         else ok = 0;
         muos_close(fd);
+
+        /* /ext2/big.bin is 300KB and its tail is behind a double-indirect
+         * block, so this read exercises the multi-level indirect path. */
+        if (path[1] == 'e') {
+            int bfd = muos_open("/ext2/big.bin", 0);
+            int big_ok = 0;
+            if (bfd >= 0) {
+                muos_lseek(bfd, 307200 - 12, 0);
+                char tb[16];
+                int tn = muos_read(bfd, tb, 12);
+                tb[tn > 0 ? tn : 0] = '\0';
+                big_ok = (tn == 12 && arg_is(tb, "EXT2-BIG-OK\n"));
+                muos_close(bfd);
+            }
+            muos_puts("vfs: big="); muos_putdec(big_ok); muos_puts("\n");
+            if (big_ok) muos_puts("EXT2-BIG-OK\n");
+            ok = ok && big_ok;
+        }
 
         int rc = muos_fstatat64(MUOS_AT_FDCWD, path, st.raw, 0);
         muos_puts("vfs: stat="); muos_putdec(rc);
@@ -599,6 +621,20 @@ int main(int argc, char** argv) {
                 muos_puts(pair_ok ? " pair-ok\n" : " pair-bad\n");
                 ok = ok && pair_ok;
 
+                /* The AF_UNIX ring holds 8KB, so a 2KB transfer must fit. */
+                for (unsigned i = 0; i < sizeof(unix_big); i++)
+                    unix_big[i] = (unsigned char)('a' + (i % 26));
+                int bs = muos_send(sv[0], unix_big, sizeof(unix_big), 0);
+                int br = muos_recv(sv[1], unix_big2, sizeof(unix_big2), 0);
+                int big_ok = (bs == (int)sizeof(unix_big) &&
+                              br == (int)sizeof(unix_big2));
+                for (unsigned i = 0; big_ok && i < sizeof(unix_big); i++)
+                    if (unix_big2[i] != unix_big[i]) big_ok = 0;
+                muos_puts("tcp: unix-big="); muos_putdec(bs);
+                muos_puts("/"); muos_putdec(br);
+                muos_puts(big_ok ? " big-ok\n" : " big-bad\n");
+                ok = ok && big_ok;
+
                 /* shutdown(SHUT_WR) on one end: the partner drains what is
                  * buffered (already read above), then recv reports EOF. */
                 int sdc = muos_shutdown(sv[0], MUOS_SHUT_WR);
@@ -791,9 +827,14 @@ int main(int argc, char** argv) {
         }
         if (fd >= 0) muos_close(fd);
 
+        /* /dev/random is an alias of the same entropy source. */
+        int rf = muos_open("/dev/random", 0);
+        int rfr = rf >= 0 ? muos_read(rf, c, 4) : -1;
+        if (rf >= 0) muos_close(rf);
+
         int ok = (r1 == 64 && r2 == 64 && diff >= 48 && nz >= 24 &&
                   bad_flags == -22 && zero_len == 0 &&
-                  rn == 32 && c_diff >= 24 && c_nz >= 12);
+                  rn == 32 && c_diff >= 24 && c_nz >= 12 && rfr == 4);
         muos_puts("rand: getrandom="); muos_putdec(r1);
         muos_puts("/"); muos_putdec(r2);
         muos_puts(" diff="); muos_putdec(diff);
@@ -1024,8 +1065,52 @@ int main(int argc, char** argv) {
         int tg = muos_tgkill(muos_getpid(), muos_gettid(), 0);
         int sy = muos_sched_yield();
 
+        int fdc = muos_open("abi2.txt",
+                            MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        int fdset = fdc >= 0 ? muos_fcntl(fdc, MUOS_F_SETFD, MUOS_FD_CLOEXEC) : -1;
+        int fdget = fdc >= 0 ? muos_fcntl(fdc, MUOS_F_GETFD, 0) : -1;
+        if (fdc >= 0) muos_close(fdc);
+
+        int pfds[2];
+        int pr = muos_pipe(pfds);
+        int nbset = pr == 0 ? muos_fcntl(pfds[0], MUOS_F_SETFL,
+                                         MUOS_O_NONBLOCK) : -1;
+        char nbbuf[1];
+        int nbrd = pr == 0 ? muos_read(pfds[0], nbbuf, 1) : -1;
+        if (pr == 0) { muos_close(pfds[0]); muos_close(pfds[1]); }
+
+        unsigned tsleep[2] = { 0, 10000000 };       /* 10ms */
+        int cn = muos_clock_nanosleep(1, 0, tsleep, 0);
+
+        unsigned char mcvec[2] = { 0, 0 };
+        unsigned mc_addr = muos_mmap(8192);
+        int minc = -1;
+        if (mc_addr) {
+            *(volatile unsigned char*)mc_addr = 1;  /* make page resident */
+            minc = muos_mincore(mc_addr, 8192, mcvec);
+            muos_munmap(mc_addr, 8192);
+        }
+
+        unsigned char* rm = (unsigned char*)muos_mmap(4096);
+        int remap_ok = 0;
+        if (rm) {
+            rm[0] = 'A'; rm[4095] = 'Z';
+            unsigned nr = muos_mremap((unsigned)rm, 4096, 8192, 1, 0);
+            if ((int)nr > 0) {
+                unsigned char* np = (unsigned char*)nr;
+                remap_ok = (np[0] == 'A' && np[4095] == 'Z' && np[4096] == 0);
+                muos_munmap(nr, 8192);
+            }
+        }
+
+        unsigned cpu = 9, node = 9;
+        int gc = muos_getcpu(&cpu, &node);
+
         ok = ok && name_ok && ma == 0 && fa == 0 && as == 0 && ag == 0 &&
-             m2 == 1 && tk == 0 && tg == 0 && sy == 0;
+             m2 == 1 && tk == 0 && tg == 0 && sy == 0 &&
+             fdset == 0 && fdget == 1 && nbset == 0 && nbrd == -11 &&
+             cn == 0 && minc == 0 && (mcvec[0] & 1) &&
+             remap_ok && gc == 0 && cpu == 0 && node == 0;
         muos_puts("abi: prctl="); muos_putdec(ps);
         muos_puts("/"); muos_putdec(pg);
         muos_puts(" name="); muos_puts(nm);
@@ -1037,6 +1122,17 @@ int main(int argc, char** argv) {
         muos_puts(" tkill="); muos_putdec(tk);
         muos_puts(" tgkill="); muos_putdec(tg);
         muos_puts(" yield="); muos_putdec(sy); muos_puts("\n");
+        muos_puts("abi: cloexec="); muos_putdec(fdset);
+        muos_puts("/"); muos_putdec(fdget);
+        muos_puts(" nonblock="); muos_putdec(nbset);
+        muos_puts("/"); muos_putdec(nbrd);
+        muos_puts(" clock_ns="); muos_putdec(cn);
+        muos_puts(" mincore="); muos_putdec(minc);
+        muos_puts("/"); muos_putdec((int)mcvec[0]);
+        muos_puts(" mremap="); muos_putdec(remap_ok);
+        muos_puts(" getcpu="); muos_putdec(gc);
+        muos_puts("/"); muos_putdec((int)cpu);
+        muos_puts("/"); muos_putdec((int)node); muos_puts("\n");
         muos_puts(ok ? "ABI-OK\n" : "ABI-BAD\n");
         return 0;
     }

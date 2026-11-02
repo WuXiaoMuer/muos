@@ -98,6 +98,13 @@ bool_t   user_fd_set_offset(int fd, uint32_t offset);
  * returns them and F_SETFL toggles O_APPEND. */
 uint32_t user_fd_flags(int fd);
 bool_t   user_fd_set_flags(int fd, uint32_t flags);
+/* Descriptor flags (FD_CLOEXEC bit 0), used by fcntl F_GETFD/F_SETFD. */
+#define USER_FD_CLOEXEC 1u
+uint32_t user_fd_fdflags(int fd);
+bool_t   user_fd_set_fdflags(int fd, uint32_t flags);
+/* Close every descriptor carrying FD_CLOEXEC (called after a successful
+ * execve image install). */
+void     user_fd_close_cloexec(void);
 void     user_fd_close(int fd);
 
 /* poll events (mirror of the Linux i386 values) */

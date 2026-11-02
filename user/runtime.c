@@ -167,6 +167,24 @@ int muos_sched_yield(void) {
     return syscall0(158);
 }
 
+int muos_clock_nanosleep(int clockid, int flags, void* req, void* rem) {
+    return syscall4(267, clockid, flags, (int)req, (int)rem);
+}
+
+int muos_mincore(unsigned addr, unsigned len, unsigned char* vec) {
+    return syscall3(218, (int)addr, (int)len, (int)vec);
+}
+
+int muos_getcpu(unsigned* cpu, unsigned* node) {
+    return syscall2(318, (int)cpu, (int)node);
+}
+
+unsigned muos_mremap(unsigned old_addr, unsigned old_size, unsigned new_size,
+                     int flags, unsigned new_addr) {
+    return (unsigned)syscall5(163, (int)old_addr, (int)old_size,
+                              (int)new_size, flags, (int)new_addr);
+}
+
 int muos_uname(char* out) {
     return syscall1(122, (int)out);
 }
