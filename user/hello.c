@@ -635,6 +635,17 @@ int main(int argc, char** argv) {
                 muos_puts(big_ok ? " big-ok\n" : " big-bad\n");
                 ok = ok && big_ok;
 
+                /* Socket fcntl(F_SETFL, O_NONBLOCK): an empty read then
+                 * returns EAGAIN immediately instead of polling. */
+                muos_fcntl(sv[1], MUOS_F_SETFL, MUOS_O_NONBLOCK);
+                int nfl = muos_fcntl(sv[1], MUOS_F_GETFL, 0);
+                int nbr = muos_recv(sv[1], r1, sizeof(r1), 0);
+                int nb_ok = (nfl == (MUOS_O_NONBLOCK | 2) && nbr == -11);
+                muos_puts("tcp: sock-nonblock="); muos_putdec(nfl);
+                muos_puts("/"); muos_putdec(nbr);
+                muos_puts(nb_ok ? " nonblock-ok\n" : " nonblock-bad\n");
+                ok = ok && nb_ok;
+
                 /* shutdown(SHUT_WR) on one end: the partner drains what is
                  * buffered (already read above), then recv reports EOF. */
                 int sdc = muos_shutdown(sv[0], MUOS_SHUT_WR);

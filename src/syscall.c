@@ -3774,6 +3774,20 @@ static uint32_t do_clock_gettime(uint32_t clockid, uint32_t ts,
 }
 
 static uint32_t do_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg) {
+    int sid = sock_id(fd);
+    if (sid >= 0) {
+        switch (cmd) {
+            case 1: return 0;                     /* F_GETFD */
+            case 2: return 0;                     /* F_SETFD */
+            case 3:                               /* F_GETFL */
+                return O_RDWR |
+                       (net_socket_nonblock(sid) ? O_NONBLOCK : 0);
+            case 4:                               /* F_SETFL */
+                net_socket_set_nonblock(sid, (arg & O_NONBLOCK) != 0);
+                return 0;
+            default: return err(ERR_EINVAL);
+        }
+    }
     if (user_fd_kind((int)fd) < 0) return err(ERR_EBADF);
     switch (cmd) {
         case 0:              /* F_DUPFD */
@@ -4368,7 +4382,9 @@ void syscall_handler(registers_t* regs) {
             int id = net_accept(sock_id(regs->ebx));
             if (id == NET_EAGAIN) {
                 proc_t* p = proc_current();
-                if (!(regs->esi & 0x800u) && p && p->pid != 1 &&
+                if (!(regs->esi & 0x800u) &&
+                    !net_socket_nonblock(sock_id(regs->ebx)) &&
+                    p && p->pid != 1 &&
                     proc_block_current_ext(regs, PROC_WAIT_ACCEPT, 0, 0,
                                            0, false, sock_id(regs->ebx))) {
                     ret = 0;        /* frame switched; waker sets eax */

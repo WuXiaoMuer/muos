@@ -141,6 +141,7 @@ typedef struct {
     bool_t   unix_peer_closed; /* partner closed/shut its send side: recv EOF */
     bool_t   shut_rd;       /* shutdown(SHUT_RD): recv reports EOF */
     bool_t   shut_wr;       /* shutdown(SHUT_WR): sends fail, FIN already sent */
+    bool_t   nonblock;      /* fcntl(F_SETFL, O_NONBLOCK) */
     uint32_t snd_nxt;
     uint32_t rcv_nxt;
     uint32_t snd_una;       /* first unacknowledged sequence number */
@@ -1603,6 +1604,14 @@ bool_t net_socket_is_unix(int id) {
     return socks[id].unix_peer >= 0 || socks[id].unix_peer_closed;
 }
 
+void net_socket_set_nonblock(int id, bool_t on) {
+    if (net_socket_ok(id)) socks[id].nonblock = on;
+}
+
+bool_t net_socket_nonblock(int id) {
+    return net_socket_ok(id) ? socks[id].nonblock : false;
+}
+
 /* Allocate a bare AF_UNIX endpoint (no NIC needed). */
 static net_sock_t* unix_alloc(int type) {
     for (int i = 0; i < NET_FD_MAX - NET_FD_BASE; i++) {
@@ -1779,6 +1788,7 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
              * once every byte it buffered has been handed to the caller. */
             if (s->unix_peer_closed) return 0;
             if (!net_socket_ok(s->unix_peer)) return 0;
+            if (s->nonblock) return NET_EAGAIN;
             __asm__ volatile ("sti; hlt; cli");
         }
         return NET_EAGAIN;
@@ -1797,6 +1807,7 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
             }
             if (s->tcp_state == TCP_CLOSE_WAIT && s->rcv_nxt == s->rx_delivered)
                 return 0;                                  /* EOF */
+            if (s->nonblock) return NET_EAGAIN;
             __asm__ volatile ("sti; hlt; cli");
         }
         return NET_EAGAIN;
@@ -1814,6 +1825,7 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
             s->plen = 0;
             return (int)n;
         }
+        if (s->nonblock) return NET_EAGAIN;
         __asm__ volatile ("sti; hlt; cli");
     }
     return NET_EAGAIN;

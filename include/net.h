@@ -45,6 +45,9 @@ int net_socketpair(int type, int* a, int* b);
 int net_socket_kind(int id);
 /* True for an AF_UNIX endpoint (socketpair) with no NIC dependence. */
 bool_t net_socket_is_unix(int id);
+/* Per-socket O_NONBLOCK: recv/accept return -EAGAIN instead of polling. */
+void   net_socket_set_nonblock(int id, bool_t on);
+bool_t net_socket_nonblock(int id);
 int net_bind(int id, uint32_t ip, uint16_t port);
 int net_connect(int id, uint32_t ip, uint16_t port);
 int net_listen(int id);
