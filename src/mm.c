@@ -426,10 +426,12 @@ uint32_t mm_create_user_pd(uint32_t tramp_phys) {
     return (uint32_t)pd;
 }
 
-/* Software-only PTE bit (bit 9 is available on non-PAE i386): set by
- * mprotect(PROT_READ/PROT_NONE) so a later write fault is a real violation
- * instead of being mistaken for a COW fault. */
+/* Software-only PTE bits (9/10 are available on non-PAE i386): bit 9 marks
+ * a page made read-only by mprotect so a later write fault is a real
+ * violation instead of a COW fault; bit 10 marks PROT_NONE, which rejects
+ * reads as well. */
 #define PTE_RO_PROT 0x200u
+#define PTE_NONE_PROT 0x400u
 
 /* A non-present user PTE carrying a swap slot: bit1 marks it, bits 12+
  * hold the slot index. Bit1 is also PTE_WRITABLE, so the present bit must
@@ -476,6 +478,7 @@ bool_t mm_user_fault(uint32_t pd_phys, uint32_t va, bool_t write) {
         if (mm_get_current_pd() == pd_phys) mm_switch_pd(pd_phys);
         return true;
     }
+    if (*pte & PTE_NONE_PROT) return false;    /* PROT_NONE: no access at all */
     if (!write || (*pte & PTE_WRITABLE)) return true;
     if (*pte & PTE_RO_PROT) return false;      /* mprotect made it read-only */
     return mm_user_make_writable(pd_phys, va);
@@ -596,7 +599,7 @@ uint32_t mm_user_translate(uint32_t pd_phys, uint32_t va) {
 bool_t mm_user_make_writable(uint32_t pd_phys, uint32_t va) {
     uint32_t* pte = user_pte(pd_phys, va);
     if (!pte || !(*pte & PTE_PRESENT)) return false;
-    if (*pte & PTE_RO_PROT) return false;      /* mprotect read-only */
+    if (*pte & (PTE_RO_PROT | PTE_NONE_PROT)) return false;  /* mprotect */
     if (*pte & PTE_WRITABLE) return true;
 
     uint32_t old = *pte & PAGE_MASK;
@@ -615,30 +618,44 @@ bool_t mm_user_make_writable(uint32_t pd_phys, uint32_t va) {
 }
 
 bool_t mm_user_protect(uint32_t pd_phys, uint32_t va, uint32_t len,
-                       bool_t writable) {
+                       uint32_t prot) {
     if (!pd_phys || len == 0) return true;
     if (va < USER_BASE || va >= USER_SIGTRAMP) return false;
 
     uint32_t end = va + len;
     if (end < va || end > USER_SIGTRAMP) end = USER_SIGTRAMP;
 
-    /* Pages that are not mapped yet keep their demand-paged default; only
-     * present pages (or swapped-out ones we can bring back) are adjusted. */
+    /* Linux PROT_READ/PROT_WRITE/PROT_EXEC bits; PROT_NONE (0) denies both
+     * reads and writes, any of the other bits makes the page readable. */
+    bool_t none = (prot & 0x7u) == 0;
+    bool_t writable = !none && (prot & 0x2u) != 0;
+
+    /* Unlike an mprotect over a populated range, a page that was never
+     * touched (or was munmapped) is faulted in first so the requested
+     * protection applies to real memory instead of a future default page. */
     for (uint32_t a = va & PAGE_MASK; a < end; a += PAGE_SIZE) {
         uint32_t* pte = user_pte(pd_phys, a);
-        if (!pte) continue;
+        if (!pte || (!(*pte & PTE_PRESENT) && !PTE_IS_SWAP(*pte))) {
+            if (!mm_user_fault(pd_phys, a, false)) return false;
+            pte = user_pte(pd_phys, a);
+            if (!pte) return false;
+        }
         if (PTE_IS_SWAP(*pte)) {
             if (!mm_user_fault(pd_phys, a, false)) return false;
             pte = user_pte(pd_phys, a);
-            if (!pte) continue;
+            if (!pte) return false;
         }
-        if (!(*pte & PTE_PRESENT)) continue;
+        if (!(*pte & PTE_PRESENT)) return false;
 
-        if (writable) {
-            *pte &= ~PTE_RO_PROT;
+        if (none) {
+            *pte &= ~PTE_WRITABLE;
+            *pte |= PTE_RO_PROT | PTE_NONE_PROT;
+        } else if (writable) {
+            *pte &= ~(PTE_RO_PROT | PTE_NONE_PROT);
             if (!mm_user_make_writable(pd_phys, a)) return false;
         } else {
             *pte &= ~PTE_WRITABLE;
+            *pte &= ~PTE_NONE_PROT;
             *pte |= PTE_RO_PROT;
         }
     }

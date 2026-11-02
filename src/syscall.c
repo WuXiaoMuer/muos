@@ -318,6 +318,9 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define SYS_shutdown    373
 #define AF_INET          2
 #define AF_UNIX          1
+#define SHUT_RD          0
+#define SHUT_WR          1
+#define SHUT_RDWR        2
 
 /* i386 iovec / msghdr layouts shared by readv/writev and sendmsg/recvmsg. */
 typedef struct {
@@ -1617,6 +1620,16 @@ static uint32_t do_socketpair(uint32_t domain, uint32_t type,
     return 0;
 }
 
+/* shutdown(2): half-close a socket. AF_UNIX partners observe EOF once the
+ * buffered bytes are drained; TCP SHUT_WR emits a FIN. */
+static uint32_t do_shutdown(uint32_t fd, uint32_t how) {
+    int id = sock_id(fd);
+    if (id < 0) return err(ERR_EBADF);
+    if (how > SHUT_RDWR) return err(ERR_EINVAL);
+    if (net_shutdown(id, (int)how) < 0) return err(ERR_EBADF);
+    return 0;
+}
+
 #define MSG_TMP_MAX 1400
 static uint8_t msg_tmp[MSG_TMP_MAX];   /* syscalls are not preempted */
 
@@ -1711,7 +1724,7 @@ static uint32_t do_socketcall(uint32_t call, uint32_t args) {
         case 11: return do_sendto(a[0], a[1], a[2], a[3], a[4], a[5]);
         case 12: return do_recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]);
         case 8:  return do_socketpair(a[0], a[1], a[2], a[3]);
-        case 13: return 0;                       /* shutdown */
+        case 13: return do_shutdown(a[0], a[1]);
         case 14: return do_setsockopt(a[0], a[1], a[2], a[3], a[4]);
         case 15: return do_getsockopt(a[0], a[1], a[2], a[3], a[4]);
         case 16: return do_sendmsg(a[0], a[1], a[2]);
@@ -3835,8 +3848,10 @@ static uint32_t do_munmap(uint32_t addr, uint32_t len) {
     return 0;
 }
 
-/* mprotect: writability of present pages. PROT_NONE is approximated as
- * read-only (the sandbox has no not-present protection). */
+/* mprotect: PROT_NONE makes the range inaccessible (reads and writes),
+ * PROT_READ (and PROT_EXEC, since i386 has no exec-only pages) strips
+ * write access, PROT_WRITE restores it. Pages that are not mapped yet are
+ * faulted in first so the protection binds to real memory. */
 static uint32_t do_mprotect(uint32_t addr, uint32_t len, uint32_t prot) {
     if (!len) return 0;
     if (addr & (PAGE_SIZE - 1u)) return err(ERR_EINVAL);
@@ -3849,8 +3864,7 @@ static uint32_t do_mprotect(uint32_t addr, uint32_t len, uint32_t prot) {
     proc_t* p = proc_current();
     if (!p || !p->pd_phys) return err(ERR_EINVAL);
 
-    bool_t writable = (prot & PROT_WRITE) != 0;
-    if (!mm_user_protect(p->pd_phys, addr, end - addr, writable))
+    if (!mm_user_protect(p->pd_phys, addr, end - addr, prot))
         return err(ERR_ENOMEM);
     return 0;
 }
@@ -4021,7 +4035,7 @@ void syscall_handler(registers_t* regs) {
             break;
         }
         case SYS_shutdown:
-            ret = 0;
+            ret = do_shutdown(regs->ebx, regs->ecx);
             break;
         case SYS_setsockopt:
             ret = do_setsockopt(regs->ebx, regs->ecx, regs->edx,

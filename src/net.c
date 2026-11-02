@@ -136,6 +136,9 @@ typedef struct {
     uint32_t unix_head;     /* incoming stream bytes (ring) */
     uint32_t unix_len;
     uint8_t  unix_buf[1024];
+    bool_t   unix_peer_closed; /* partner closed/shut its send side: recv EOF */
+    bool_t   shut_rd;       /* shutdown(SHUT_RD): recv reports EOF */
+    bool_t   shut_wr;       /* shutdown(SHUT_WR): sends fail, FIN already sent */
     uint32_t snd_nxt;
     uint32_t rcv_nxt;
     uint32_t snd_una;       /* first unacknowledged sequence number */
@@ -1687,9 +1690,11 @@ int net_sendto(int id, const void* data, uint32_t len,
                uint32_t ip, uint16_t port) {
     if (!net_socket_ok(id)) return -1;
     net_sock_t* s = &socks[id];
+    if (s->shut_wr || s->unix_peer_closed) return -1;
     if (s->unix_peer >= 0) {
         if (!net_socket_ok(s->unix_peer)) return -1;
         net_sock_t* peer = &socks[s->unix_peer];
+        if (peer->shut_rd) return -1;          /* peer no longer reads */
         if (s->type == NET_SOCK_DGRAM) {
             if (peer->has || len > sizeof(peer->data)) return -1;
             memcpy(peer->data, data, len);
@@ -1723,7 +1728,9 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
     if (!net_socket_ok(id)) return -1;
     net_sock_t* s = &socks[id];
 
-    if (s->unix_peer >= 0) {
+    if (s->shut_rd) return 0;                  /* read half already closed */
+
+    if (s->unix_peer >= 0 || s->unix_peer_closed) {
         for (uint32_t loops = 0; loops < 300; loops++) {   /* ~3 seconds */
             if (s->type == NET_SOCK_DGRAM) {
                 if (s->has) {
@@ -1744,7 +1751,10 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
                 s->unix_len -= n;
                 return (int)n;
             }
-            if (!net_socket_ok(s->unix_peer)) return 0;    /* peer closed */
+            /* EOF once the partner closed its end or shut down writes, and
+             * once every byte it buffered has been handed to the caller. */
+            if (s->unix_peer_closed) return 0;
+            if (!net_socket_ok(s->unix_peer)) return 0;
             __asm__ volatile ("sti; hlt; cli");
         }
         return NET_EAGAIN;
@@ -1785,15 +1795,45 @@ int net_recvfrom(int id, void* buf, uint32_t maxlen,
     return NET_EAGAIN;
 }
 
+/* shutdown(2): SHUT_RD (0) ends local reads, SHUT_WR (1) ends local writes
+ * and tells the peer (FIN for TCP, EOF-after-drain for AF_UNIX), SHUT_RDWR
+ * (2) does both. */
+int net_shutdown(int id, int how) {
+    if (!net_socket_ok(id)) return -1;
+    if (how < 0 || how > 2) return -1;
+    net_sock_t* s = &socks[id];
+
+    bool_t rd = (how == 0 || how == 2);
+    bool_t wr = (how == 1 || how == 2);
+    if (rd) s->shut_rd = true;
+    if (wr && !s->shut_wr) {
+        s->shut_wr = true;
+        if (s->unix_peer >= 0) {
+            if (net_socket_ok(s->unix_peer))
+                socks[s->unix_peer].unix_peer_closed = true;
+        } else if (s->type == NET_SOCK_STREAM &&
+                   (s->tcp_state == TCP_ESTAB ||
+                    s->tcp_state == TCP_CLOSE_WAIT)) {
+            tcp_send_seg(s, s->snd_nxt, s->rcv_nxt,
+                         TCP_F_FIN | TCP_F_ACK, NULL, 0);
+            s->snd_nxt++;
+        }
+    }
+    return 0;
+}
+
 int net_close(int id) {
     if (!net_socket_ok(id)) return -1;
     net_sock_t* s = &socks[id];
     if (s->unix_peer >= 0) {
-        if (net_socket_ok(s->unix_peer)) socks[s->unix_peer].unix_peer = -1;
+        if (net_socket_ok(s->unix_peer)) {
+            socks[s->unix_peer].unix_peer = -1;
+            socks[s->unix_peer].unix_peer_closed = true;
+        }
         memset(s, 0, sizeof(*s));
         return 0;
     }
-    if (s->type == NET_SOCK_STREAM &&
+    if (s->type == NET_SOCK_STREAM && !s->shut_wr &&
         (s->tcp_state == TCP_ESTAB || s->tcp_state == TCP_CLOSE_WAIT)) {
         tcp_send_seg(s, s->snd_nxt, s->rcv_nxt, TCP_F_FIN | TCP_F_ACK, NULL, 0);
         s->snd_nxt++;

@@ -311,6 +311,10 @@ int muos_socketpair(int type, int sv[2]) {
     return syscall4(360, MUOS_AF_UNIX, type, 0, (int)sv);
 }
 
+int muos_shutdown(int fd, int how) {
+    return syscall2(373, fd, how);
+}
+
 int muos_getsockopt(int fd, int level, int opt, unsigned* val, unsigned* len) {
     return syscall5(365, fd, level, opt, (int)val, (int)len);
 }

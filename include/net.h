@@ -55,6 +55,8 @@ int net_sendto(int id, const void* data, uint32_t len,
                uint32_t ip, uint16_t port);
 int net_recvfrom(int id, void* buf, uint32_t maxlen,
                  uint32_t* ip, uint16_t* port);
+/* shutdown(2): how is 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR. */
+int net_shutdown(int id, int how);
 int net_close(int id);
 int net_getsockname(int id, uint32_t* ip, uint16_t* port);
 int net_getpeername(int id, uint32_t* ip, uint16_t* port);

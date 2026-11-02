@@ -12,6 +12,7 @@
 #define MUOS_O_DIRECTORY 0x10000
 
 /* mmap(2) prot/flags and rlimit resources */
+#define MUOS_PROT_NONE  0x0
 #define MUOS_PROT_READ  0x1
 #define MUOS_PROT_WRITE 0x2
 #define MUOS_PROT_EXEC  0x4
@@ -26,6 +27,9 @@
 #define MUOS_SOCK_STREAM 1
 #define MUOS_SOL_SOCKET  1
 #define MUOS_SO_TYPE     3
+#define MUOS_SHUT_RD     0
+#define MUOS_SHUT_WR     1
+#define MUOS_SHUT_RDWR   2
 
 typedef struct {
     unsigned base;
@@ -73,6 +77,7 @@ int  muos_munmap(unsigned addr, unsigned len);
 int  muos_mprotect(unsigned addr, unsigned len, int prot);
 int  muos_msync(unsigned addr, unsigned len, int flags);
 int  muos_socketpair(int type, int sv[2]);
+int  muos_shutdown(int fd, int how);
 int  muos_getsockopt(int fd, int level, int opt, unsigned* val, unsigned* len);
 int  muos_sendmsg(int fd, muos_msghdr_t* msg, int flags);
 int  muos_recvmsg(int fd, muos_msghdr_t* msg, int flags);

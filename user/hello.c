@@ -578,6 +578,18 @@ int main(int argc, char** argv) {
                 muos_puts(" pair-recv="); muos_putdec(got);
                 muos_puts(pair_ok ? " pair-ok\n" : " pair-bad\n");
                 ok = ok && pair_ok;
+
+                /* shutdown(SHUT_WR) on one end: the partner drains what is
+                 * buffered (already read above), then recv reports EOF. */
+                int sdc = muos_shutdown(sv[0], MUOS_SHUT_WR);
+                char eob[4];
+                int eof = muos_recv(sv[1], eob, sizeof(eob), 0);
+                int shut_ok = (sdc == 0 && eof == 0);
+                muos_puts("tcp: shutdown="); muos_putdec(sdc);
+                muos_puts(" peer-recv="); muos_putdec(eof);
+                muos_puts(shut_ok ? " shutdown-ok\n" : " shutdown-bad\n");
+                ok = ok && shut_ok;
+
                 muos_close(sv[0]);
                 muos_close(sv[1]);
             } else {
@@ -1281,6 +1293,20 @@ int main(int argc, char** argv) {
                 muos_puts(prot_ok ? "mfile: mprotect-ok\n" : "mfile: mprotect-bad\n");
                 ok = ok && prot_ok;
                 muos_munmap((unsigned)mp, 4096);
+            }
+
+            /* mprotect over a just-munmapped page must fault it back in and
+             * return 0; the fresh page is readable zero-filled memory. */
+            char* mr = (char*)muos_mmap(4096);
+            if (mr && (unsigned)mr >= 0x08048000u) {
+                muos_munmap((unsigned)mr, 4096);
+                rc = muos_mprotect((unsigned)mr, 4096,
+                                   MUOS_PROT_READ | MUOS_PROT_WRITE);
+                int remap_ok = (rc == 0 && mr[0] == 0 && mr[4095] == 0);
+                muos_puts(remap_ok ? "mfile: mprotect-remap-ok\n"
+                                   : "mfile: mprotect-remap-bad\n");
+                ok = ok && remap_ok;
+                muos_munmap((unsigned)mr, 4096);
             }
 
             rc = muos_fsync(fd);
