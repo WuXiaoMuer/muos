@@ -9,7 +9,7 @@
 - **进程与信号**:`fork/execve/wait4/waitid`、`clone` 线程(`CLONE_VM/FILES/THREAD/SETTLS`,共享地址空间)、信号 pending/blocked 掩码与 `signal/sigaction/rt_sigaction/sigprocmask`、handler + sigreturn trampoline、默认终止动作、`alarm`;阻塞 `wait4/waitid/poll/read` 在管道/键盘/定时器事件上唤醒
 - **Linux ABI**:退出/stdio、文件 fd、`brk`/匿名 `mmap`、`uname`、i386 TLS;多级 RAM FS(`mkdir/rmdir`、子目录路径解析)与普通文件:`open/read/write/lseek/close`、`getdents(64)`、`stat/lstat/fstat(64)`/`statx`、`access`、`getcwd`、`writev/readv`、`unlink/rename`、`utimes` 族;虚拟 `/dev/null|zero|console`、`/proc/{meminfo,uptime,version,cpuinfo,mounts,loadavg,stat,maps}`、`/proc/<pid>/{stat,status,comm,cmdline,maps}` 与 `/etc/mtab`,并由 `statfs/sysinfo` 支撑 `df/free`;`pipe/pipe2` 支撑真实 shell 管道,`/bin/<applet>` 映射到 BusyBox 模块;`/dev/hda` 提供 ATA PIO 块设备(跨启动持久化)
 - **ATA 磁盘 + MuFS**:primary master PIO / 28-bit LBA,`/dev/hda` 字节级读写(部分扇区读改写);扇区 0 超级块、元数据表、16×64KB 数据槽,所有文件变更写穿、`fsync/sync` 全量刷新、开机自动挂载(无盘时退回纯 RAM FS);`tools/test_ata.py` 两次启动验证文件内容与裸扇区数据都保留
-- **分区与真实文件系统**:`part.c` 解析 MBR 与 GPT(保护性 MBR → GPT 表项,过滤 Basic Data GUID),`fat.c` 读取 FAT32(8.3 + VFAT 长名、簇链、子目录)并可创建/覆盖文件(8.3 或自动生成 `NAME~1` 别名 + LFN 项;分配/释放簇链、双 FAT 写穿),`ext2.c` 读取 ext2(超级块/组描述符/12 直接块 + 一级间接)并可创建/覆盖文件(块与 inode 位图分配、目录项插入/分裂、更新空闲计数);两个卷以 `/fat`、`/ext2` 挂载进 VFS,用户程序可直接 `open/read/write/stat/getdents/unlink/rename/mkdir/rmdir`(支持文件与目录改名,open 支持 `O_CREAT/O_TRUNC`;写路径每次把整文件回写到卷,单文件上限 64KB,超出返回 EFBIG);检测到分区表时 MuFS 不再格式化该盘;MuFS 元数据提交带写前日志(扇区 9–15,挂载时重放未完成提交)。`tools/test_fs_read.py` 用生成的 MBR/GPT FAT32 与 ext2 镜像验证 `part/fatls/fatcat/fatwrite/ext2ls/ext2cat/ext2write`、`run vfs` 挂载读取/写入/删除/重命名/建目录/删目录与二次启动持久化
+- **分区与真实文件系统**:`part.c` 解析 MBR 与 GPT(保护性 MBR → GPT 表项,过滤 Basic Data GUID),`fat.c` 读取 FAT32(8.3 + VFAT 长名、簇链、子目录)并可创建/覆盖文件(8.3 或自动生成 `NAME~1` 别名 + LFN 项;分配/释放簇链、双 FAT 写穿),`ext2.c` 读取 ext2(超级块/组描述符/12 直接块 + 单/双/三级间接)并可创建/覆盖文件(块与 inode 位图分配、目录项插入/分裂、更新空闲计数);两个卷以 `/fat`、`/ext2` 挂载进 VFS,用户程序可直接 `open/read/write/stat/getdents/unlink/rename/mkdir/rmdir`(支持文件与目录改名,open 支持 `O_CREAT/O_TRUNC`;写路径每次把整文件回写到卷,暂存缓冲按需从内核堆分配、8MB 上限,ext2 写支持直接 + 单/双级间接,超出返回 EFBIG);检测到分区表时 MuFS 不再格式化该盘;MuFS 元数据提交带写前日志(扇区 9–15,挂载时重放未完成提交)。`tools/test_fs_read.py` 用生成的 MBR/GPT FAT32 与 ext2 镜像验证 `part/fatls/fatcat/fatwrite/ext2ls/ext2cat/ext2write`、`run vfs` 挂载读取/写入/删除/重命名/建目录/删目录与二次启动持久化
 - **外部 ELF / Multiboot modules**:`qemu -kernel ... -initrd program` 直接加载任意静态 ELF,Shell `mods` / `execmod <n> [args...]`;已验证 **Alpine 静态 i386 BusyBox 1.36.1** 可运行 `echo`、`ls /`、`cat /notes.txt`、`pwd`、`id`、`uname -a`、`wc`、`grep`、`head/tail`、`sort`、`sed`、`cut`、`od`、`md5sum`、`stat`、`du`、`date`、`cp/rm/mv/touch`、`free`、`df`、`dd`、`uptime`、`ps`,以及 **BusyBox shell 执行外部 applet 与管道**:`sh -c 'echo hi | cat'`、`sh -c 'ls | wc -l'`
 - **RAM 文件系统**:16 文件槽 × 64KB + 16 目录槽(多级路径,足够存放静态 i386 ELF)+ 全屏文本编辑器
 - **MuOS v1.3 桌面(`desktop`/`gui`)**:文本模式 Win7 风格 GUI(任务栏、开始菜单、窗口 z-order、Calculator),启动 logo 为立体 ASCII 字标
@@ -43,7 +43,7 @@ muos/
 │   ├── ata.c        ATA PIO 块设备(identify/read/write,28-bit LBA)
 │   ├── part.c       MBR/GPT 分区表解析(保护性 MBR → GPT 表项)
 │   ├── fat.c        FAT32 读写(8.3 + VFAT 长名、簇链、子目录)
-│   ├── ext2.c       ext2 读写(超级块/组描述符/直接块 + 一级间接/位图分配)
+│   ├── ext2.c       ext2 读写(超级块/组描述符/直接块 + 单/双级间接/位图分配)
 │   ├── pci.c        PCI 配置空间访问(0xCF8/0xCFC)+ 设备查找
 │   ├── net.c        RTL8139/E1000 驱动 + ARP/IPv4/ICMP/UDP/TCP + DHCP + socket 表
 │   ├── string.c     freestanding 字符串/内存函数(标准名)
@@ -219,7 +219,7 @@ muos> ext2write /NEW.TXT OK # 创建/覆盖 ext2 文件(位图分配 + 目录项
 muos> ls /fat             # 挂载的 FAT32 卷(读写)
 muos> cat /fat/HELLO.TXT  # 通过 VFS 路径读取分区文件
 muos> ls /ext2            # 挂载的 ext2 卷(读写)
-muos> run vfs             # 挂载卷 open/read/write/stat/getdents 验证(含 ext2 300KB 双间接读、128KB 大文件写)
+muos> run vfs             # 挂载卷 open/read/write/stat/getdents 验证(含 ext2 300KB 双间接读、512KB 双间接写)
 muos> poweroff            # ACPI S5 关机(无 FADT 时用 QEMU 0x604/0xB004 端口)
 muos> run fault           # 故意写 0xC0000000,验证用户态 Page Fault 只杀进程
 ```

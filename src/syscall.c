@@ -19,18 +19,18 @@
 #include "net.h"
 #include "fat.h"
 #include "ext2.h"
+#include "kheap.h"
 
 /* Mounted block-volume ids (VFS_T_EXT id / user_fd ext_vol). */
 #define VFS_VOL_FAT  1
 #define VFS_VOL_EXT2 2
 
-/* One 256KB staging buffer for writable mounted-volume files. Writes are
- * read-modify-rewrite (FAT/ext2 drivers take whole-file images), and syscalls
- * are not preempted, so a single buffer is safe and avoids per-fd heap
- * ownership across fork/dup. ext2's single-indirect limit is 268 blocks, so
- * 256KB fits without a second-level indirect write path. */
-#define VFS_EXT_MAX 262144u
-static uint8_t vfs_ext_wbuf[VFS_EXT_MAX];
+/* Mounted block-volume writes are read-modify-rewrite (FAT and ext2 take a
+ * whole-file image), so a staging buffer the size of the file is needed.
+ * It is heap-allocated per call: the old 256KB static buffer capped file
+ * writes, and ext2 writes now follow the double-indirect levels. 8MB is a
+ * practical ceiling for ATA-sized rewrites. */
+#define VFS_EXT_MAX (8u * 1024u * 1024u)
 
 static int vfs_vol_write(int vol, const char* path, const void* data,
                          uint32_t len) {
@@ -481,19 +481,25 @@ static uint32_t do_write(uint32_t fd, uint32_t buf, uint32_t count) {
             uint32_t off = (fflags & O_APPEND) ? old : user_fd_offset((int)fd);
             if (off >= VFS_EXT_MAX || count > VFS_EXT_MAX - off)
                 return err(ERR_EFBIG);
-
-            memset(vfs_ext_wbuf, 0, sizeof(vfs_ext_wbuf));
-            if (old) {
-                int n = vol == VFS_VOL_FAT
-                        ? fat_read_at(ep, 0, vfs_ext_wbuf, old)
-                        : ext2_read_at(ep, 0, vfs_ext_wbuf, old);
-                if (n < 0) return err(ERR_EIO);
-            }
-            memcpy(vfs_ext_wbuf + off, (const void*)buf, count);
             uint32_t nlen = off + count;
             if (nlen < old) nlen = old;     /* overwrite keeps the tail */
-            if (vfs_vol_write(vol, ep, vfs_ext_wbuf, nlen))
-                return err(ERR_EIO);
+
+            uint8_t* stage = kmalloc(nlen);
+            if (!stage) return err(ERR_ENOMEM);
+            memset(stage, 0, nlen);
+            if (old) {
+                int n = vol == VFS_VOL_FAT
+                        ? fat_read_at(ep, 0, stage, old)
+                        : ext2_read_at(ep, 0, stage, old);
+                if (n < 0) {
+                    kfree(stage);
+                    return err(ERR_EIO);
+                }
+            }
+            memcpy(stage + off, (const void*)buf, count);
+            bool_t werr = vfs_vol_write(vol, ep, stage, nlen);
+            kfree(stage);
+            if (werr) return err(ERR_EIO);
             user_fd_set_offset((int)fd, off + count);
             return count;
         }

@@ -1,10 +1,11 @@
-/* ext2.c - minimal read-only ext2 driver.
+/* ext2.c - minimal ext2 driver.
  *
  * Layout: superblock at partition byte offset 1024, group descriptor table
  * at block (first_data_block + 1), block size from s_log_block_size.
  * rev 0 images only (128-byte inodes); rev 1 with 128-byte inodes also
  * works. Directory lookup walks linear entries; file reads use the 12
- * direct blocks and the single-indirect block.
+ * direct blocks and the single, double and triple indirect blocks. Writes
+ * fill the direct, single- and double-indirect levels.
  */
 #include "ext2.h"
 #include "part.h"
@@ -36,6 +37,8 @@ static uint8_t blkbuf[MAX_BLOCK] __attribute__((aligned(4)));
  * alloc_block()/write_inode_data() can nest. */
 static uint8_t mapbuf[MAX_BLOCK] __attribute__((aligned(4)));
 static uint8_t indbuf_w[MAX_BLOCK] __attribute__((aligned(4)));
+static uint8_t dindbuf_w[MAX_BLOCK] __attribute__((aligned(4)));  /* 2nd-level pointer block */
+static uint8_t lvl2buf_w[MAX_BLOCK] __attribute__((aligned(4)));  /* current 2nd-level data block */
 
 static uint16_t le16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t le32(const uint8_t* p) {
@@ -520,7 +523,9 @@ static bool_t dir_add(uint32_t dir_ino, const char* name, uint32_t child) {
     return write_inode(dir_ino, dinode);
 }
 
-/* Release the data blocks referenced by an inode and clear its pointers. */
+/* Release the data blocks referenced by an inode and clear its pointers.
+ * Walks the single, double and triple indirect trees so truncating a file
+ * that was created elsewhere does not leak blocks. */
 static void free_inode_blocks(uint8_t* inode) {
     for (uint32_t i = 0; i < 12; i++) {
         uint32_t block = le32(inode + 40 + i * 4);
@@ -538,24 +543,75 @@ static void free_inode_blocks(uint8_t* inode) {
         free_block(ind);
         put32(inode + 40 + 12 * 4, 0);
     }
+    uint32_t dind = le32(inode + 40 + 13 * 4);
+    if (dind) {
+        if (read_block(dind, dindbuf_w)) {
+            for (uint32_t i = 0; i < vol.block_size / 4; i++) {
+                uint32_t l2 = le32(dindbuf_w + i * 4);
+                if (!l2) continue;
+                if (read_block(l2, lvl2buf_w)) {
+                    for (uint32_t j = 0; j < vol.block_size / 4; j++) {
+                        uint32_t block = le32(lvl2buf_w + j * 4);
+                        if (block) free_block(block);
+                    }
+                }
+                free_block(l2);
+            }
+        }
+        free_block(dind);
+        put32(inode + 40 + 13 * 4, 0);
+    }
+    uint32_t tind = le32(inode + 40 + 14 * 4);
+    if (tind) {
+        if (read_block(tind, dindbuf_w)) {
+            for (uint32_t i = 0; i < vol.block_size / 4; i++) {
+                uint32_t d2 = le32(dindbuf_w + i * 4);
+                if (!d2) continue;
+                if (read_block(d2, indbuf_w)) {
+                    for (uint32_t j = 0; j < vol.block_size / 4; j++) {
+                        uint32_t l2 = le32(indbuf_w + j * 4);
+                        if (!l2) continue;
+                        if (read_block(l2, lvl2buf_w)) {
+                            for (uint32_t k = 0; k < vol.block_size / 4; k++) {
+                                uint32_t block = le32(lvl2buf_w + k * 4);
+                                if (block) free_block(block);
+                            }
+                        }
+                        free_block(l2);
+                    }
+                }
+                free_block(d2);
+            }
+        }
+        free_block(tind);
+        put32(inode + 40 + 14 * 4, 0);
+    }
 }
 
-/* Write len bytes into freshly allocated blocks and update the inode. */
+/* Write len bytes into freshly allocated blocks and update the inode.
+ * Levels: 12 direct, one single-indirect block, then a double-indirect
+ * block pointing at second-level pointer blocks. */
 static bool_t write_inode_data(uint8_t* inode, const uint8_t* data,
                                uint32_t len) {
     uint32_t bs = vol.block_size;
     uint32_t ptrs = bs / 4;
     uint32_t nblocks = (len + bs - 1) / bs;
-    if (nblocks > 12 + ptrs) return false;
+    if (nblocks > 12 + ptrs + ptrs * ptrs) return false;
 
-    uint32_t ind_block = 0;
+    uint32_t ind_block = 0;          /* single-indirect pointer block */
+    uint32_t dind_block = 0;         /* double-indirect pointer block */
+    uint32_t lvl2_block = 0;         /* current second-level pointer block */
+    uint32_t lvl1 = 0;               /* index of lvl2_block inside dind */
+    uint32_t lvl2_count = 0;
+    bool_t have_lvl1 = false;
+
     for (uint32_t i = 0; i < nblocks; i++) {
         int block = alloc_block();
         if (block < 0) return false;
 
         if (i < 12) {
             put32(inode + 40 + i * 4, (uint32_t)block);
-        } else {
+        } else if (i < 12 + ptrs) {
             if (!ind_block) {
                 int ib = alloc_block();
                 if (ib < 0) return false;
@@ -564,6 +620,30 @@ static bool_t write_inode_data(uint8_t* inode, const uint8_t* data,
                 put32(inode + 40 + 12 * 4, ind_block);
             }
             put32(indbuf_w + (i - 12) * 4, (uint32_t)block);
+        } else {
+            uint32_t rel = i - 12 - ptrs;
+            uint32_t l1 = rel / ptrs;
+            uint32_t l2 = rel % ptrs;
+            if (!dind_block) {
+                int db = alloc_block();
+                if (db < 0) return false;
+                dind_block = (uint32_t)db;
+                for (uint32_t j = 0; j < bs; j++) dindbuf_w[j] = 0;
+                put32(inode + 40 + 13 * 4, dind_block);
+            }
+            if (!have_lvl1 || l1 != lvl1) {
+                if (lvl2_block && !write_block(lvl2_block, lvl2buf_w))
+                    return false;
+                int ib = alloc_block();
+                if (ib < 0) return false;
+                lvl2_block = (uint32_t)ib;
+                lvl1 = l1;
+                have_lvl1 = true;
+                lvl2_count++;
+                for (uint32_t j = 0; j < bs; j++) lvl2buf_w[j] = 0;
+                put32(dindbuf_w + l1 * 4, lvl2_block);
+            }
+            put32(lvl2buf_w + l2 * 4, (uint32_t)block);
         }
 
         uint32_t done = i * bs;
@@ -572,10 +652,13 @@ static bool_t write_inode_data(uint8_t* inode, const uint8_t* data,
         if (chunk) memcpy(blkbuf, data + done, chunk);
         if (!write_block((uint32_t)block, blkbuf)) return false;
     }
+    if (lvl2_block && !write_block(lvl2_block, lvl2buf_w)) return false;
     if (ind_block && !write_block(ind_block, indbuf_w)) return false;
+    if (dind_block && !write_block(dind_block, dindbuf_w)) return false;
 
     put32(inode + 4, len);
-    put32(inode + 28, (nblocks + (ind_block ? 1u : 0u)) * (bs / 512u));
+    uint32_t meta = (ind_block ? 1u : 0u) + (dind_block ? 1u : 0u) + lvl2_count;
+    put32(inode + 28, (nblocks + meta) * (bs / 512u));
     return true;
 }
 

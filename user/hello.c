@@ -67,7 +67,7 @@ static unsigned char unix_big2[2048];
 static unsigned char unix_fill[8192];
 static unsigned char unix_drainbuf[4096];
 static unsigned char unix_small[512];
-static unsigned char vfs_big[131072];       /* 128KB mounted-volume write test */
+static unsigned char vfs_big[524288];       /* 512KB mounted-volume write test */
 
 static void unix_drainer(void* arg) {
     unsigned ts[2] = { 0, 20000000 };       /* 20ms */
