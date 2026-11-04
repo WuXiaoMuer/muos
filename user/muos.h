@@ -141,6 +141,9 @@ int  muos_thread_start(void (*fn)(void*), void* arg, void* stack_top);
 #define MUOS_FUTEX_WAIT_BITSET 9
 #define MUOS_FUTEX_WAKE_BITSET 10
 int  muos_futex(void* uaddr, int op, int val, void* timeout);
+int  muos_futex_full(void* uaddr, int op, int val, int val2,
+                     void* uaddr2, int val3);
+int  muos_set_robust_list(void* head, int len);
 int  muos_prctl(int opt, unsigned a2, unsigned a3, unsigned a4, unsigned a5);
 int  muos_madvise(unsigned addr, unsigned len, int advice);
 int  muos_fadvise64(int fd, unsigned off_lo, unsigned off_hi,

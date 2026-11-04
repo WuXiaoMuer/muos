@@ -134,6 +134,10 @@ int muos_futex(void* uaddr, int op, int val, void* timeout) {
     return syscall4(240, (int)uaddr, op, val, (int)timeout);
 }
 
+int muos_set_robust_list(void* head, int len) {
+    return syscall2(311, (int)head, len);
+}
+
 int muos_prctl(int opt, unsigned a2, unsigned a3, unsigned a4, unsigned a5) {
     return syscall5(172, opt, (int)a2, (int)a3, (int)a4, (int)a5);
 }

@@ -3901,7 +3901,8 @@ static bool_t futex_timeout(uint32_t ptr, uint32_t* deadline, bool_t* has) {
  * FUTEX_WAKE (1) / FUTEX_WAKE_BITSET (10) wake waiters in the same address
  * space. The PRIVATE flag is accepted and ignored. Other ops are ENOSYS. */
 static uint32_t do_futex(registers_t* regs, uint32_t uaddr, uint32_t op,
-                         uint32_t val, uint32_t timeout_ptr) {
+                         uint32_t val, uint32_t val2, uint32_t uaddr2,
+                         uint32_t val3) {
     if (uaddr & 3u) return err(ERR_EINVAL);
     uint32_t cmd = op & 0x7Fu;          /* strip FUTEX_PRIVATE/CLOCK flags */
 
@@ -3912,7 +3913,7 @@ static uint32_t do_futex(registers_t* regs, uint32_t uaddr, uint32_t op,
 
         uint32_t deadline = 0;
         bool_t has_deadline = false;
-        if (!futex_timeout(timeout_ptr, &deadline, &has_deadline))
+        if (!futex_timeout(val2, &deadline, &has_deadline))
             return err(ERR_EINVAL);
 
         proc_t* cur = proc_current();
@@ -3928,25 +3929,40 @@ static uint32_t do_futex(registers_t* regs, uint32_t uaddr, uint32_t op,
         if (!cur) return 0;
         return (uint32_t)proc_futex_wake(uaddr, (int32_t)val, cur->pd_phys);
     }
+
+    if (cmd == 3 || cmd == 4) {         /* REQUEUE / CMP_REQUEUE */
+        if (uaddr2 & 3u) return err(ERR_EINVAL);
+        proc_t* cur = proc_current();
+        if (!cur) return 0;
+        if (cmd == 4) {
+            if (!user_ptr_ok(uaddr, 4)) return err(ERR_EFAULT);
+            if (*(volatile uint32_t*)uaddr != val3) return err(ERR_EAGAIN);
+        }
+        return (uint32_t)proc_futex_requeue(uaddr, uaddr2, (int32_t)val,
+                                            (int32_t)val2, cur->pd_phys);
+    }
     return err(ERR_ENOSYS);
 }
 
 static uint32_t do_set_robust_list(uint32_t head, uint32_t len) {
-    /* i386 struct robust_list_head is 12 bytes. Accepted but not tracked;
-     * exiting a thread does not walk the robust list yet. */
+    /* i386 struct robust_list_head is 12 bytes; the head is walked when the
+     * owning thread exits so robust mutexes are released. */
     if (!head || len != 12) return err(ERR_EINVAL);
     if (!user_ptr_ok(head, len)) return err(ERR_EFAULT);
+    proc_t* cur = proc_current();
+    if (cur) cur->robust_head = head;
     return 0;
 }
 
 static uint32_t do_get_robust_list(uint32_t pid, uint32_t head_ptr,
                                    uint32_t len_ptr) {
-    (void)pid;
     if (!head_ptr || !len_ptr) return err(ERR_EFAULT);
     if (!user_ptr_ok(head_ptr, 4) || !user_ptr_ok(len_ptr, 4))
         return err(ERR_EFAULT);
-    *(uint32_t*)head_ptr = 0;
-    *(uint32_t*)len_ptr = 0;
+    proc_t* cur = proc_current();
+    bool_t self = (!pid || (cur && pid == (uint32_t)cur->pid));
+    *(uint32_t*)head_ptr = (self && cur) ? cur->robust_head : 0;
+    *(uint32_t*)len_ptr = 12;
     return 0;
 }
 
@@ -4831,7 +4847,8 @@ void syscall_handler(registers_t* regs) {
             ret = 0;            /* single CPU round-robin: no-op is valid */
             break;
         case SYS_futex:
-            ret = do_futex(regs, regs->ebx, regs->ecx, regs->edx, regs->esi);
+            ret = do_futex(regs, regs->ebx, regs->ecx, regs->edx, regs->esi,
+                           regs->edi, regs->ebp);
             break;
         case SYS_set_robust_list:
             ret = do_set_robust_list(regs->ebx, regs->ecx);

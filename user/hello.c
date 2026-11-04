@@ -92,6 +92,29 @@ static void futex_sleeper(void* arg) {
     muos_exit(0);
 }
 
+/* FUTEX_REQUEUE moves this waiter from req_a to req_b. */
+static unsigned futex_req_a, futex_req_b;
+static volatile int futex_req_started, futex_req_ret, futex_req_seen;
+static void futex_requeue_waiter(void* arg) {
+    (void)arg;
+    futex_req_started = 1;
+    futex_req_seen = (int)futex_req_a;
+    futex_req_ret = muos_futex((void*)&futex_req_a, MUOS_FUTEX_WAIT, 0, 0);
+}
+
+/* Robust list: node -> lock word; exiting while holding it must zero it. */
+static unsigned robust_head[3], robust_node[2], robust_word;
+static void robust_thread(void* arg) {
+    (void)arg;
+    robust_node[0] = (unsigned)&robust_head[0];
+    robust_node[1] = (unsigned)((char*)&robust_word - (char*)&robust_node[0]);
+    robust_head[0] = (unsigned)&robust_node[0];
+    robust_head[1] = 0;
+    robust_head[2] = 0;
+    muos_set_robust_list(&robust_head[0], 12);
+    robust_word = 1;
+}
+
 static void spin_child(void) {
     for (;;) {
         volatile unsigned x = 1;
@@ -1164,11 +1187,42 @@ int main(int argc, char** argv) {
         int ws = muos_waitpid(tsleep, &st, 0);
         int timed = (trc == -110 && ws == tsleep);
 
-        ok = ok && woke && timed;
+        futex_req_a = 0; futex_req_b = 0;
+        futex_req_started = 0; futex_req_ret = 9;
+        int rqth = muos_thread_start(futex_requeue_waiter, 0,
+                                     &thread_stacks[0][0] + 4096);
+        /* Busy-wait (staying runnable) so the waiter can block and the PIT
+         * can switch back to us; nanosleep here leaves no runnable process
+         * for the waiter's block to switch to. */
+        for (volatile unsigned spin = 0; spin < 20000000u; spin++) { }
+        int rq = muos_futex_full(&futex_req_a, 3, 0, 1, &futex_req_b, 0);
+        int rqw = muos_futex(&futex_req_b, MUOS_FUTEX_WAKE, 1, 0);
+        int rqst = 0;
+        int rqww = muos_waitpid(rqth, &rqst, 0);
+        int requeue_ok = (rq == 0 && rqw == 1 && rqww == rqth &&
+                          ((rqst >> 8) & 0xFF) == 0);
+
+        robust_word = 0;
+        int rbth = muos_thread_start(robust_thread, 0,
+                                     &thread_stacks[0][0] + 4096);
+        int rbww = muos_waitpid(rbth, &st, 0);
+        int robust_ok = (rbww == rbth && robust_word == 0);
+
+        ok = ok && woke && timed && requeue_ok && robust_ok;
         muos_puts("futex: eagain="); muos_putdec(eagain);
         muos_puts(" wait="); muos_putdec(rc);
         muos_puts(" wake="); muos_putdec(futex_wake_ret);
         muos_puts(" timeout="); muos_putdec(trc);
+        muos_puts(" requeue="); muos_putdec(rq);
+        muos_puts("/"); muos_putdec(rqw);
+        muos_puts("/"); muos_putdec(rqww);
+        muos_puts(" robust="); muos_putdec(robust_word);
+        muos_puts("/"); muos_putdec(rbww);
+        muos_puts(" rqm="); muos_putdec(futex_req_started);
+        muos_puts("/"); muos_putdec(futex_req_ret);
+        muos_puts("/"); muos_putdec(futex_req_seen);
+        muos_puts(" flags="); muos_putdec(woke);
+        muos_putdec(timed); muos_putdec(requeue_ok); muos_putdec(robust_ok);
         muos_puts("\n");
         muos_puts(ok ? "FUTEX-OK\n" : "FUTEX-BAD\n");
         return 0;

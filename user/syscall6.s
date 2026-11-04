@@ -118,3 +118,27 @@ muos_thread_start:
     int 0x80
 .hang:
     jmp .hang
+
+; ---------------------------------------------------------------------------
+; int muos_futex_full(void* uaddr, int op, int val, int val2,
+;                     void* uaddr2, int val3)      -> SYS_futex (240)
+; REQUEUE/CMP_REQUEUE need args 5-6, which travel in edi/ebp.
+global muos_futex_full
+muos_futex_full:
+    push ebx
+    push esi
+    push edi
+    push ebp
+    mov eax, 240
+    mov ebx, [esp + 20]         ; uaddr
+    mov ecx, [esp + 24]         ; op
+    mov edx, [esp + 28]         ; val
+    mov esi, [esp + 32]         ; val2 / timeout
+    mov edi, [esp + 36]         ; uaddr2
+    mov ebp, [esp + 40]         ; val3
+    int 0x80
+    pop ebp
+    pop edi
+    pop esi
+    pop ebx
+    ret

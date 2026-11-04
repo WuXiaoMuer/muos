@@ -239,7 +239,7 @@ USER_SIGTRAMP = 0x08847000
 - 虚拟 `/bin`、`/usr/bin`、`/sbin` 下的任意名字(以及 `/bin/busybox`)映射到 Multiboot module 0;`execve` 支持 `VFS_T_MODULE`,BusyBox shell 因此能按 PATH 重新执行自身 applet。
 - `pipe(42)/pipe2(331)`:8 个 4KB 环形缓冲 pipe.c;fd 表新增 `PIPE_READ/PIPE_WRITE` 类型,`read/write/dup/dup2/close/fstat` 均支持;shell 的 `echo hi | cat`、`ls | wc -l` 已跑通。
 - `clone(120)` 支持 `CLONE_VM` 线程与自定义栈,非 CLONE_VM 时等价 fork;`vfork(190)` 等同 fork;`kill(37)` 真实投递信号,SIGTERM/SIGKILL 默认终止进程;进程组调用暂时返回自身 pid(无 pgid 表)。
-- 线程同步:`futex(240)` 新增 `PROC_WAIT_FUTEX`,`blk_ptr` 记录用户地址、`blk_deadline` 记录超时;WAIT 先比较用户字,不等返回 EAGAIN,相等则阻塞;WAKE 按 `pd_phys + 地址` 在同一地址空间内唤醒至多 val 个进程并置 `eax=0`;PIT tick 把超时等待唤醒为 `-ETIMEDOUT`;`set/get_robust_list` 接受(不做 robust 清理),`sched_yield` 单核轮转下返回 0。`run futex` 覆盖 WAIT/WAKE、EAGAIN 与 ETIMEDOUT。
+- 线程同步:`futex(240)` 新增 `PROC_WAIT_FUTEX`,`blk_ptr` 记录用户地址、`blk_deadline` 记录超时;WAIT 先比较用户字,不等返回 EAGAIN,相等则阻塞;WAKE 按 `pd_phys + 地址` 在同一地址空间内唤醒至多 val 个进程并置 `eax=0`;REQUEUE/CMP_REQUEUE 以 `uaddr2` 为第 5 参(edi)、CMP 的期望值为第 6 参(ebp),先唤醒至多 val 个、再把至多 val2 个等待者的 `blk_ptr` 改到 `uaddr2`(CMP 在用户字不匹配时返回 EAGAIN);PIT tick 把超时等待唤醒为 `-ETIMEDOUT`;`set_robust_list(311)` 把 12 字节 head 记入 `proc_t.robust_head`,线程退出时 `proc_robust_cleanup` 沿 `list.next` 遍历(最多 16 个节点,`list_op_pending` 不遍历),按节点后 4 字节的 `futex_offset` 定位锁字、缺页建立后清零并 `proc_futex_wake`;`get_robust_list(312)` 返回自身 head 与长度 12,`sched_yield` 单核轮转下返回 0。`run futex` 覆盖 WAIT/WAKE、EAGAIN、ETIMEDOUT、REQUEUE 迁移与 robust list 退出清理。
 
 ### 7.8 网络与 socket ABI(pci.c / net.c)
 

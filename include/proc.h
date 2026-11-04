@@ -110,6 +110,7 @@ typedef struct {
     uint32_t sig_frame_sp[PROC_SIGFRAME_MAX];
     int      sig_depth;
     uint32_t alarm_tick;       /* absolute tick for SIGALRM, 0 = disarmed */
+    uint32_t robust_head;      /* set_robust_list() head, 0 = none */
 } proc_t;
 
 void     proc_init(void);
@@ -156,6 +157,12 @@ bool_t   proc_block_current_ext(registers_t* regs, proc_wait_t kind,
 /* Wake up to `count` processes blocked in futex(WAIT) on `uaddr` inside the
  * address space `pd_phys`. Returns the number woken. */
 int      proc_futex_wake(uint32_t uaddr, int32_t count, uint32_t pd_phys);
+/* FUTEX_REQUEUE: wake up to `wake` waiters on uaddr, move up to `move`
+ * remaining waiters to uaddr2 (same address space). */
+int      proc_futex_requeue(uint32_t uaddr, uint32_t uaddr2, int32_t wake,
+                            int32_t move, uint32_t pd_phys);
+/* Walk a thread's robust futex list and release its held locks. */
+void     proc_robust_cleanup(proc_t* p);
 /* Complete blocked AF_UNIX sends whose peer ring now has space. Returns the
  * number of senders woken (their eax is set to the sent byte count). */
 int      proc_unix_writers_try(void);

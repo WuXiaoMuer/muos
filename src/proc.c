@@ -722,6 +722,32 @@ int proc_futex_wake(uint32_t uaddr, int32_t count, uint32_t pd_phys) {
     return woken;
 }
 
+int proc_futex_requeue(uint32_t uaddr, uint32_t uaddr2, int32_t wake,
+                       int32_t move, uint32_t pd_phys) {
+    int woken = 0, moved = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        proc_t* p = &procs[i];
+        if (!p->used || p->pid == 1) continue;
+        if (p->state != PROC_BLOCKED || p->wait_kind != PROC_WAIT_FUTEX)
+            continue;
+        if (p->pd_phys != pd_phys || p->blk_ptr != uaddr) continue;
+
+        if (woken < wake) {
+            p->wait_kind = PROC_WAIT_NONE;
+            p->blk_has_deadline = false;
+            p->eax = 0;
+            p->state = PROC_READY;
+            woken++;
+        } else if (moved < move) {
+            p->blk_ptr = uaddr2;
+            moved++;
+        } else {
+            break;
+        }
+    }
+    return woken;
+}
+
 /* Copy a user buffer from a blocked process page by page: its page
  * directory is not active, so each page is translated separately. */
 static uint32_t proc_copy_user(proc_t* p, uint32_t uptr, void* dst,
@@ -875,6 +901,28 @@ bool_t proc_block_current_ext(registers_t* regs, proc_wait_t kind,
     return true;
 }
 
+/* Release robust mutexes a thread still owns: each list node holds a
+ * futex_offset pointing at the lock word. Runs while the PD is still active. */
+void proc_robust_cleanup(proc_t* p) {
+    if (!p || !p->robust_head) return;
+    uint32_t head = p->robust_head;
+    if (!user_ptr_ok(head, 12)) return;
+    uint32_t node = *(volatile uint32_t*)head;
+    for (int i = 0; i < 16; i++) {
+        if (!node || node == head) break;
+        if (!user_ptr_ok(node, 8)) break;
+        uint32_t next = *(volatile uint32_t*)node;
+        int32_t off = *(volatile int32_t*)(node + 4);
+        uint32_t addr = (uint32_t)((int32_t)node + off);
+        if (user_ptr_ok(addr, 4)) {
+            (void)mm_user_fault(p->pd_phys, addr, true);
+            *(volatile uint32_t*)addr = 0;
+            proc_futex_wake(addr, 0x7FFFFFFF, p->pd_phys);
+        }
+        node = next;
+    }
+}
+
 void proc_exit_current(registers_t* regs, int code, bool_t faulted) {
     proc_t* cur = proc_current();
     if (!cur || cur->pid == 1) {
@@ -883,6 +931,7 @@ void proc_exit_current(registers_t* regs, int code, bool_t faulted) {
     }
 
     if (cur->fd_state) user_fd_state_save(cur->fd_state);
+    proc_robust_cleanup(cur);
     cur->exit_code = code;
     cur->faulted = faulted;
     cur->state = PROC_ZOMBIE;
