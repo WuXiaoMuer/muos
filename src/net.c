@@ -182,6 +182,13 @@ typedef struct {
     uint8_t  q_retries;
     uint8_t  dupacks;       /* consecutive duplicate ACKs */
     bool_t   fast_recover;  /* fast retransmit/recovery in progress */
+
+    /* CUBIC congestion avoidance (armed after the first loss event). */
+    uint32_t cubic_wmax;    /* cwnd in bytes just before the reduction */
+    uint32_t cubic_k;       /* ticks to climb back to cubic_wmax */
+    uint32_t cubic_epoch;   /* tick of the reduction */
+    uint32_t cubic_acc;     /* bytes accumulated toward the next MSS */
+    bool_t   cubic_mode;
 } net_sock_t;
 
 #define TCP_MSS 480u
@@ -941,6 +948,66 @@ static int tcp_first_unsacked(net_sock_t* s) {
     return s->q_head;
 }
 
+/* ---- CUBIC congestion avoidance -----------------------------------------
+ * Integer-only CUBIC with C=0.4 and beta=0.7 (Linux defaults). The window is
+ * tracked in bytes; the curve is evaluated in MSS units from the reduction
+ * tick, so no floating point is involved. */
+static uint32_t icbrt(uint32_t n) {
+    uint32_t x = 0;
+    while (x < 1000u) {
+        uint32_t c = (x + 1u) * (x + 1u) * (x + 1u);
+        if (c > n) break;
+        x++;
+    }
+    return x;
+}
+
+/* Loss response: remember W_max, shrink by beta=0.7 and arm the cubic curve.
+ * K = cbrt(0.75*W_max) seconds, in PIT ticks; the 1e6 scale keeps two
+ * decimals of the root so small windows still get a sensible K. */
+static void tcp_cubic_reduce(net_sock_t* s) {
+    s->cubic_wmax = s->cwnd;
+    s->ssthresh = s->cwnd > TCP_MSS * 2u
+                  ? s->cwnd * 7u / 10u : TCP_MSS * 2u;
+    s->cwnd = s->ssthresh;
+    uint32_t wm_mss = s->cubic_wmax / TCP_MSS;
+    s->cubic_k = icbrt((3u * wm_mss * 1000000u) / 4u);
+    s->cubic_epoch = pit_get_ticks();
+    s->cubic_acc = 0;
+    s->cubic_mode = true;
+}
+
+/* CUBIC target in bytes: W_max + 0.4*(dt_seconds)^3 MSS. dt is in ticks
+ * relative to K; the cubic term in milli-MSS is dt^3/2500. */
+static uint32_t tcp_cubic_target(const net_sock_t* s, uint32_t now) {
+    int32_t dt = (int32_t)(now - s->cubic_epoch) - (int32_t)s->cubic_k;
+    if (dt > 1000) dt = 1000;
+    if (dt < -1000) dt = -1000;
+    int32_t cube = dt * dt * dt;
+    int32_t milli = cube / 2500;
+    int32_t grow = milli * (int32_t)TCP_MSS / 1000;
+    int32_t target = (int32_t)s->cubic_wmax + grow;
+    if (target < (int32_t)TCP_MSS) target = (int32_t)TCP_MSS;
+    if (target > (int32_t)TCP_CWND_MAX * 2) target = (int32_t)TCP_CWND_MAX * 2;
+    return (uint32_t)target;
+}
+
+/* Congestion avoidance: below the cubic curve fall back to the TCP-friendly
+ * Reno increment; above it, require cwnd/target-deficit ACKs per extra MSS. */
+static void tcp_cubic_grow(net_sock_t* s, uint32_t now) {
+    uint32_t target = tcp_cubic_target(s, now);
+    if (target <= s->cwnd) {
+        s->cwnd += (TCP_MSS * TCP_MSS) / (s->cwnd ? s->cwnd : TCP_MSS);
+    } else {
+        s->cubic_acc += target - s->cwnd;
+        if (s->cubic_acc >= s->cwnd) {
+            s->cubic_acc -= s->cwnd;
+            s->cwnd += TCP_MSS;
+        }
+    }
+    if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
+}
+
 /* ACK processing: advance snd_una, retire acknowledged queue entries and
  * grow the congestion window (slow start / congestion avoidance). Three
  * duplicate ACKs retransmit the first unsacked segment immediately (fast
@@ -953,9 +1020,8 @@ static void tcp_ack(net_sock_t* s, uint32_t ack) {
             if (++s->dupacks >= 3) {
                 s->fast_recover = true;
                 s->dupacks = 0;
-                s->ssthresh = s->cwnd > TCP_MSS * 2 ? s->cwnd / 2
-                                                    : TCP_MSS * 2;
-                s->cwnd = s->ssthresh + TCP_MSS * 3;
+                tcp_cubic_reduce(s);
+                s->cwnd += TCP_MSS * 3;
                 if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
                 int h = tcp_first_unsacked(s);
                 uint32_t a = (s->txq[h].flags & TCP_F_SYN) ? 0 : s->rcv_nxt;
@@ -994,10 +1060,12 @@ static void tcp_ack(net_sock_t* s, uint32_t ack) {
     }
 
     if (exited_recovery) return;            /* window already deflated */
-    if (s->cwnd >= s->ssthresh)
-        s->cwnd += (TCP_MSS * TCP_MSS) / (s->cwnd ? s->cwnd : TCP_MSS);
-    else
+    if (s->cwnd >= s->ssthresh) {
+        if (s->cubic_mode) tcp_cubic_grow(s, pit_get_ticks());
+        else s->cwnd += (TCP_MSS * TCP_MSS) / (s->cwnd ? s->cwnd : TCP_MSS);
+    } else {
         s->cwnd += TCP_MSS;
+    }
     if (s->cwnd > TCP_CWND_MAX) s->cwnd = TCP_CWND_MAX;
 }
 
@@ -1030,7 +1098,7 @@ static void tcp_timers(void) {
             continue;
         }
         s->q_retries++;
-        s->ssthresh = s->cwnd > TCP_MSS * 2 ? s->cwnd / 2 : TCP_MSS * 2;
+        tcp_cubic_reduce(s);
         s->cwnd = TCP_MSS;
         s->dupacks = 0;
         s->fast_recover = false;
@@ -1542,11 +1610,44 @@ static bool_t tcp_fastretx_selftest(void) {
 
     uint32_t cw0 = s->cwnd;
     for (int i = 0; i < 3; i++) tcp_ack(s, 1000);
-    bool_t ok = s->fast_recover && s->ssthresh == cw0 / 2 &&
+    bool_t ok = s->fast_recover && s->ssthresh == cw0 * 7u / 10u &&
                 s->cwnd == s->ssthresh + TCP_MSS * 3;
 
     tcp_ack(s, 1200);
     ok = ok && !s->fast_recover && s->cwnd == s->ssthresh && s->q_count == 0;
+    s->used = false;
+    return ok;
+}
+
+/* CUBIC math: beta=0.7 reduction, K in ticks, target equal to W_max at
+ * t=K and above W_max later in the epoch. */
+static bool_t tcp_cubic_selftest(void) {
+    net_sock_t* s = tcp_new_sock();
+    if (!s) return false;
+    s->tcp_state = TCP_ESTAB;
+    s->lport = 9004;
+    s->rport = 9104;
+    s->rip = my_ip;
+    s->cwnd = TCP_MSS * 10u;
+    s->ssthresh = TCP_CWND_MAX;
+
+    uint32_t wmax = s->cwnd;
+    tcp_cubic_reduce(s);
+    bool_t ok = s->cubic_mode && s->cubic_wmax == wmax &&
+                s->ssthresh == wmax * 7u / 10u &&
+                s->cwnd == s->ssthresh &&
+                s->cubic_k > 100u && s->cubic_k < 300u;
+
+    uint32_t t_k = s->cubic_epoch + s->cubic_k;
+    ok = ok && tcp_cubic_target(s, t_k) == wmax;
+    ok = ok && tcp_cubic_target(s, t_k + 1000) > wmax;
+    /* At the reduction tick the curve is just below W_max (around cwnd). */
+    uint32_t t0 = tcp_cubic_target(s, s->cubic_epoch);
+    ok = ok && t0 + TCP_MSS * 3u >= s->cwnd && t0 <= s->cwnd + TCP_MSS;
+
+    uint32_t before = s->cwnd;
+    for (int i = 0; i < 50; i++) tcp_cubic_grow(s, t_k + 400);
+    ok = ok && s->cwnd >= before;
     s->used = false;
     return ok;
 }
@@ -2150,6 +2251,11 @@ bool_t net_init(void) {
         serial_write("[net] TCP-FASTRETX-OK\n");
     else
         serial_write("[net] TCP-FASTRETX-BAD\n");
+
+    if (tcp_cubic_selftest())
+        serial_write("[net] TCP-CUBIC-OK\n");
+    else
+        serial_write("[net] TCP-CUBIC-BAD\n");
 
     if (tcp_sack_selftest())
         serial_write("[net] TCP-SACK-OK\n");
