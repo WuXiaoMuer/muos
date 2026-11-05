@@ -226,6 +226,10 @@ static bool_t vfs_mount_stat(int vol, const char* sub, bool_t* is_dir,
 #define AT_FDCWD           (-100)
 #define AT_EMPTY_PATH       0x1000
 #define AT_REMOVEDIR        0x200
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_NO_AUTOMOUNT     0x800
+#define AT_STATX_SYNC_TYPE  0x6000
+#define STATX_ALL           0x0fffu
 
 /* Metadata, truncation, sync and rlimit calls. */
 #define SYS_chmod           15
@@ -2170,18 +2174,25 @@ static void fill_statx(char* st, uint32_t ino, uint32_t mode,
     put_u64(st, 112, (uint64_t)mtime);   /* stx_mtime.sec */
 }
 
-/* statx(383): modern musl tries this before the stat64 family. An empty
- * path with AT_EMPTY_PATH means "stat the dirfd itself". */
-static uint32_t do_statx(uint32_t dirfd, uint32_t path_ptr, uint32_t buf) {
+/* statx(383): modern musl tries this before the stat64 family. Linux rejects
+ * unknown flag/mask bits up front, and an empty path is only valid with
+ * AT_EMPTY_PATH, in which case the dirfd itself is described. */
+static uint32_t do_statx(uint32_t dirfd, uint32_t path_ptr, uint32_t flags,
+                         uint32_t mask, uint32_t buf) {
     if (!user_ptr_ok(buf, STATX_SIZE)) return err(ERR_EFAULT);
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH |
+                  AT_STATX_SYNC_TYPE))
+        return err(ERR_EINVAL);
+    if (mask & ~STATX_ALL) return err(ERR_EINVAL);
 
     char path[128];
     if (!copy_user_string(path_ptr, path, sizeof(path))) return err(ERR_EFAULT);
 
     uint32_t ino, mode, nlink, size, at, mt, ct;
     if (path[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH)) return err(ERR_ENOENT);
         int fd = (int32_t)dirfd;
-        if (fd < 0) return err(ERR_ENOENT);
+        if (fd < 0) return err(ERR_EBADF);
         if (!vfs_fd_fields(fd, &ino, &mode, &nlink, &size, &at, &mt, &ct))
             return err(ERR_EBADF);
     } else {
@@ -2322,6 +2333,11 @@ static int kbuf_write(uint32_t fd, const char* data, uint32_t count) {
 /* sendfile(187)/sendfile64(239): used by BusyBox's fd-copy path. */
 static uint32_t do_sendfile(uint32_t out_fd, uint32_t in_fd,
                             uint32_t off_ptr, uint32_t count) {
+    if (count > 0x7ffff000u) count = 0x7ffff000u;   /* Linux clamps, no error */
+    if ((int32_t)in_fd == (int32_t)out_fd) return err(ERR_EINVAL);
+    int kind = user_fd_kind((int)in_fd);
+    if (kind < 0) return err(ERR_EBADF);
+    if (kind != USER_FD_FILE) return err(ERR_EINVAL);
     int slot = user_fd_slot((int)in_fd);
     if (slot < 0) return err(ERR_EBADF);
 
@@ -2329,6 +2345,7 @@ static uint32_t do_sendfile(uint32_t out_fd, uint32_t in_fd,
     if (off_ptr) {
         if (!user_ptr_ok(off_ptr, 4)) return err(ERR_EFAULT);
         memcpy(&off, (const void*)off_ptr, 4);
+        if ((int32_t)off < 0) return err(ERR_EINVAL);
     } else {
         off = user_fd_offset((int)in_fd);
     }
@@ -4767,7 +4784,8 @@ void syscall_handler(registers_t* regs) {
             ret = do_sendfile(regs->ebx, regs->ecx, regs->edx, regs->esi);
             break;
         case SYS_statx:
-            ret = do_statx(regs->ebx, regs->ecx, regs->edi);
+            ret = do_statx(regs->ebx, regs->ecx, regs->edx, regs->esi,
+                           regs->edi);
             break;
         case SYS_dup:
             ret = do_dup(regs->ebx);

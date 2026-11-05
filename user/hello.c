@@ -30,6 +30,7 @@ static int count_sub(const char* s, const char* sub) {
 }
 
 static char maps_buf[512];
+static char statx_buf[MUOS_STATX_SIZE];
 static int maps_count(const char* sub) {
     int fd = muos_open("/proc/self/maps", 0);
     if (fd < 0) return -1;
@@ -1326,12 +1327,47 @@ int main(int argc, char** argv) {
         unsigned cres[2] = { 0, 0 };
         int cr = muos_clock_getres(1, cres);
 
+        /* statx flag/mask validation and AT_EMPTY_PATH semantics. */
+        int sx_bad_mask = muos_statx(MUOS_AT_FDCWD, "abi.txt", 0,
+                                     0x80000000u, statx_buf);
+        int sx_bad_flag = muos_statx(MUOS_AT_FDCWD, "abi.txt",
+                                     0x80000000u, 0, statx_buf);
+        int sx_empty = muos_statx(MUOS_AT_FDCWD, "", 0, 0, statx_buf);
+        int sfd = muos_open("abi.txt", 0);
+        unsigned sx_mask = 0;
+        int sx_ok = -1;
+        if (sfd >= 0) {
+            sx_ok = muos_statx(sfd, "", MUOS_AT_EMPTY_PATH, MUOS_STATX_ALL,
+                               statx_buf);
+            if (sx_ok == 0) sx_mask = ((unsigned*)statx_buf)[0];
+            muos_close(sfd);
+        }
+
+        /* sendfile boundaries: past EOF -> 0, negative offset -> EINVAL. */
+        int sfo = muos_open("abi-copy.txt",
+                            MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        int sfi = muos_open("abi.txt", 0);
+        int sf_eof = -1, sf_neg = -1, sf_ok = -1;
+        if (sfo >= 0 && sfi >= 0) {
+            int off_eof = 8;
+            sf_eof = muos_sendfile(sfo, sfi, &off_eof, 16);
+            int off_neg = -1;
+            sf_neg = muos_sendfile(sfo, sfi, &off_neg, 16);
+            int off_zero = 0;
+            sf_ok = muos_sendfile(sfo, sfi, &off_zero, 1);
+        }
+        if (sfo >= 0) muos_close(sfo);
+        if (sfi >= 0) muos_close(sfi);
+
         ok = ok && name_ok && ma == 0 && fa == 0 && as == 0 && ag == 0 &&
              m2 == 1 && tk == 0 && tg == 0 && sy == 0 &&
              fdset == 0 && fdget == 1 && nbset == 0 && nbrd == -11 &&
              cn == 0 && minc == 0 && (mcvec[0] & 1) &&
              remap_ok && gc == 0 && cpu == 0 && node == 0 &&
-             cr == 0 && cres[0] == 0 && cres[1] == 10000000;
+             cr == 0 && cres[0] == 0 && cres[1] == 10000000 &&
+             sx_bad_mask == -22 && sx_bad_flag == -22 && sx_empty == -2 &&
+             sx_ok == 0 && sx_mask == 0x7ff &&
+             sf_eof == 0 && sf_neg == -22 && sf_ok == 1;
         muos_puts("abi: prctl="); muos_putdec(ps);
         muos_puts("/"); muos_putdec(pg);
         muos_puts(" name="); muos_puts(nm);
@@ -1355,7 +1391,15 @@ int main(int argc, char** argv) {
         muos_puts("/"); muos_putdec((int)cpu);
         muos_puts("/"); muos_putdec((int)node);
         muos_puts(" getres="); muos_putdec(cr);
-        muos_puts("/"); muos_putdec((int)cres[1]); muos_puts("\n");
+        muos_puts("/"); muos_putdec((int)cres[1]);
+        muos_puts(" statx="); muos_putdec(sx_bad_mask);
+        muos_puts("/"); muos_putdec(sx_bad_flag);
+        muos_puts("/"); muos_putdec(sx_empty);
+        muos_puts("/"); muos_putdec(sx_ok);
+        muos_puts("/"); muos_putdec((int)sx_mask);
+        muos_puts(" sendfile="); muos_putdec(sf_eof);
+        muos_puts("/"); muos_putdec(sf_neg);
+        muos_puts("/"); muos_putdec(sf_ok); muos_puts("\n");
         muos_puts(ok ? "ABI-OK\n" : "ABI-BAD\n");
         return 0;
     }

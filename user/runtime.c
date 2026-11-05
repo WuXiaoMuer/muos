@@ -183,6 +183,15 @@ int muos_mincore(unsigned addr, unsigned len, unsigned char* vec) {
     return syscall3(218, (int)addr, (int)len, (int)vec);
 }
 
+int muos_statx(int dirfd, const char* path, unsigned flags,
+               unsigned mask, void* buf) {
+    return syscall5(383, dirfd, (int)path, (int)flags, (int)mask, (int)buf);
+}
+
+int muos_sendfile(int out_fd, int in_fd, int* offset, unsigned count) {
+    return syscall4(187, out_fd, in_fd, (int)offset, (int)count);
+}
+
 int muos_getcpu(unsigned* cpu, unsigned* node) {
     return syscall2(318, (int)cpu, (int)node);
 }

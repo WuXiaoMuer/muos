@@ -144,7 +144,7 @@
 - [x] `vmstat/top` 所需的 CPU 统计字段(`/proc/stat` 全量,`top -b -n 1` 通过);内存统计已有 `/proc/meminfo`
 - [x] errno 起步对齐(EBADF/EFAULT/EINVAL/ENOENT/ENOTDIR/EISDIR/ENOMEM/ENOSYS 等);`uname` 已回报 MuOS/muos/i386
 - [x] `stat` 族返回 MuOS 假 identity:根目录 `S_IFDIR|0755`、文件 `S_IFREG|0644`、`st_dev=1`、块大小/块数按 64KB 文件计算
-- [ ] errno 与 Linux 做一次全量审计(尤其 `statx` flags/mask 与 `sendfile` 边界)
+- [x] errno 与 Linux 做一次全量审计(尤其 `statx` flags/mask 与 `sendfile` 边界):`statx(383)` 现在接收 flags/mask 并校验(未知位 EINVAL、空路径需 `AT_EMPTY_PATH`),`sendfile` 校验 in_fd 类型/同 fd/负偏移并对 count 做 Linux 上限截断;`run abi` 增加 `statx=-22/-22/-2/0/2047 sendfile=0/-22/1` 断言
 - [x] RTC 读取(CMOS,桌面任务栏时钟);`time(13)`/`gettimeofday(78)`/`clock_gettime(265/403)` 返回真实 UTC epoch
 - [x] RTC → epoch 换算(CMOS 年月日 + 世纪寄存器 + 闰年 civil-days 算法),RAM FS 记录 atime/mtime/ctime,`date/ls -l/stat/touch` 显示真实时间
 - [ ] a.out/ELF 的零页(empty bad-address page,0x08048000 之前不可映射)与地址布局兼容

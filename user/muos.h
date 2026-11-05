@@ -160,6 +160,14 @@ int  muos_mincore(unsigned addr, unsigned len, unsigned char* vec);
 int  muos_getcpu(unsigned* cpu, unsigned* node);
 unsigned muos_mremap(unsigned old_addr, unsigned old_size, unsigned new_size,
                      int flags, unsigned new_addr);
+#define MUOS_AT_SYMLINK_NOFOLLOW 0x100
+#define MUOS_AT_NO_AUTOMOUNT     0x800
+#define MUOS_AT_STATX_SYNC_TYPE  0x6000
+#define MUOS_STATX_ALL           0x0fff
+#define MUOS_STATX_SIZE          256
+int  muos_statx(int dirfd, const char* path, unsigned flags,
+                unsigned mask, void* buf);
+int  muos_sendfile(int out_fd, int in_fd, int* offset, unsigned count);
 
 /* ---- sockets (IPv4 only; values mirror Linux i386) ---- */
 #define MUOS_AF_INET      2
