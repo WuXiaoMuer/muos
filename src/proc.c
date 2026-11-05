@@ -104,6 +104,10 @@ bool_t proc_space_cow(proc_t* child, proc_t* parent) {
     }
 
     s->refs = 1;
+    /* fork inherits the parent's mapping table (threads share it already). */
+    s->vma_count = parent->space->vma_count;
+    if (s->vma_count > PROC_VMA_MAX) s->vma_count = PROC_VMA_MAX;
+    memcpy(s->vma, parent->space->vma, s->vma_count * sizeof(proc_vma_t));
     child->space = s;
     child->mem = NULL;
     child->mem_pages = 0;
@@ -126,6 +130,128 @@ bool_t proc_space_share(proc_t* child, proc_t* parent) {
     child->mem_pages = 0;
     child->pd_phys = parent->pd_phys;
     return true;
+}
+
+/* ---- VMA bookkeeping (sorted, page-aligned, non-overlapping) ---- */
+
+void proc_vma_clear(proc_space_t* s) {
+    if (s) s->vma_count = 0;
+}
+
+proc_vma_t* proc_vma_find(proc_space_t* s, uint32_t addr) {
+    if (!s) return NULL;
+    for (uint32_t i = 0; i < s->vma_count; i++) {
+        if (addr >= s->vma[i].start && addr < s->vma[i].end) return &s->vma[i];
+    }
+    return NULL;
+}
+
+/* File mapping offsets move with the range start; anonymous ones stay 0. */
+static uint32_t vma_offset_at(const proc_vma_t* v, uint32_t start) {
+    if (v->flags & PROC_VMA_ANON) return 0;
+    return v->offset + (start - v->start);
+}
+
+bool_t proc_vma_add(proc_space_t* s, uint32_t start, uint32_t end,
+                    uint32_t prot, uint32_t flags, uint32_t offset) {
+    if (!s || start >= end) return false;
+    uint32_t a = start & ~(PAGE_SIZE - 1u);
+    uint32_t b = (end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    if (b <= a) return false;
+
+    /* Extend the preceding mapping when the attributes and file offsets
+     * line up (the bump arena always appends, so this is the common case). */
+    for (uint32_t i = 0; i < s->vma_count; i++) {
+        proc_vma_t* v = &s->vma[i];
+        bool_t same = (v->prot == prot && v->flags == flags);
+        bool_t contig = (v->flags & PROC_VMA_ANON) ||
+                        v->offset + (v->end - v->start) == offset;
+        if (same && contig && v->end == a) {
+            v->end = b;
+            return true;
+        }
+        if (v->start >= b) break;
+    }
+
+    if (s->vma_count >= PROC_VMA_MAX) return false;
+    uint32_t at = 0;
+    while (at < s->vma_count && s->vma[at].start < a) at++;
+    if (at > 0 && s->vma[at - 1].end > a) return false;        /* overlap */
+    if (at < s->vma_count && s->vma[at].start < b) return false;
+
+    for (uint32_t i = s->vma_count; i > at; i--) s->vma[i] = s->vma[i - 1];
+    s->vma[at].start = a;
+    s->vma[at].end = b;
+    s->vma[at].prot = prot;
+    s->vma[at].flags = flags;
+    s->vma[at].offset = offset;
+    s->vma_count++;
+    return true;
+}
+
+void proc_vma_remove(proc_space_t* s, uint32_t start, uint32_t end) {
+    if (!s || start >= end || s->vma_count == 0) return;
+    uint32_t a = start & ~(PAGE_SIZE - 1u);
+    uint32_t b = (end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+
+    proc_vma_t out[PROC_VMA_MAX];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < s->vma_count; i++) {
+        proc_vma_t v = s->vma[i];
+        if (v.end <= a || v.start >= b) {
+            if (n < PROC_VMA_MAX) out[n++] = v;
+            continue;
+        }
+        if (v.start < a && n < PROC_VMA_MAX) {      /* keep the head */
+            proc_vma_t h = v;
+            h.end = a;
+            out[n++] = h;
+        }
+        if (v.end > b && n < PROC_VMA_MAX) {        /* keep the tail */
+            proc_vma_t t = v;
+            t.start = b;
+            t.offset = vma_offset_at(&v, b);
+            out[n++] = t;
+        }
+    }
+    memcpy(s->vma, out, n * sizeof(proc_vma_t));
+    s->vma_count = n;
+}
+
+void proc_vma_protect(proc_space_t* s, uint32_t start, uint32_t end,
+                      uint32_t prot) {
+    if (!s || start >= end || s->vma_count == 0) return;
+    uint32_t a = start & ~(PAGE_SIZE - 1u);
+    uint32_t b = (end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+
+    proc_vma_t out[PROC_VMA_MAX];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < s->vma_count; i++) {
+        proc_vma_t v = s->vma[i];
+        if (v.end <= a || v.start >= b || n >= PROC_VMA_MAX) {
+            if (n < PROC_VMA_MAX) out[n++] = v;
+            continue;
+        }
+        if (v.start < a) {                 /* head keeps the old protection */
+            proc_vma_t h = v;
+            h.end = a;
+            out[n++] = h;
+        }
+        proc_vma_t m = v;                  /* overlapping middle: new prot */
+        m.start = v.start > a ? v.start : a;
+        m.end = v.end < b ? v.end : b;
+        m.prot = prot;
+        m.offset = vma_offset_at(&v, m.start);
+        if (n < PROC_VMA_MAX) out[n++] = m;
+        if (v.end > b && n < PROC_VMA_MAX) {   /* tail keeps the old prot */
+            proc_vma_t t = v;
+            t.start = b;
+            t.offset = vma_offset_at(&v, b);
+            out[n++] = t;
+        }
+    }
+    memcpy(s->vma, out, n * sizeof(proc_vma_t));
+    s->vma_count = n;
 }
 
 /* ---- refcounted fd table ---- */
@@ -628,6 +754,7 @@ bool_t proc_reset_current(void) {
     proc_t* p = proc_current();
     if (!p || !p->pd_phys) return false;
     mm_user_reset_pages(p->pd_phys);
+    if (p->space) proc_vma_clear(p->space);   /* execve starts a fresh image */
     return true;
 }
 

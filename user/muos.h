@@ -7,6 +7,7 @@
 
 /* open(2) flags (Linux i386 values) */
 #define MUOS_O_WRONLY 0x1
+#define MUOS_O_RDWR   0x2
 #define MUOS_O_CREAT  0x40
 #define MUOS_O_TRUNC  0x200
 #define MUOS_O_APPEND 0x400

@@ -985,6 +985,17 @@ static uint32_t sb_dec02(char* b, uint32_t pos, uint32_t max, uint32_t v) {
     return sb_dec(b, pos, max, v);
 }
 
+/* Eight lowercase hex digits, Linux /proc style. */
+static uint32_t sb_hex8(char* b, uint32_t pos, uint32_t max, uint32_t v) {
+    for (int i = 7; i >= 0; i--) {
+        uint32_t nib = (v >> (i * 4)) & 0xF;
+        if (pos + 1 >= max) break;
+        b[pos++] = (char)(nib < 10 ? '0' + nib : 'a' + (nib - 10));
+    }
+    b[pos] = '\0';
+    return pos;
+}
+
 static uint32_t vfs_vfile_text(int id, uint32_t pid, char* out, uint32_t max) {
     uint32_t pos = 0;
     out[0] = '\0';
@@ -1126,10 +1137,33 @@ static uint32_t vfs_vfile_text(int id, uint32_t pid, char* out, uint32_t max) {
             break;
         }
         case VFS_VF_MAPS:
-        case VFS_VF_PID_MAPS:
-            pos = sb_add(out, pos, max,
-                         "08048000-08848000 rwxp 00000000 00:00 0 [stack]\n");
+        case VFS_VF_PID_MAPS: {
+            proc_t* tp = pid ? proc_find(pid) : proc_current();
+            proc_space_t* sp = tp ? tp->space : NULL;
+            if (sp) {
+                for (uint32_t i = 0; i < sp->vma_count; i++) {
+                    const proc_vma_t* v = &sp->vma[i];
+                    char perms[5];
+                    perms[0] = (v->prot & PROT_READ) ? 'r' : '-';
+                    perms[1] = (v->prot & PROT_WRITE) ? 'w' : '-';
+                    perms[2] = (v->prot & PROT_EXEC) ? 'x' : '-';
+                    perms[3] = (v->flags & MAP_SHARED) ? 's' : 'p';
+                    perms[4] = '\0';
+                    pos = sb_hex8(out, pos, max, v->start);
+                    pos = sb_add(out, pos, max, "-");
+                    pos = sb_hex8(out, pos, max, v->end);
+                    pos = sb_add(out, pos, max, " ");
+                    pos = sb_add(out, pos, max, perms);
+                    pos = sb_add(out, pos, max, " ");
+                    pos = sb_hex8(out, pos, max, v->offset);
+                    pos = sb_add(out, pos, max, " 00:00 0 ");
+                    pos = sb_add(out, pos, max,
+                                 (v->flags & PROC_VMA_ANON) ? "[anon]\n"
+                                                            : "[file]\n");
+                }
+            }
             break;
+        }
         default:
             break;
     }
@@ -4147,7 +4181,6 @@ static void shared_purge_dead(void) {
  * caller (e.g. a future dynamic loader) is responsible for what it covers. */
 static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
                         uint32_t flags, int fd, uint32_t offset) {
-    (void)prot;
     if (len == 0) return err(ERR_EINVAL);
 
     uint32_t rounded = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1u);
@@ -4155,6 +4188,7 @@ static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
 
     proc_t* p = proc_current();
     uint32_t pid = p ? p->pid : 0;
+    proc_space_t* sp = p ? p->space : NULL;
 
     uint32_t at;
     if (flags & MAP_FIXED) {
@@ -4162,8 +4196,9 @@ static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
         if (addr < USER_BASE || rounded > USER_END - USER_STACK_RESERVE - addr)
             return err(ERR_ENOMEM);
         at = addr;
-        /* Replacing an existing shared mapping flushes its dirty content. */
+        /* Replacing an existing mapping flushes its dirty content first. */
         shared_flush(pid, at, rounded, true);
+        if (sp) proc_vma_remove(sp, at, at + rounded);
     } else {
         at = user_mmap_anon(len);
         if (!at) return err(ERR_ENOMEM);
@@ -4172,6 +4207,7 @@ static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
     if (flags & MAP_ANONYMOUS) {
         if (fd != -1) return err(ERR_EINVAL);
         if (flags & MAP_FIXED) memset((void*)at, 0, rounded);
+        if (sp) (void)proc_vma_add(sp, at, at + rounded, prot, flags, 0);
         return at;                  /* the bump arena is already zeroed */
     }
 
@@ -4215,6 +4251,7 @@ static uint32_t do_mmap(uint32_t addr, uint32_t len, uint32_t prot,
             shared_maps[idx].slot = slot;
         }
     }
+    if (sp) (void)proc_vma_add(sp, at, at + rounded, prot, flags, offset);
     return at;
 }
 
@@ -4241,10 +4278,14 @@ static uint32_t do_mremap(uint32_t old_addr, uint32_t old_size,
     uint32_t old_r = (old_size + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
     uint32_t new_r = (new_size + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
     if (new_r < new_size || new_r > USER_SIZE) return err(ERR_ENOMEM);
-    if (new_size <= old_size) return old_addr;      /* shrink keeps the range */
+    proc_t* p = proc_current();
+    if (new_size <= old_size) {                     /* shrink keeps the range */
+        if (p && p->space && new_r < old_r)
+            proc_vma_remove(p->space, old_addr + new_r, old_addr + old_r);
+        return old_addr;
+    }
     if (!(flags & 1u)) return err(ERR_ENOMEM);      /* MREMAP_MAYMOVE */
 
-    proc_t* p = proc_current();
     if (!p || !p->pd_phys) return err(ERR_EINVAL);
 
     uint32_t at;
@@ -4260,6 +4301,7 @@ static uint32_t do_mremap(uint32_t old_addr, uint32_t old_size,
 
     if (old_r) memcpy((void*)at, (const void*)old_addr, old_r);
     mm_user_unmap(p->pd_phys, old_addr, old_r);
+    if (p->space) proc_vma_remove(p->space, old_addr, old_addr + old_r);
     return at;
 }
 
@@ -4279,6 +4321,7 @@ static uint32_t do_munmap(uint32_t addr, uint32_t len) {
     shared_purge_dead();
     shared_flush(p->pid, addr, end - addr, true);
     mm_user_unmap(p->pd_phys, addr, end - addr);
+    if (p->space) proc_vma_remove(p->space, addr, end);
     return 0;
 }
 
@@ -4300,6 +4343,7 @@ static uint32_t do_mprotect(uint32_t addr, uint32_t len, uint32_t prot) {
 
     if (!mm_user_protect(p->pd_phys, addr, end - addr, prot))
         return err(ERR_ENOMEM);
+    if (p->space) proc_vma_protect(p->space, addr, end, prot);
     return 0;
 }
 

@@ -16,6 +16,29 @@ static int arg_is(const char* s, const char* t) {
     return *s == '\0' && *t == '\0';
 }
 
+/* Count non-overlapping occurrences in a NUL-terminated string. */
+static int count_sub(const char* s, const char* sub) {
+    int n = 0;
+    while (*s) {
+        const char* a = s;
+        const char* b = sub;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) n++;
+        s++;
+    }
+    return n;
+}
+
+static char maps_buf[512];
+static int maps_count(const char* sub) {
+    int fd = muos_open("/proc/self/maps", 0);
+    if (fd < 0) return -1;
+    int n = muos_read(fd, maps_buf, sizeof(maps_buf) - 1);
+    muos_close(fd);
+    maps_buf[n > 0 ? n : 0] = '\0';
+    return count_sub(maps_buf, sub);
+}
+
 /* Internet checksum for the ICMP echo request built below. */
 static unsigned short inet_cksum(const unsigned char* p, int len) {
     unsigned sum = 0;
@@ -1477,7 +1500,7 @@ int main(int argc, char** argv) {
         muos_unlinkat(MUOS_AT_FDCWD, "p1new", MUOS_AT_REMOVEDIR);
 
         /* unlink while an fd is open: the data must stay readable */
-        fd = muos_open("p1file", MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        fd = muos_open("p1file", MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_RDWR);
         ok = ok && fd >= 0;
         if (fd >= 0) {
             const char msg[] = "OPEN-DATA";
@@ -1781,17 +1804,28 @@ int main(int argc, char** argv) {
             /* mprotect: drop to read-only, then re-enable writes. */
             char* mp = (char*)muos_mmap(4096);
             int prot_ok = 0;
+            int maps_ok = 0;
             if (mp && (unsigned)mp >= 0x08048000u) {
                 mp[0] = 'X';
+                int maps_anon = maps_count("[anon]");
                 rc = muos_mprotect((unsigned)mp, 4096, MUOS_PROT_READ);
                 int ro_ok = (rc == 0 && mp[0] == 'X');
+                int maps_ro = maps_count("r--p");
                 rc = muos_mprotect((unsigned)mp, 4096,
                                    MUOS_PROT_READ | MUOS_PROT_WRITE);
                 mp[1] = 'Y';
+                int maps_rw = maps_count("rw-p");
                 prot_ok = (ro_ok && rc == 0 && mp[1] == 'Y');
                 muos_puts(prot_ok ? "mfile: mprotect-ok\n" : "mfile: mprotect-bad\n");
                 ok = ok && prot_ok;
                 muos_munmap((unsigned)mp, 4096);
+                int maps_after = maps_count("[anon]");
+                /* /proc/self/maps must track the VMA table across mmap,
+                 * mprotect and munmap. */
+                maps_ok = (maps_anon >= 1 && maps_ro == 1 && maps_rw == 1 &&
+                           maps_after == 0);
+                muos_puts(maps_ok ? "mfile: maps-ok\n" : "mfile: maps-bad\n");
+                ok = ok && maps_ok;
             }
 
             /* mprotect over a just-munmapped page must fault it back in and

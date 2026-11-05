@@ -35,12 +35,23 @@ typedef enum {
 
 /* Refcounted address space: a thread group shares one block + page
  * directory; a plain process owns its own. Freed when refs hits 0. */
+#define PROC_VMA_MAX 24
+#define PROC_VMA_ANON 0x20u      /* MAP_ANONYMOUS bit kept in vma.flags */
+typedef struct {
+    uint32_t start, end;     /* page-aligned [start,end) range */
+    uint32_t prot;           /* PROT_READ / PROT_WRITE / PROT_EXEC */
+    uint32_t flags;          /* MAP_* flags used at creation */
+    uint32_t offset;         /* file offset for file-backed mappings */
+} proc_vma_t;
+
 typedef struct {
     void*    mem;          /* block physical base (identity-addressable) */
     uint32_t mem_pages;
     uint32_t pd_phys;      /* private page directory (0 = kernel) */
     uint32_t tramp_phys;   /* sigreturn trampoline code page */
     uint32_t refs;
+    uint32_t vma_count;    /* number of entries in vma[], sorted by start */
+    proc_vma_t vma[PROC_VMA_MAX];
 } proc_space_t;
 
 /* Saved fd table header (refcounted so CLONE_FILES threads share one). */
@@ -134,6 +145,17 @@ bool_t   proc_detach_current(void);
 /* Release all user pages of the current process before loading a new image. */
 bool_t   proc_reset_current(void);
 void     proc_snapshot_free(proc_t* p);
+
+/* VMA bookkeeping for the user window (mmap/munmap/mprotect/mremap). Ranges
+ * are page-aligned and stored sorted by start; the table lives in the
+ * address space so CLONE_THREAD shares it and fork copies it. */
+void        proc_vma_clear(proc_space_t* s);
+bool_t      proc_vma_add(proc_space_t* s, uint32_t start, uint32_t end,
+                         uint32_t prot, uint32_t flags, uint32_t offset);
+void        proc_vma_remove(proc_space_t* s, uint32_t start, uint32_t end);
+void        proc_vma_protect(proc_space_t* s, uint32_t start, uint32_t end,
+                             uint32_t prot);
+proc_vma_t* proc_vma_find(proc_space_t* s, uint32_t addr);
 
 /* fd table helpers */
 bool_t   proc_fdstate_alloc(proc_t* p);

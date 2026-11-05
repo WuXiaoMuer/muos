@@ -235,7 +235,7 @@ USER_SIGTRAMP = 0x08847000
 - `execve(11)`:先把 path/argv 拷到内核,`vfs_lookup` 找到 RAM FS 文件,`elf32_validate` 预校验;`user_exec_image` 先 `proc_reset_current` 释放全部用户页,再装载段+栈(缺页时分配,保留 fd/cwd),再把 syscall 的 iret 帧改成新 entry/esp——同一个 pid 原地替换。
 - 信号:`proc_signal_send` 置 pending 位;若目标 BLOCKED,把 `eax=-EINTR`、清 wait_kind 并置 READY。`proc_signal_deliver` 在 syscall 返回前与 tick 中运行:handler 为空则执行默认动作(SIGKILL/SIGTERM 等终止,状态 128+sig;SIGCHLD/SIGCONT 忽略);有 handler 则把 12 个寄存器 + eip 存到用户栈(handler 栈之上),入口设为 handler、返回地址为 `USER_SIGTRAMP`(只读 `mov eax,173; int 0x80`)或 libc restorer,并记录 frame 供 `proc_sigreturn` 恢复。屏蔽位只推迟投递,不会丢弃 pending。
 - `sched_load` 恢复 CR3/TSS.esp0/fd 表/cwd/brk/TLS,并把 `registers_t` 全部改写后置 `frame_switched`;syscall/IRQ epilogue 的 `iret` 因此进入下一个进程。
-- `/proc` 目录由 proc 表动态生成 PID 子目录;`/proc/self` 解析为当前进程。`ps` 读取 `/proc/<pid>/stat` 与 `cmdline`;另有 `/proc/loadavg`、`/proc/stat`、`/proc/self/maps`。
+- `/proc` 目录由 proc 表动态生成 PID 子目录;`/proc/self` 解析为当前进程。`ps` 读取 `/proc/<pid>/stat` 与 `cmdline`;另有 `/proc/loadavg`、`/proc/stat`、`/proc/self/maps`(由地址空间 VMA 表生成,格式 `start-end perms offset 00:00 0 [anon|file]`)。
 - 虚拟 `/bin`、`/usr/bin`、`/sbin` 下的任意名字(以及 `/bin/busybox`)映射到 Multiboot module 0;`execve` 支持 `VFS_T_MODULE`,BusyBox shell 因此能按 PATH 重新执行自身 applet。
 - `pipe(42)/pipe2(331)`:8 个 4KB 环形缓冲 pipe.c;fd 表新增 `PIPE_READ/PIPE_WRITE` 类型,`read/write/dup/dup2/close/fstat` 均支持;shell 的 `echo hi | cat`、`ls | wc -l` 已跑通。
 - `clone(120)` 支持 `CLONE_VM` 线程与自定义栈,非 CLONE_VM 时等价 fork;`vfork(190)` 等同 fork;`kill(37)` 真实投递信号,SIGTERM/SIGKILL 默认终止进程;进程组调用暂时返回自身 pid(无 pgid 表)。

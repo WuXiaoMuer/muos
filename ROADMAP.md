@@ -140,7 +140,7 @@
 - [x] 目录层级:`mkdir/rmdir`、子目录路径解析、直接子项枚举、跨目录文件 `rename`;`mkdir -p`/`cp`/`mv` 实测通过
 - [x] `*at` 族:`openat(295)`、`mkdirat(296)`、`fstatat64(300)`、`unlinkat(301,含 AT_REMOVEDIR)`、`renameat(302)`、`readlinkat(305)`、`fchmodat(306)`、`faccessat(307)`;绝对路径/`AT_FDCWD`/目录 fd 三种解析,`AT_EMPTY_PATH` 支持;`run at` 用例与 BusyBox `mkdir/touch/ls/rm` 回归通过;目录 rename 已支持整棵子树改名
 - [x] `/proc/<pid>/{stat,status,comm,cmdline}` 与动态 PID 目录;`ps` 显示 kernel/busybox
-- [x] `/proc/loadavg`、`/proc/stat`、`/proc/self/maps` 最小实现
+- [x] `/proc/loadavg`、`/proc/stat`、`/proc/self/maps`(maps 由地址空间 VMA 表生成,随 mmap/mprotect/munmap/mremap 更新)
 - [x] `vmstat/top` 所需的 CPU 统计字段(`/proc/stat` 全量,`top -b -n 1` 通过);内存统计已有 `/proc/meminfo`
 - [x] errno 起步对齐(EBADF/EFAULT/EINVAL/ENOENT/ENOTDIR/EISDIR/ENOMEM/ENOSYS 等);`uname` 已回报 MuOS/muos/i386
 - [x] `stat` 族返回 MuOS 假 identity:根目录 `S_IFDIR|0755`、文件 `S_IFREG|0644`、`st_dev=1`、块大小/块数按 64KB 文件计算
