@@ -147,7 +147,7 @@
 - [x] errno 与 Linux 做一次全量审计(尤其 `statx` flags/mask 与 `sendfile` 边界):`statx(383)` 现在接收 flags/mask 并校验(未知位 EINVAL、空路径需 `AT_EMPTY_PATH`),`sendfile` 校验 in_fd 类型/同 fd/负偏移并对 count 做 Linux 上限截断;`run abi` 增加 `statx=-22/-22/-2/0/2047 sendfile=0/-22/1` 断言
 - [x] RTC 读取(CMOS,桌面任务栏时钟);`time(13)`/`gettimeofday(78)`/`clock_gettime(265/403)` 返回真实 UTC epoch
 - [x] RTC → epoch 换算(CMOS 年月日 + 世纪寄存器 + 闰年 civil-days 算法),RAM FS 记录 atime/mtime/ctime,`date/ls -l/stat/touch` 显示真实时间
-- [ ] a.out/ELF 的零页(empty bad-address page,0x08048000 之前不可映射)与地址布局兼容
+- [x] 零页/地址布局:用户窗口从 `0x08048000` 起,`mm_user_fault` 与 `mmap(MAP_FIXED)` 都拒绝低于 `USER_BASE` 的地址,因此 NULL 解引用必然触发页故障;`run nullpage` 验证 `mmap(0)`/`mmap(0x08047000)` 均失败、`/proc/self/maps` 不含 `00000000-` 行,且子进程解引用 NULL 以 139(SIGSEGV)退出而父进程继续运行
 - [x] 方法学落地:每个真实二进制暴露的缺失 syscall 即刻补齐,串口只记录一次未知号;本轮 BusyBox 已驱动出完整 VFS 元数据面与 `/dev`/`/proc` 基础
 - 验收:`echo/ls/cat/free/df/dd` 已通过;下一步以 `sh -c`、管道、`ps` 暴露的 `fork/pipe/proc` 需求作为清单
 
@@ -165,7 +165,7 @@
 
 ## 附:近期工程债(不阻塞主线)
 
-- [ ] fs 截断告警(fs_write 返回实际写入量,调用方检查)
+- [x] fs 截断告警:`fs_write_at` 按 `FS_MAX_SIZE`(64KB)截断并返回实际写入量,`write(2)` 原样返回该短计数(不谎报全量成功);`run append` 用 70KB 写入验证返回 65536 且 `stat` 大小同步为 65536
 - [x] 内核堆 Grow:1MB 起步,耗尽时按 256KB 追加映射新页(独立虚拟窗口,跳过 RAM 别名/MMIO),16MB 上限;大块分配自检通过
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
 - [x] 网卡(RTL8139 + Intel E1000)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] 更多网卡型号、IRQ 驱动方式;MuFS 仍是整槽布局,无块分配位图/碎片整理

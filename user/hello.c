@@ -977,7 +977,23 @@ int main(int argc, char** argv) {
         int ro_w = ro >= 0 ? muos_write(ro, "XX", 2) : 0;
         if (ro >= 0) muos_close(ro);
 
-        ok = ok && appended && toggled && ro_w == -9;
+        /* RAM FS capacity is 64KB per file: a 70KB write must report the
+         * actual (short) byte count instead of silently claiming success. */
+        static unsigned char big_write[71680];
+        for (unsigned i = 0; i < sizeof(big_write); i++)
+            big_write[i] = (unsigned char)(i & 0xFF);
+        int bfd = muos_open("trunc.txt",
+                            MUOS_O_CREAT | MUOS_O_TRUNC | MUOS_O_WRONLY);
+        int bw = bfd >= 0 ? muos_write(bfd, big_write, sizeof(big_write)) : -1;
+        if (bfd >= 0) muos_close(bfd);
+        union {
+            char raw[MUOS_STAT64_SIZE];
+            unsigned word[MUOS_STAT64_SIZE / 4];
+        } tst;
+        int trc = muos_fstatat64(MUOS_AT_FDCWD, "trunc.txt", tst.raw, 0);
+        int trunc_ok = (bw == 65536 && trc == 0 && tst.word[11] == 65536);
+
+        ok = ok && appended && toggled && ro_w == -9 && trunc_ok;
         muos_puts("append: write="); muos_putdec(w1);
         muos_puts("/"); muos_putdec(w2);
         muos_puts(" read="); muos_putdec(rn);
@@ -986,7 +1002,46 @@ int main(int argc, char** argv) {
         muos_puts(" getfl="); muos_putdec(fget);
         muos_puts(" read="); muos_putdec(rn2);
         muos_puts(" ro-write="); muos_putdec(ro_w); muos_puts("\n");
+        muos_puts("append: short-write="); muos_putdec(bw);
+        muos_puts(" size="); muos_putdec((int)tst.word[11]);
+        muos_puts(trunc_ok ? " trunc-ok\n" : " trunc-bad\n");
         muos_puts(ok ? "APPEND-OK\n" : "APPEND-BAD\n");
+        return 0;
+    }
+
+    if (argc > 1 && arg_is(argv[1], "nullpage")) {
+        /* Linux keeps the first page unmapped so a NULL dereference faults.
+         * MAP_FIXED at 0 (or anywhere below the sandbox base) must fail,
+         * /proc/self/maps must not list 00000000, and a child that touches
+         * NULL must die with SIGSEGV without harming its parent. */
+        int ok = 1;
+        unsigned at0 = muos_mmap_at(0, 4096, MUOS_PROT_READ | MUOS_PROT_WRITE,
+                                    MUOS_MAP_FIXED | MUOS_MAP_ANONYMOUS);
+        unsigned below = muos_mmap_at(0x08047000u, 4096,
+                                      MUOS_PROT_READ | MUOS_PROT_WRITE,
+                                      MUOS_MAP_FIXED | MUOS_MAP_ANONYMOUS);
+        int maps_null = maps_count("00000000-");
+        int at0_err = (int)at0 < 0;
+        int below_err = (int)below < 0;
+        muos_puts("null: mmap0="); muos_putdec(at0_err);
+        muos_puts(" below-base="); muos_putdec(below_err);
+        muos_puts(" maps-null="); muos_putdec(maps_null); muos_puts("\n");
+        ok = ok && at0_err && below_err && maps_null == 0;
+
+        int pid = muos_fork();
+        if (pid == 0) {
+            *(volatile int*)0 = 1;      /* must fault, not corrupt the kernel */
+            muos_exit(7);               /* unreachable */
+        }
+        int st = 0;
+        int wp = muos_waitpid(pid, &st, 0);
+        int code = (st >> 8) & 0xFF;
+        int child_ok = (pid > 0 && wp == pid && code == 139);
+        muos_puts("null: fork="); muos_putdec(pid);
+        muos_puts(" wait="); muos_putdec(wp);
+        muos_puts(" code="); muos_putdec(code); muos_puts("\n");
+        ok = ok && child_ok;
+        muos_puts(ok ? "NULLPAGE-OK\n" : "NULLPAGE-BAD\n");
         return 0;
     }
 

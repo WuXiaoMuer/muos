@@ -233,6 +233,17 @@ unsigned muos_mmap_file(int fd, unsigned len, int prot, int flags, unsigned offs
     return (unsigned)syscall1(90, (int)args);
 }
 
+unsigned muos_mmap_at(unsigned addr, unsigned len, int prot, int flags) {
+    unsigned args[6];
+    args[0] = addr;
+    args[1] = len;
+    args[2] = (unsigned)prot;
+    args[3] = (unsigned)flags;
+    args[4] = (unsigned)-1;
+    args[5] = 0;
+    return (unsigned)syscall1(90, (int)args);
+}
+
 int muos_chmod(const char* path, int mode) {
     return syscall2(15, (int)path, mode);
 }

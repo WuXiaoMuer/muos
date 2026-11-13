@@ -83,6 +83,8 @@ int  muos_getpid(void);
 int  muos_uname(char* out /* 390 bytes */);
 int  muos_getrandom(void* buf, unsigned len, int flags);
 unsigned muos_mmap(unsigned len);
+/* Fixed-address anonymous mapping (used to prove the null page is unmappable). */
+unsigned muos_mmap_at(unsigned addr, unsigned len, int prot, int flags);
 int  muos_munmap(unsigned addr, unsigned len);
 int  muos_mprotect(unsigned addr, unsigned len, int prot);
 int  muos_msync(unsigned addr, unsigned len, int flags);
