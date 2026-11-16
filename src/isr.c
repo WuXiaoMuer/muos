@@ -53,6 +53,37 @@ static const char* hex32(uint32_t n, char* buf) {
     return buf;
 }
 
+/* Walk the EBP chain of the panicking kernel stack (higher-half only, so a
+ * corrupt frame cannot fault while reporting). Each frame is
+ * [saved ebp][return address]. */
+static void panic_backtrace(uint32_t ebp) {
+    char head[80];
+    uint32_t fp = ebp;
+    for (int depth = 0; depth < 8; depth++) {
+        if (fp < 0xC0000000u || (fp & 3u) || fp > 0xFFFFF000u) break;
+        uint32_t* frame = (uint32_t*)fp;
+        uint32_t next = frame[0];
+        uint32_t ret = frame[1];
+        if (!ret) break;
+
+        vga_print("  #"); vga_print_dec((uint32_t)depth);
+        vga_print(" "); vga_print_hex(ret);
+        serial_write("  #"); serial_write(hex32((uint32_t)depth, head));
+        serial_write(" "); serial_write(hex32(ret, head));
+        if (!(ret >= 0xC0000000u)) {
+            vga_print(" (user)\n");
+            serial_write(" (user)\n");
+            break;
+        }
+        vga_print("\n");
+        serial_write("\n");
+        if (next <= fp) break;          /* no progress: stop unwinding */
+        fp = next;
+    }
+    vga_print("  symbolize: i686-elf-addr2line -f -e build/kernel.elf <addr>\n");
+    serial_write("  symbolize: i686-elf-addr2line -f -e build/kernel.elf <addr>\n");
+}
+
 void isr_handler(registers_t* regs) {
     /* Demand paging + copy-on-write for the live user address space.
      * The check uses the *current* page directory (not user_is_active):
@@ -105,6 +136,8 @@ void isr_handler(registers_t* regs) {
     vga_print("  EDI: "); vga_print_hex(regs->edi);
     vga_print("\n  Error code: "); vga_print_hex(regs->err_code);
     vga_print("\n  ESP: "); vga_print_hex(regs->esp);
+    vga_print("\nBacktrace (EBP chain):\n");
+    panic_backtrace(regs->ebp);
     vga_print("\n\nSystem halted.\n");
 
     serial_write("\n[KERNEL PANIC] Exception: ");
@@ -123,6 +156,8 @@ void isr_handler(registers_t* regs) {
     serial_write(" EDI=");     serial_write(hex32(regs->edi, head));
     serial_write(" ESP=");     serial_write(hex32(regs->esp, head));
     serial_write(" ERR=");     serial_write(hex32(regs->err_code, head));
+    serial_write("\nBacktrace (EBP chain):\n");
+    panic_backtrace(regs->ebp);
     serial_write("\n\nSystem halted.\n");
 
     for (;;) {

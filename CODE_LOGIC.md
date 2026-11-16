@@ -217,7 +217,7 @@ USER_SIGTRAMP = 0x08847000
 - `ldmu.c`(ld-mu.so,无依赖):从栈解析 auxv → 由 `AT_PHDR` + `PROG_BASE` 反推主程序 bias → 解析 `PT_DYNAMIC`/`PT_TLS` → 按 `DT_NEEDED` 从 `/lib/<name>` 用 `open/read` 读入 `fbuf` 并映射到 `0x08400000` 起的空位 → 符号解析(SysV `DT_HASH` 或 `DT_GNU_HASH`:gnu 走 bloom 过滤 + bucket/chain 链)→ `tls_setup()` 布局静态 TLS → 对依赖库和主程序依次应用 `RELATIVE/32/PC32/GLOB_DAT/JMP_SLOT/COPY/IRELATIVE`(COPY 按 `st_size` 从提供者复制数据;IRELATIVE 调用 `bias + addend` 处的 resolver 并写回结果)→ `jmp AT_ENTRY`(不改动栈)。未知重定位会打印 `unsupported relocation` 并退出,不再静默跳过。
 - 符号版本化:`DT_VERSYM` 给出每个 dynsym 的版本索引;`ver_name` 先在 `DT_VERDEF`(导出)里匹配 `vd_ndx → verdaux.vda_name`,再在 `DT_VERNEED`(依赖)里匹配 `vernaux.vna_other → vna_name`。未定义符号用 `want_version` 取其所需版本名,`lookup_gnu/lookup_in/find_in` 对每个同名候选调用 `ver_ok`:提供者无 versym 视为兼容;索引 ≤1 为基版本;索引带 `0x8000`(hidden)只在不指定版本时拒绝;否则比较版本名。
 - 静态 TLS 细节:`tls_setup` 以 `TLS_TP=0x08780000` 为线程指针,按对象顺序(主程序在前)从 TP 向下扣减对齐后的 `p_memsz`,记录每模块的负偏移与模块 id;把 `bias + p_vaddr` 的 `.tdata` 复制进块、`.tbss` 清零;`*(u32*)TP = TP` 写自指针,再 `set_thread_area(243, {base=TP, limit=0xFFFFF, flags=0x51})` 并 `mov %gs,0x33`。`R_386_TLS_TPOFF/IE/GOTIE/TPOFF32/IE_32` 只把模块偏移加到 GOT 里已就位的符号偏移(与 glibc i386 ld.so 的规则一致),`LE/LE_32` 完整解析;`DTPMOD32` 写模块 id、`DTPOFF32` 加符号块内偏移。`__tls_get_addr` 由 ld-mu 内建:汇编入口 `ldmu_tls_get_addr_entry` 按 i386 约定从 `%eax` 取 (mod,off) 二元组指针,压栈后调 `ldmu_tls_get_addr_c` 返回 `TP + 模块偏移 + off`。
-- 用户态异常在 `isr_handler` 开头分流:`(regs->cs & 3) == 3 && user_is_active()` → `user_handle_fault` 打印 EIP/CS/CR2 后回 Shell,内核 panic 路径不受影响。
+- 用户态异常在 `isr_handler` 开头分流:`(regs->cs & 3) == 3 && user_is_active()` → `user_handle_fault` 打印 EIP/CS/CR2 后回 Shell,内核 panic 路径不受影响。内核 panic 依次打印 VGA 与串口两份寄存器 dump,再调 `panic_backtrace(regs->ebp)` 沿 `[saved ebp][ret]` 帧链上溯最多 8 层(只接受 `>= 0xC0000000` 的栈帧,`next <= fp` 即停止,避免坏帧二次故障),末尾提示用 `i686-elf-addr2line -f -e build/kernel.elf <addr>` 还原符号。
 
 ### 7.6 i386 TLS 与真实 libc 启动
 
@@ -386,5 +386,5 @@ USER_SIGTRAMP = 0x08847000
 8. 桌面是 80×25 字符网格(ISO 路径经 VBE 帧缓冲渲染,`-kernel` 为 VGA 文本);`pixel` 是合成器窗口管理器(每窗口后备缓冲 + 拖动/关闭/聚焦 + 滚动条 + 按钮/输入框/列表/下拉菜单 + 8 级裁剪栈),但尚无更多字体尺寸与工具栏控件
 9. 单处理器(PIC,非 APIC);用户进程由 IRQ0 抢占,内核 shell 本身仍在启动栈上协作运行
 10. 无内核栈溢出保护(16KB 栈,GUI 深调用链靠它撑着;用户态入口另有 8KB TSS 栈)
-11. 无 guard page / 无 KASLR / panic 信息只有寄存器 dump(有 -g,可 addr2line)
+11. 无 guard page / 无 KASLR / panic 信息为寄存器 dump + EBP 链回溯(有 -g,可 addr2line)
 12. NT/PE 兼容尚未开始:执行前端目前只有 ELF32(ROADMAP 阶段 5)

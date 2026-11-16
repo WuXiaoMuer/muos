@@ -347,6 +347,7 @@ muos> execmod 0 dd if=/dev/zero of=/z.bin bs=16 count=1
 | 物理分配器发 4MB 以上帧却 Page Fault | 分页只恒等映射了前 4MB(旧版) | mm_init 现在恒等映射全部 RAM |
 | multiboot mmap 字段读出来是垃圾 | mmap_length/mmap_addr 在偏移 44/48,截断的结构体少定义了 syms[4] | 用 include\multiboot.h 的完整定义 |
 | panic 寄存器全是乱码 / 中断随机错派甚至野跳转 | `registers_t` 字段序与 isr_stubs.s 压栈序不一致(段寄存器压栈序 ds→es→fs→gs,gs 在最低地址) | 结构体必须按 gs,fs,es,ds 开头,与汇编严格对齐;irq 分发处再加 `irq < 16` 边界防护 |
+| panic 后如何定位到源码行 | 只有寄存器地址,没有符号 | panic 现在会打印 EBP 链回溯并提示 `i686-elf-addr2line -f -e build/kernel.elf <addr>`(构建带 `-g`) |
 | 下载 qemu-w64-setup-20250424.exe 404 | 上游只保留最近几个版本 | setup-tools.ps1 已指向当前版本;旧版本号需手动更新 |
 | 进入 Ring3 第一条指令就 #GP | `iret` 不会重载 DS/ES/FS/GS,仍留着 DPL0 的 0x10 | `user_enter` 在 iret 前把 DS/ES/FS/GS 置 0x23,返回时恢复 0x10 |
 | `int 0x80` 里 read 键盘死锁 | 中断门自动清 IF,键盘环形缓冲永远进不了数据 | `keyboard_getchar` 内部 `sti; hlt; cli` 等待(本次直接复用) |

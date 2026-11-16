@@ -175,7 +175,7 @@
 - [x] 安全基础:SMEP(CPUID leaf7 EBX bit7 时置 CR4 bit20);弱 ASLR(栈顶 0..7 页、`AT_RANDOM` 使库基址偏移 0..31 页)
 - [x] uid/gid 与文件权限:MuFS 元数据保存 owner/mode(v2),`getuid/getgid/setuid/setgid` 生效,open/access 按 rwx 检查(目录需 x),chmod/chown 落盘;`run perm` 实测非 root 读 0600 被拒、读 0644 成功
 - [x] 真 PS/2 鼠标驱动(8042 aux 初始化、IRQ12 与键盘共享 drain、文本光标、点击/拖拽)
-- [ ] panic 打印带 addr2line 说明(已加 -g)
+- [x] panic 打印带 addr2line 说明(已加 -g):`isr_handler` 在寄存器 dump 后遍历 EBP 链输出最多 8 帧返回地址(只接受 higher-half 地址,指针不前进即停止),并打印 `i686-elf-addr2line -f -e build/kernel.elf <addr>` 提示
 - [x] ISO 路径构造最小 mb_info:`boot_cd.s` 用 BIOS INT 15h/E820 收集内存图,生成带 MEM|MMAP 的 Multiboot info(0x5600/0x5800)并交给内核;仅 BIOS 无 E820 时才回退 32MB
 - [x] ACPI:RSDP(EBDA/0xE0000) → RSDT/XSDT → FADT,取 PM1a_CNT;`poweroff` 写 SLP_TYPa=5|SLP_EN(回退 QEMU 0x604/0xB004),`reboot` 走 8042 复位线。校验所有表指针落在恒等映射 RAM 内,避免 SeaBIOS 表在 RAM 顶端保留区导致内核页故障
 - [ ] UEFI 引导、USB HID/存储、基础音频、SMP/APIC 未实现(远期)
