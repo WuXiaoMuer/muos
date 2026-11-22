@@ -33,6 +33,7 @@ def qemu_path():
     here = os.path.dirname(os.path.abspath(__file__))
     for p in (os.path.join(os.path.dirname(here), "tools", "qemu",
                            "qemu-system-i386.exe"),
+              r"Z:\qemu\qemu-system-i386.exe",
               r"X:\qemu\qemu-system-i386.exe",
               r"C:\qemu\qemu-system-i386.exe",
               r"C:\Program Files\qemu\qemu-system-i386.exe"):

@@ -68,7 +68,9 @@ static void panic_backtrace(uint32_t ebp) {
 
         vga_print("  #"); vga_print_dec((uint32_t)depth);
         vga_print(" "); vga_print_hex(ret);
-        serial_write("  #"); serial_write(hex32((uint32_t)depth, head));
+        char dbuf[12];
+        u32_to_dec(dbuf, (uint32_t)depth);
+        serial_write("  #"); serial_write(dbuf);
         serial_write(" "); serial_write(hex32(ret, head));
         if (!(ret >= 0xC0000000u)) {
             vga_print(" (user)\n");

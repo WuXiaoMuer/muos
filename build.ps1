@@ -23,6 +23,7 @@ function Find-Tool {
         "C:\qemu\$Name.exe",
         "C:\Program Files\qemu\$Name.exe",
         "C:\Program Files (x86)\qemu\$Name.exe",
+        "Z:\qemu\$Name.exe",
         "X:\qemu\$Name.exe",
         "$PSScriptRoot\toolchain\bin\$Name.exe",
         "$PSScriptRoot\tools\nasm\$Name.exe",

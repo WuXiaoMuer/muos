@@ -22,10 +22,12 @@ $BuildDir = "$Root\build"
 
 function Find-Qemu {
     $candidates = @(
+        "Z:\qemu\qemu-system-i386.exe",
         "X:\qemu\qemu-system-i386.exe",
         "C:\qemu\qemu-system-i386.exe",
         "C:\Program Files\qemu\qemu-system-i386.exe",
-        "C:\Program Files (x86)\qemu\qemu-system-i386.exe"
+        "C:\Program Files (x86)\qemu\qemu-system-i386.exe",
+        "$Root\tools\qemu\qemu-system-i386.exe"
     )
     $cmd = Get-Command "qemu-system-i386" -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
