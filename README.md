@@ -45,7 +45,7 @@ muos/
 │   ├── fat.c        FAT32 读写(8.3 + VFAT 长名、簇链、子目录)
 │   ├── ext2.c       ext2 读写(超级块/组描述符/直接块 + 单/双级间接/位图分配)
 │   ├── pci.c        PCI 配置空间访问(0xCF8/0xCFC)+ 设备查找
-│   ├── net.c        RTL8139/E1000 驱动 + ARP/IPv4/ICMP/UDP/TCP + DHCP + socket 表
+│   ├── net.c        RTL8139/E1000/virtio-net 驱动 + ARP/IPv4/ICMP/UDP/TCP + DHCP + socket 表
 │   ├── string.c     freestanding 字符串/内存函数(标准名)
 │   ├── fs.c editor.c win7.c shell.c task.c test.c ...(fs:16×64KB)
 │   │   editor: 128×79、10KB 存盘缓冲、PgUp/PgDn;win7: z-order/鼠标/RTC
@@ -134,6 +134,8 @@ release.bat noverify     :: 跳过 QEMU 冒烟测试
 python tools\test_busybox.py "run net" "run tcp" "run dyn" "run tls"
 # 以 Intel E1000 网卡启动,验证 DHCP/ICMP/UDP 与 TCP/阻塞 accept
 python tools\test_e1000.py
+# 以 virtio-net(现代 virtio 1.0 PCI)启动,验证同一套协议栈
+python tools\test_virtio.py
 # 两次启动验证 ATA 与 MuFS 持久化
 python tools\test_ata.py
 # MBR/GPT + FAT32(含长名/子目录)与 ext2 读写挂载
@@ -203,7 +205,7 @@ muos> run pie             # ET_DYN(PIE) 镜像:内核 bias + R_386_RELATIVE 重�
 muos> run dyn             # 动态链接:PT_INTERP + 共享库 libmu.so(DT_NEEDED/符号解析)
 muos> run tls             # 静态 TLS:initial-exec(TPOFF)+ global-dynamic(__tls_get_addr)
 muos> run perm            # uid/gid 与文件权限:非 root 读 0600 被拒、读 0644 成功
-muos> run net             # 网卡:raw ICMP echo + UDP DNS 查询(QEMU -nic user,model=rtl8139|e1000)
+muos> run net             # 网卡:raw ICMP echo + UDP DNS 查询(QEMU -nic user,model=rtl8139|e1000|virtio-net-pci)
 muos> run tcp             # TCP:双连接回显 + getsockname/getpeername + listen/accept 自连接 + socketpair(8KB/写满阻塞)/msghdr/shutdown/非阻塞 socket
 muos> pixel               # 像素窗口管理器(仅 ISO/VBE):拖动/聚焦/关闭、滚动条、按钮/输入框/列表/下拉菜单、双缓冲合成
 muos> run fsata           # MuFS 持久文件:创建/写/fsync/回读(重启后 run fsread)

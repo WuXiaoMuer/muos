@@ -67,7 +67,8 @@
 - [x] TCP(SOCK_STREAM):SYN/SYN-ACK/ACK、PSH 数据、FIN/ACK,127.0.0.1 回环 + 内核 port 7 echo;8 段发送队列 + 队列头 RTO 指数退避(最多 5 次)、ACK 逐段退休、慢开始 + 整数 **CUBIC 拥塞避免**(C=0.4、beta=0.7,`cubic_k=100*cbrt(0.75*W_max/MSS)` ticks,目标窗口按 `dt³/2500` milli-MSS 计算);接收端 4 段乱序队列(按 `rcv_nxt` 连续推进)、对端窗口跟踪与 **WS 窗口缩放协商**(SYN/SYN-ACK 带 shift=4,按对端 shift 放大 `snd_wnd`);**快速重传**:连续 3 个重复 ACK 立即重传队头、按 CUBIC beta 收缩(`ssthresh=0.7*cwnd`)、`cwnd=ssthresh+3*MSS` 进入快速恢复,完整 ACK 后退出并回落到 `ssthresh`;`accept` 在无待完成连接时阻塞(由握手完成事件唤醒,`run baccept` 实测);启动自检 `TCP-REORDER-OK`/`TCP-WSCALE-OK`/`TCP-FASTRETX-OK`/`TCP-CUBIC-OK`;`getsockname/getpeername` 返回真实四元组;`run tcp` 实测双连接回显、真实 socket 名、`listen/accept` 自连接(`TCP-OK`/`ACCEPT-OK`)与 `socketpair`/`getsockopt`/`sendmsg·recvmsg`(`pair-ok`)、2KB 大块收发(`big-ok`),以及 `shutdown(SHUT_WR)` 半关闭后对端在排空缓冲后 `recv` 返回 0(`shutdown-ok`);**SACK/时间戳**:SYN 协商 MSS/SACK-permitted/TS/WS,ACK 携带 SACK 块(最多 2 段),发送队列按 `sacked` 标记,快速重传与 RTO 跳过已收段;时间戳回显 `TSecr`;自检 `TCP-SACK-OK`/`TCP-TS-OK`
 - [x] VBE 线性帧缓冲:ISO 引导(`boot_cd.s`)用 INT 10h 4F00/4F01/4F02 设置 800×600×32(回退 1024×768×32 / 800×600×24/16),描述符写 0x6F00;内核 `fb.c` 恒等映射显存并把 80×25 影子文本网格用 8×8 字模渲染;`-kernel` 路径仍为 VGA 文本模式
 - [x] 像素窗口管理器(`pixel`,ISO/VBE):4 个窗口(Terminal/System/Editor/Widgets),每窗口 32-bit 后备缓冲 + 合成器 + 全屏双缓冲(`fb_blit32`);鼠标拖动标题栏/关闭/聚焦置顶,文本窗口可拖动滚动条,Widgets 提供按钮(Say Hello/Clear Log)、单行输入框(回车发送到 Terminal)、可点击选择/滚动的列表控件与 Menu 下拉菜单(2 倍字号标题);绘制使用 8 级裁剪栈(列表视口、菜单弹层、任务栏文本均受限);键盘输入到焦点窗口,任务栏与 8×16 文字(8×8 字模纵向 2 倍);ESC 返回文本 shell;`tools/test_wm.py` 用 QMP 相对鼠标点击列表行并校验高亮像素,再打开菜单并选择菜单项校验弹层像素
-- [ ] 更多字体尺寸、其他网卡
+- [x] 其他网卡:新增 **virtio-net**(现代 virtio 1.0 PCI:解析厂商 capability 取 common/notify/device 配置区,BAR 映射 uncached,协商 `VIRTIO_F_VERSION_1`+MAC,分离的 desc/avail/used 队列,RX 回收与 TX used-ring 同步,12 字节 `virtio_net_hdr`);初始化回退链 RTL8139 → E1000 → virtio,`tools/test_virtio.py` 在 `model=virtio-net-pci` 下验证 `NET-OK`/`TCP-OK`/`BACC-OK`
+- [ ] 更多字体尺寸
 
 ## 阶段 0:地基(已完成,2026-09)
 
@@ -168,7 +169,7 @@
 - [x] fs 截断告警:`fs_write_at` 按 `FS_MAX_SIZE`(64KB)截断并返回实际写入量,`write(2)` 原样返回该短计数(不谎报全量成功);`run append` 用 70KB 写入验证返回 65536 且 `stat` 大小同步为 65536
 - [x] 内核堆 Grow:1MB 起步,耗尽时按 256KB 追加映射新页(独立虚拟窗口,跳过 RAM 别名/MMIO),16MB 上限;大块分配自检通过
 - [x] higher-half 内核(0xC0000000),用户窗口 PDE 私有、其余 PDE 共享内核 identity + high 映射
-- [x] 网卡(RTL8139 + Intel E1000)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] 更多网卡型号、IRQ 驱动方式;MuFS 仍是整槽布局,无块分配位图/碎片整理
+- [x] 网卡(RTL8139 + Intel E1000 + virtio-net)+ IPv4 socket ABI(ARP/ICMP/UDP)+ DHCP + 最小 TCP(SOCK_STREAM);[x] VBE 线性帧缓冲(ISO 路径);[ ] IRQ 驱动方式;MuFS 仍是整槽布局,无块分配位图/碎片整理
 - [x] 符号版本化:解析 `DT_VERSYM/DT_VERDEF/DT_VERNEED`,按版本名筛选提供者并处理隐藏版本位;未版本化 `.so` 仍兼容
 - [ ] 动态链接器兼容真实 libc 产物(仍未用真实 glibc/musl `.so` 端到端验证;`.gnu.hash`/TLS/`R_386_COPY`/`IRELATIVE` 已支持)
 - [x] `MAP_SHARED` 写回文件;`munmap` 释放页帧/交换槽;`mprotect` 支持只读(PTE bit9)与 `PROT_NONE`(PTE bit10,读写均按违规故障),未映射页先缺页建立零页再施加保护(`run mmapfile` 的 `mprotect-remap-ok`)

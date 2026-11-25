@@ -214,7 +214,8 @@ typedef struct {
 typedef enum {
     NET_DRV_NONE = 0,
     NET_DRV_RTL8139,
-    NET_DRV_E1000
+    NET_DRV_E1000,
+    NET_DRV_VIRTIO
 } net_drv_t;
 
 static uint16_t io_base;
@@ -601,17 +602,416 @@ static void e1000_send(const uint8_t* frame, uint32_t len) {
     e_tx_cur = (slot + 1) % E_TX_DESC;
 }
 
+/* ---------------- virtio-net (legacy PCI, virtio 0.9.5) ---------------- */
+
+#define VIRTIO_VENDOR      0x1AF4
+#define VIRTIO_DEV_NET     0x1000
+#define VIRTIO_NET_F_MAC   (1u << 5)
+
+/* Legacy virtio PCI I/O register offsets (BAR0). */
+#define VQ_HOST_FEATURES   0x00
+#define VQ_GUEST_FEATURES  0x04
+#define VQ_PFN             0x08
+#define VQ_SIZE            0x0C
+#define VQ_SELECT          0x0E
+#define VQ_NOTIFY          0x10
+#define VQ_STATUS          0x12
+#define VQ_ISR             0x13
+#define VQ_CONFIG          0x14            /* virtio-net: MAC at +0 */
+#define VQ_RXQ             0
+#define VQ_TXQ             1
+#define VRX_DESC           16
+#define VTX_DESC           8
+#define VBUF_SIZE          2048
+/* virtio-net prepends a header to every packet. With virtio 1.0 the header
+ * includes num_buffers (12 bytes), which is what QEMU consumes even without
+ * MRG_RXBUF; legacy mode uses the 10-byte form. */
+#define VNET_HDR           12
+#define VSTAT_ACK          0x01
+#define VSTAT_DRV          0x02
+#define VSTAT_DRVOK        0x04
+#define VQ_F_WRITE         0x0002
+
+/* Split virtqueue descriptor (16 bytes): 64-bit address as two 32-bit
+ * words, 32-bit length, 16-bit flags, 16-bit next. */
+typedef struct __attribute__((packed)) {
+    uint32_t addr_lo, addr_hi;
+    uint32_t len;
+    uint16_t flags;
+    uint16_t next;
+} vq_desc_t;
+
+static uint16_t v_io;
+static bool_t   v_modern;           /* modern (virtio 1.0) interface active */
+static volatile uint8_t* v_notify;  /* notify region (modern) */
+static uint32_t v_notify_mul;
+static uint16_t v_notify_off[2];
+static uint8_t* vq_base[2];      /* higher-half alias used by the CPU */
+static uint32_t vq_phys[2];      /* physical queue base (device PFN) */
+static uint16_t vq_qsize[2];
+static uint32_t vq_used_off[2];
+static uint32_t vq_pages[2];
+static uint16_t v_avail_idx[2];
+static uint16_t v_last_used[2];
+static int      v_tx_cur;
+static uint8_t  v_rx_buf[VRX_DESC][VBUF_SIZE] __attribute__((aligned(16)));
+static uint8_t  v_tx_buf[VTX_DESC][VBUF_SIZE] __attribute__((aligned(16)));
+
+static vq_desc_t* vq_desc(int q) { return (vq_desc_t*)vq_base[q]; }
+static bool_t virtio_modern_init(uint8_t bus, uint8_t slot, uint8_t func);
+static uint16_t*  vq_avail(int q) {
+    return (uint16_t*)(vq_base[q] + (uint32_t)vq_qsize[q] * 16);
+}
+static uint8_t*   vq_used(int q) { return vq_base[q] + vq_used_off[q]; }
+
+/* Legacy layout: descriptor table, then avail ring, then the used ring
+ * aligned up to a 4KB boundary (the device computes the same offset). */
+static bool_t vq_alloc(int q) {
+    uint32_t qs = vq_qsize[q];
+    uint32_t avail_end = qs * 16u + 6u + 2u * qs;
+    uint32_t used_off = (avail_end + 4095u) & ~4095u;
+    uint32_t total = used_off + 6u + 8u * qs;
+    uint32_t pages = (total + PAGE_SIZE - 1u) / PAGE_SIZE;
+    if (pages > 32) return false;
+
+    uint8_t* mem = mm_alloc_pages(pages);
+    if (!mem) return false;
+    memset(mem, 0, pages * PAGE_SIZE);
+    /* mm_alloc_pages hands back an identity address; access the queue
+     * through the higher-half alias so the CPU view is explicit. */
+    vq_phys[q] = (uint32_t)mem;
+    vq_base[q] = (uint8_t*)(KERNEL_VBASE + (uint32_t)mem);
+    vq_used_off[q] = used_off;
+    vq_pages[q] = pages;
+    v_avail_idx[q] = 0;
+    v_last_used[q] = 0;
+    return true;
+}
+
+/* Hand one descriptor index to the device and kick the queue. */
+static void vq_kick(int q, uint16_t head) {
+    uint16_t* av = vq_avail(q);
+    av[2 + (v_avail_idx[q] % vq_qsize[q])] = head;
+    __asm__ volatile ("" ::: "memory");
+    v_avail_idx[q]++;
+    av[1] = v_avail_idx[q];
+    __asm__ volatile ("" ::: "memory");
+    if (v_modern) {
+        volatile uint16_t* nt =
+            (volatile uint16_t*)(v_notify + v_notify_off[q] * v_notify_mul);
+        *nt = (uint16_t)q;
+    } else {
+        outw(v_io + VQ_NOTIFY, (uint16_t)q);
+    }
+}
+
+static void virtio_poll(void) {
+    if (!v_modern) outw(v_io + VQ_NOTIFY, VQ_RXQ);   /* legacy re-arm */
+    uint8_t* used = vq_used(VQ_RXQ);
+    for (uint32_t guard = 0; guard < 64; guard++) {
+        uint16_t uidx = *(volatile uint16_t*)(used + 2);
+        if (v_last_used[VQ_RXQ] == uidx) break;
+        uint32_t slot = v_last_used[VQ_RXQ] % vq_qsize[VQ_RXQ];
+        uint32_t id = *(volatile uint32_t*)(used + 4 + slot * 8);
+        uint32_t len = *(volatile uint32_t*)(used + 8 + slot * 8);
+        v_last_used[VQ_RXQ]++;
+
+        if (id < VRX_DESC && len > VNET_HDR) {
+            uint32_t flen = len - VNET_HDR;
+            if (flen > sizeof(rx_frame)) flen = sizeof(rx_frame);
+            memcpy(rx_frame, v_rx_buf[id] + VNET_HDR, flen);
+            net_handle_frame(rx_frame, flen);
+        }
+        /* Return the buffer so the device can fill it again. */
+        if (id < VRX_DESC) vq_kick(VQ_RXQ, (uint16_t)id);
+    }
+    tcp_timers();
+}
+
+static void virtio_send(const uint8_t* frame, uint32_t len) {
+    if (len < 14 || len > VBUF_SIZE - VNET_HDR) return;
+    int slot = v_tx_cur;
+    v_tx_cur = (v_tx_cur + 1) % VTX_DESC;
+
+    memset(v_tx_buf[slot], 0, VNET_HDR);            /* zeroed net header */
+    memcpy(v_tx_buf[slot] + VNET_HDR, frame, len);
+    vq_desc_t* d = &vq_desc(VQ_TXQ)[slot];
+    d->addr_lo = mm_virt_to_phys((uint32_t)v_tx_buf[slot]);
+    d->addr_hi = 0;
+    d->len = (uint32_t)(len + VNET_HDR);    d->flags = 0;
+    d->next = 0;
+
+    uint16_t before = *(volatile uint16_t*)(vq_used(VQ_TXQ) + 2);
+    vq_kick(VQ_TXQ, (uint16_t)slot);
+    /* Poll the used ring so the buffer is not reused before the device is
+     * done with it (QEMU completes the frame on the next notify). */
+    for (uint32_t n = 0; n < 200000; n++) {
+        if (*(volatile uint16_t*)(vq_used(VQ_TXQ) + 2) != before) return;
+        outb(0x80, 0);
+    }
+}
+
+static bool_t virtio_init(void) {
+    uint8_t bus = 0, slot = 0, func = 0;
+    if (!pci_find(VIRTIO_VENDOR, VIRTIO_DEV_NET, &bus, &slot, &func))
+        return false;
+    /* Legacy virtio: subsystem device id 1 identifies the network device. */
+    uint32_t subsys = pci_read32(bus, slot, func, 0x2C);
+    if (((subsys >> 16) & 0xFFFF) != 1) return false;
+
+    /* Prefer the modern (virtio 1.0) interface; fall back to legacy I/O. */
+    v_modern = false;
+    if (virtio_modern_init(bus, slot, func)) {
+        v_modern = true;
+        return true;
+    }
+
+    uint32_t bar = pci_read32(bus, slot, func, 0x10);
+    if (!(bar & 1)) return false;
+    v_io = (uint16_t)(bar & 0xFFFC);
+    pci_enable_io_busmaster(bus, slot, func);
+
+    outb(v_io + VQ_STATUS, 0);                       /* reset */
+    outb(v_io + VQ_STATUS, VSTAT_ACK);
+    outb(v_io + VQ_STATUS, VSTAT_ACK | VSTAT_DRV);
+
+    uint32_t host = inl(v_io + VQ_HOST_FEATURES);
+    uint32_t want = (host & VIRTIO_NET_F_MAC) ? VIRTIO_NET_F_MAC : 0;
+    outl(v_io + VQ_GUEST_FEATURES, want);
+
+    if (want & VIRTIO_NET_F_MAC) {
+        for (int i = 0; i < 6; i++)
+            mac_addr[i] = inb(v_io + VQ_CONFIG + (uint16_t)i);
+    } else {
+        mac_addr[0] = 0x52; mac_addr[1] = 0x54; mac_addr[2] = 0x00;
+        mac_addr[3] = 0x12; mac_addr[4] = 0x34; mac_addr[5] = 0x56;
+    }
+
+    for (int q = 0; q < 2; q++) {
+        outw(v_io + VQ_SELECT, (uint16_t)q);
+        uint16_t qs = inw(v_io + VQ_SIZE);
+        if (qs < 2 || qs > 1024) return false;
+        vq_qsize[q] = qs;
+        if (!vq_alloc(q)) return false;
+        outl(v_io + VQ_PFN, vq_phys[q] >> 12);
+    }
+
+    /* Publish the receive buffers before the device goes live. */
+    v_tx_cur = 0;
+    for (int i = 0; i < VRX_DESC; i++) {
+        vq_desc_t* d = &vq_desc(VQ_RXQ)[i];
+        d->addr_lo = mm_virt_to_phys((uint32_t)v_rx_buf[i]);
+        d->addr_hi = 0;
+        d->len = VBUF_SIZE;
+        d->flags = VQ_F_WRITE;
+        d->next = 0;
+    }
+    for (int i = 0; i < VRX_DESC; i++) {
+        uint16_t* av = vq_avail(VQ_RXQ);
+        av[2 + i] = (uint16_t)i;
+    }
+    v_avail_idx[VQ_RXQ] = VRX_DESC;
+    vq_avail(VQ_RXQ)[1] = v_avail_idx[VQ_RXQ];
+    __asm__ volatile ("" ::: "memory");
+
+    outb(v_io + VQ_STATUS, VSTAT_ACK | VSTAT_DRV | VSTAT_DRVOK);
+    outw(v_io + VQ_NOTIFY, VQ_RXQ);
+    return true;
+}
+
+/* ---------------- virtio-net (modern virtio 1.0 PCI) ---------------- */
+
+#define VM_CAP_VENDOR      0x09
+#define VM_CFG_COMMON      1
+#define VM_CFG_NOTIFY      2
+#define VM_CFG_DEVICE      4
+
+/* common configuration offsets (virtio 1.0, struct virtio_pci_common_cfg) */
+#define VM_DEV_SELECT     0x00
+#define VM_DEV_FEAT       0x04
+#define VM_DRV_SELECT     0x08
+#define VM_DRV_FEAT       0x0C
+#define VM_STATUS         0x14
+#define VM_QSELECT        0x16
+#define VM_QSIZE          0x18
+#define VM_QENABLE        0x1C
+#define VM_QNOTIFY        0x1E
+#define VM_QDESC          0x20
+#define VM_QAVAIL         0x28
+#define VM_QUSED          0x30
+
+#define VM_ST_ACK         0x01
+#define VM_ST_DRV         0x02
+#define VM_ST_DRVOK       0x04
+#define VM_ST_FEATOK      0x08
+
+#define VM_MMIO_BASE      0xE1000000u
+#define VM_MMIO_STRIDE    0x00010000u      /* 64KB window per BAR */
+#define VM_MMIO_PAGES     16u
+
+static volatile uint8_t* v_common;
+static volatile uint8_t* v_devcfg;
+
+static uint32_t vm_rd32(uint32_t off) {
+    return *(volatile uint32_t*)(v_common + off);
+}
+static void vm_wr32(uint32_t off, uint32_t v) {
+    *(volatile uint32_t*)(v_common + off) = v;
+}
+static void vm_wr16(uint32_t off, uint16_t v) {
+    *(volatile uint16_t*)(v_common + off) = v;
+}
+static uint16_t vm_rd16(uint32_t off) {
+    return *(volatile uint16_t*)(v_common + off);
+}
+static void vm_wr64(uint32_t off, uint32_t lo, uint32_t hi) {
+    vm_wr32(off, lo);
+    vm_wr32(off + 4, hi);
+}
+
+/* Map one PCI memory BAR into a dedicated uncached 64KB window. */
+static volatile uint8_t* vm_map_bar(uint8_t bus, uint8_t slot, uint8_t func,
+                                    uint8_t bar) {
+    uint32_t val = pci_read32(bus, slot, func, (uint8_t)(0x10 + bar * 4));
+    if (val & 1u) return NULL;                     /* need a memory BAR */
+    uint32_t phys = val & ~0xFu;
+    if (!phys) return NULL;
+    uint32_t virt = VM_MMIO_BASE + (uint32_t)bar * VM_MMIO_STRIDE;
+    for (uint32_t i = 0; i < VM_MMIO_PAGES; i++) {
+        if (!mm_map_page(phys + i * PAGE_SIZE, virt + i * PAGE_SIZE,
+                         PAGE_KERNEL | PDE_PCD))
+            return NULL;
+    }
+    return (volatile uint8_t*)virt;
+}
+
+/* Walk the PCI capability list and program the modern virtio queues.
+ * Returns false when the device is legacy-only. */
+static bool_t virtio_modern_init(uint8_t bus, uint8_t slot, uint8_t func) {
+    uint16_t status = pci_read16(bus, slot, func, 0x06);
+    if (!(status & 0x10)) return false;            /* no capability list */
+    uint8_t cap = (uint8_t)(pci_read16(bus, slot, func, 0x34) & 0xFF);
+
+    uint8_t common_bar = 0xFF, notify_bar = 0xFF, dev_bar = 0xFF;
+    uint32_t common_off = 0, notify_off = 0, dev_off = 0;
+    for (int guard = 0; cap && guard < 32; guard++) {
+        uint32_t h0 = pci_read32(bus, slot, func, cap);
+        uint8_t id = (uint8_t)(h0 & 0xFF);
+        uint8_t next = (uint8_t)((h0 >> 8) & 0xFF);
+        if (id == VM_CAP_VENDOR) {
+            uint8_t type = (uint8_t)((h0 >> 24) & 0xFF);     /* cfg_type */
+            uint8_t bar = (uint8_t)(pci_read32(bus, slot, func,
+                                               (uint8_t)(cap + 4)) & 0xFF);
+            uint32_t off = pci_read32(bus, slot, func, (uint8_t)(cap + 8));
+            uint32_t len = pci_read32(bus, slot, func, (uint8_t)(cap + 12));
+            if (!len) len = 0x1000;
+            if (type == VM_CFG_COMMON) { common_bar = bar; common_off = off; }
+            else if (type == VM_CFG_NOTIFY) {
+                notify_bar = bar; notify_off = off;
+                v_notify_mul = pci_read32(bus, slot, func,
+                                          (uint8_t)(cap + 16));
+            } else if (type == VM_CFG_DEVICE) { dev_bar = bar; dev_off = off; }
+        }
+        cap = next;
+    }
+    if (common_bar == 0xFF || notify_bar == 0xFF) {
+        serial_write("\n");
+        return false;
+    }
+
+    volatile uint8_t* cb = vm_map_bar(bus, slot, func, common_bar);
+    if (!cb) return false;
+    volatile uint8_t* nb = (notify_bar == common_bar)
+                           ? cb : vm_map_bar(bus, slot, func, notify_bar);
+    if (!nb) return false;
+    if (dev_bar != 0xFF) {
+        volatile uint8_t* db = (dev_bar == common_bar) ? cb
+                              : (dev_bar == notify_bar) ? nb
+                              : vm_map_bar(bus, slot, func, dev_bar);
+        if (db) v_devcfg = db + dev_off;
+    }
+    v_common = cb + common_off;
+    v_notify = nb + notify_off;
+
+    /* Reset, then ACK + DRIVER. */
+    *(volatile uint8_t*)(v_common + VM_STATUS) = 0;
+    for (uint32_t n = 0; n < 100000; n++) {
+        if (*(volatile uint8_t*)(v_common + VM_STATUS) == 0) break;
+        outb(0x80, 0);
+    }
+    *(volatile uint8_t*)(v_common + VM_STATUS) = VM_ST_ACK;
+    *(volatile uint8_t*)(v_common + VM_STATUS) = VM_ST_ACK | VM_ST_DRV;
+
+    /* Negotiate MAC from the low 32-bit feature word. */
+    vm_wr32(VM_DEV_SELECT, 0);
+    uint32_t feats = vm_rd32(VM_DEV_FEAT);
+    vm_wr32(VM_DEV_SELECT, 1);
+    (void)vm_rd32(VM_DEV_FEAT);
+
+    uint32_t want = (feats & VIRTIO_NET_F_MAC) ? VIRTIO_NET_F_MAC : 0;
+    vm_wr32(VM_DRV_SELECT, 0);               /* driver features, low word */
+    vm_wr32(VM_DRV_FEAT, want);
+    vm_wr32(VM_DRV_SELECT, 1);               /* high word: VIRTIO_F_VERSION_1 */
+    vm_wr32(VM_DRV_FEAT, 1u);
+
+    *(volatile uint8_t*)(v_common + VM_STATUS) =
+        VM_ST_ACK | VM_ST_DRV | VM_ST_FEATOK;
+    if (!(*(volatile uint8_t*)(v_common + VM_STATUS) & VM_ST_FEATOK)) {
+        *(volatile uint8_t*)(v_common + VM_STATUS) = 0;   /* needs reset */
+        return false;
+    }
+
+    if ((want & VIRTIO_NET_F_MAC) && v_devcfg) {
+        for (int i = 0; i < 6; i++) mac_addr[i] = v_devcfg[i];
+    } else {
+        mac_addr[0] = 0x52; mac_addr[1] = 0x54; mac_addr[2] = 0x00;
+        mac_addr[3] = 0x12; mac_addr[4] = 0x34; mac_addr[5] = 0x56;
+    }
+
+    for (int q = 0; q < 2; q++) {
+        vm_wr16(VM_QSELECT, (uint16_t)q);
+        uint16_t qs = vm_rd16(VM_QSIZE);
+        if (qs < 2 || qs > 1024) return false;
+        vq_qsize[q] = qs;
+        if (!vq_alloc(q)) return false;
+        vm_wr64(VM_QDESC, vq_phys[q], 0);
+        vm_wr64(VM_QAVAIL, vq_phys[q] + (uint32_t)qs * 16u, 0);
+        vm_wr64(VM_QUSED, vq_phys[q] + vq_used_off[q], 0);
+        v_notify_off[q] = vm_rd16(VM_QNOTIFY);
+        vm_wr16(VM_QENABLE, 1);
+    }
+
+    v_tx_cur = 0;
+    for (int i = 0; i < VRX_DESC; i++) {
+        vq_desc_t* d = &vq_desc(VQ_RXQ)[i];
+        d->addr_lo = mm_virt_to_phys((uint32_t)v_rx_buf[i]);
+        d->addr_hi = 0;
+        d->len = VBUF_SIZE;
+        d->flags = VQ_F_WRITE;
+        d->next = 0;
+    }
+    __asm__ volatile ("" ::: "memory");
+    for (int i = 0; i < VRX_DESC; i++) vq_kick(VQ_RXQ, (uint16_t)i);
+
+    *(volatile uint8_t*)(v_common + VM_STATUS) =
+        VM_ST_ACK | VM_ST_DRV | VM_ST_FEATOK | VM_ST_DRVOK;
+    *(volatile uint16_t*)(v_notify + v_notify_off[VQ_RXQ] * v_notify_mul) = 0;
+    return true;
+}
+
 /* ---------------- driver dispatch ---------------- */
 
 static void net_poll(void) {
     if (!present) return;
     if (driver == NET_DRV_E1000) e1000_poll();
+    else if (driver == NET_DRV_VIRTIO) virtio_poll();
     else rtl_poll();
 }
 
 static void net_send_frame(const uint8_t* frame, uint32_t len) {
     if (!present) return;
     if (driver == NET_DRV_E1000) e1000_send(frame, len);
+    else if (driver == NET_DRV_VIRTIO) virtio_send(frame, len);
     else rtl_send_frame(frame, len);
 }
 
@@ -2226,6 +2626,8 @@ bool_t net_init(void) {
         driver = NET_DRV_RTL8139;
     } else if (e1000_init()) {
         driver = NET_DRV_E1000;
+    } else if (virtio_init()) {
+        driver = NET_DRV_VIRTIO;
     } else {
         return false;
     }
@@ -2280,7 +2682,9 @@ bool_t net_init(void) {
 
 bool_t net_present(void) { return present; }
 const char* net_driver_name(void) {
-    return driver == NET_DRV_E1000 ? "E1000" : "RTL8139";
+    if (driver == NET_DRV_E1000) return "E1000";
+    if (driver == NET_DRV_VIRTIO) return "VIRTIO";
+    return "RTL8139";
 }
 void net_get_mac(uint8_t out[6]) { memcpy(out, mac_addr, 6); }
 uint32_t net_get_ip(void) { return my_ip; }
